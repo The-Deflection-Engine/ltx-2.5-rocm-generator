@@ -489,7 +489,10 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         vae = load_video_vae_encoder(model_path, device=torch_device, dtype=torch.bfloat16)
 
     if vae_tiling:
-        vae.enable_tiling()
+        logger.warning(
+            "VAE tiling is not yet implemented in this script. "
+            "Continuing without tiling - this may cause OOM errors for large resolutions."
+        )
 
     # Load audio VAE encoder and audio processor if needed
     audio_vae_encoder = None

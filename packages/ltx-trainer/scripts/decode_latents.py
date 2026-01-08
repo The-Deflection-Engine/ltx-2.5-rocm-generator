@@ -68,7 +68,10 @@ class LatentsDecoder:
             self.vae = load_video_vae_decoder(model_path, device=self.device, dtype=torch.bfloat16)
 
             if vae_tiling:
-                self.vae.enable_tiling()
+                logger.warning(
+                    "VAE tiling is not yet implemented in this script. "
+                    "Continuing without tiling - this may cause OOM errors for large resolutions."
+                )
 
         if with_audio:
             with console.status(f"[bold]Loading audio VAE decoder from {model_path}...", spinner="dots"):
