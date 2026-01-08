@@ -48,6 +48,13 @@ def preprocess_dataset(  # noqa: PLR0913
     with_audio: bool = False,
 ) -> None:
     """Run the preprocessing pipeline with the given arguments."""
+    # VAE tiling is not yet implemented
+    if vae_tiling:
+        logger.warning(
+            "VAE tiling is not yet implemented in this script. "
+            "Continuing without tiling - this may cause OOM errors for large resolutions."
+        )
+
     # Validate dataset file
     _validate_dataset_file(dataset_file)
 

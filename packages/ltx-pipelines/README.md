@@ -43,7 +43,7 @@ All pipelines can be run directly from the command line. Each pipeline module is
 # Run a pipeline (example: two-stage text-to-video)
 python -m ltx_pipelines.ti2vid_two_stages \
     --checkpoint-path path/to/checkpoint.safetensors \
-    --distilled-lora-path path/to/distilled_lora.safetensors \
+    --distilled-lora path/to/distilled_lora.safetensors 0.8 \
     --spatial-upsampler-path path/to/upsampler.safetensors \
     --gemma-root path/to/gemma \
     --prompt "A beautiful sunset over the ocean" \
@@ -55,11 +55,11 @@ python -m ltx_pipelines.ti2vid_two_stages --help
 
 Available pipeline modules:
 
-- `ltx_pipelines.ti2vid_two_stages` - Two-stage text-to-video (recommended)
-- `ltx_pipelines.ti2vid_one_stage` - Single-stage text-to-video
-- `ltx_pipelines.distilled` - Fast distilled pipeline
-- `ltx_pipelines.ic_lora` - Video-to-video with IC-LoRA
-- `ltx_pipelines.keyframe_interpolation` - Keyframe interpolation
+- `ltx_pipelines.ti2vid_two_stages` - Two-stage text/image-to-video (recommended).
+- `ltx_pipelines.ti2vid_one_stage` - Single-stage text/image-to-video.
+- `ltx_pipelines.distilled` - Fast text/image-to-video pipeline using only the distilled model.
+- `ltx_pipelines.ic_lora` - Video-to-video with IC-LoRA.
+- `ltx_pipelines.keyframe_interpolation` - Keyframe interpolation.
 
 Use `--help` with any pipeline module to see all available options and parameters.
 
@@ -73,9 +73,9 @@ Use `--help` with any pipeline module to see all available options and parameter
 Do you need to condition on existing images/videos?
 ├─ YES → Do you have reference videos for video-to-video?
 │  ├─ YES → Use ICLoraPipeline
-│  └─ NO → Do you have keyframe images to interpolate?
+│  └─ NO → Do you have multiple keyframe images to interpolate?
 │     ├─ YES → Use KeyframeInterpolationPipeline
-│     └─ NO → Use ICLoraPipeline (image conditioning only)
+│     └─ NO → Use TI2VidTwoStagesPipeline (image conditioning only)
 │
 └─ NO → Text-to-video only
    ├─ Do you need best quality?
@@ -103,7 +103,7 @@ Do you need to condition on existing images/videos?
 
 ### 1. TI2VidTwoStagesPipeline
 
-**Best for:** High-quality text-to-video generation with upsampling. **Recommended for production use.**
+**Best for:** High-quality text/image-to-video generation with upsampling. **Recommended for production use.**
 
 **Source**: [`src/ltx_pipelines/ti2vid_two_stages.py`](src/ltx_pipelines/ti2vid_two_stages.py)
 
@@ -212,8 +212,7 @@ When authoring custom scripts, pass the `fp8transformer` flag to pipeline classe
 ```python
 pipeline = TI2VidTwoStagesPipeline(
     checkpoint_path=ltx_model_path,
-    distilled_lora_path=distilled_lora_path,
-    distilled_lora_strength=0.6,
+    distilled_lora=distilled_lora,
     spatial_upsampler_path=upsampler_path,
     gemma_root=gemma_root_path,
     loras=[],
@@ -275,11 +274,20 @@ This allows you to use **20-30 steps instead of 40** while maintaining quality. 
 ## 📖 Example: Image-to-Video
 
 ```python
+from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
+
+distilled_lora = [
+    LoraPathStrengthAndSDOps(
+        "/path/to/distilled_lora.safetensors",
+        0.6,
+        LTXV_LORA_COMFY_RENAMING_MAP
+    ),
+]
 
 pipeline = TI2VidTwoStagesPipeline(
     checkpoint_path="/path/to/checkpoint.safetensors",
-    distilled_lora_path="/path/to/distilled_lora.safetensors",
+    distilled_lora=distilled_lora,
     spatial_upsampler_path="/path/to/upsampler.safetensors",
     gemma_root="/path/to/gemma",
     loras=[],
