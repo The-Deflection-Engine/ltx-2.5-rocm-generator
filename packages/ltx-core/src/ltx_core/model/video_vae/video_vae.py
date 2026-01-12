@@ -1,5 +1,5 @@
 from dataclasses import replace
-from typing import Any, Callable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Iterator, List, Tuple
 
 import torch
 from einops import rearrange
@@ -521,12 +521,11 @@ class VideoDecoder(nn.Module):
             )
             self.last_scale_shift_table = nn.Parameter(torch.empty(2, feature_channels))
 
-    # def forward(self, sample: torch.Tensor, target_shape) -> torch.Tensor:
     def forward(
         self,
         sample: torch.Tensor,
-        timestep: Optional[torch.Tensor] = None,
-        generator: Optional[torch.Generator] = None,
+        timestep: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         r"""
         Decode latent representation into video frames.
@@ -651,8 +650,8 @@ class VideoDecoder(nn.Module):
         self,
         latent: torch.Tensor,
         tiling_config: TilingConfig | None = None,
-        timestep: Optional[torch.Tensor] = None,
-        generator: Optional[torch.Generator] = None,
+        timestep: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
     ) -> Iterator[torch.Tensor]:
         """
         Decode a latent tensor into video frames using tiled processing.
@@ -769,8 +768,8 @@ class VideoDecoder(nn.Module):
         group_tiles: List[Tile],
         buffer: torch.Tensor,
         latent: torch.Tensor,
-        timestep: Optional[torch.Tensor],
-        generator: Optional[torch.Generator],
+        timestep: torch.Tensor | None,
+        generator: torch.Generator | None,
     ) -> torch.Tensor:
         """
         Decode and accumulate all tiles of a temporal group into a local buffer.
@@ -815,6 +814,7 @@ def decode_video(
     latent: torch.Tensor,
     video_decoder: VideoDecoder,
     tiling_config: TilingConfig | None = None,
+    generator: torch.Generator | None = None,
 ) -> Iterator[torch.Tensor]:
     """
     Decode a video latent tensor with the given decoder.
@@ -822,6 +822,7 @@ def decode_video(
         latent: Tensor [c, f, h, w]
         video_decoder: Decoder module.
         tiling_config: Optional tiling settings.
+        generator: Optional random generator for deterministic decoding.
     Yields:
         Decoded chunk [f, h, w, c], uint8 in [0, 255].
     """
@@ -832,10 +833,10 @@ def decode_video(
         return frames
 
     if tiling_config is not None:
-        for frames in video_decoder.tiled_decode(latent, tiling_config):
+        for frames in video_decoder.tiled_decode(latent, tiling_config, generator=generator):
             yield convert_to_uint8(frames)
     else:
-        decoded_video = video_decoder(latent)
+        decoded_video = video_decoder(latent, generator=generator)
         yield convert_to_uint8(decoded_video)
 
 

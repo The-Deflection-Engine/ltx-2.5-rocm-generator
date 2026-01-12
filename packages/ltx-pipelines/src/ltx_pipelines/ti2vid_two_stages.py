@@ -225,7 +225,9 @@ class TI2VidTwoStagesPipeline:
         del video_encoder
         cleanup_memory()
 
-        decoded_video = vae_decode_video(video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config)
+        decoded_video = vae_decode_video(
+            video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config, generator
+        )
         decoded_audio = vae_decode_audio(
             audio_state.latent, self.stage_2_model_ledger.audio_decoder(), self.stage_2_model_ledger.vocoder()
         )
