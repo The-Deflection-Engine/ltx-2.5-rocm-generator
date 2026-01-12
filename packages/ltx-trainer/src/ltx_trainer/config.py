@@ -350,6 +350,11 @@ class CheckpointsConfig(ConfigBaseModel):
         ge=-1,
     )
 
+    precision: Literal["bfloat16", "float32"] = Field(
+        default="bfloat16",
+        description="Precision to use when saving checkpoint weights. Options: 'bfloat16' or 'float32'.",
+    )
+
 
 class HubConfig(ConfigBaseModel):
     """Configuration for Hugging Face Hub integration"""

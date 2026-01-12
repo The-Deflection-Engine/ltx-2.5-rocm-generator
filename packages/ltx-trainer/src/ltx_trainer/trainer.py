@@ -873,6 +873,9 @@ class LtxvTrainer:
 
         save_dir.mkdir(exist_ok=True, parents=True)
 
+        # Determine save precision
+        save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32
+
         # For LoRA: extract only adapter weights; for full: use as-is
         if is_lora:
             unwrapped = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
@@ -885,9 +888,15 @@ class LtxvTrainer:
             # Convert to ComfyUI-compatible format (add "diffusion_model." prefix)
             state_dict = {f"diffusion_model.{k}": v for k, v in state_dict.items()}
 
+            # Cast to configured precision
+            state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in state_dict.items()}
+
             # Save to disk
             save_file(state_dict, saved_weights_path)
         else:
+            # Cast to configured precision
+            full_state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in full_state_dict.items()}
+
             # Save to disk
             self._accelerator.save(full_state_dict, saved_weights_path)
 
