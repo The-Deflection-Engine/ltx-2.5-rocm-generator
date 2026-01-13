@@ -344,7 +344,7 @@ class LtxvTrainer:
         logger.debug("Loading text encoder...")
         if self._config.acceleration.load_text_encoder_in_8bit:
             logger.warning(
-                "⚠️  load_text_encoder_in_8bit is set to True but 8-bit text encoder loading "
+                "⚠️ load_text_encoder_in_8bit is set to True but 8-bit text encoder loading "
                 "is not currently implemented. The text encoder will be loaded in bfloat16 precision."
             )
 
@@ -428,7 +428,7 @@ class LtxvTrainer:
             if self._config.model.training_mode == "full":
                 raise ValueError("Quantization is not supported in full training mode.")
 
-            logger.warning(f"Quantizing model with precision: {self._config.acceleration.quantization}")
+            logger.info(f'Quantizing model with "{self._config.acceleration.quantization}". This may take a while...')
             self._transformer = quantize_model(
                 self._transformer,
                 precision=self._config.acceleration.quantization,

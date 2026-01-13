@@ -24,7 +24,8 @@ sub-configurations:
 
 Check out our example configurations in the `configs` directory:
 
-- 📄 [Audio-Video LoRA Training](../configs/ltx2_av_lora.yaml) - Joint audio-video to generation training
+- 📄 [Audio-Video LoRA Training](../configs/ltx2_av_lora.yaml) - Joint audio-video generation training
+- 📄 [Audio-Video LoRA Training (Low VRAM)](../configs/ltx2_av_lora_low_vram.yaml) - Memory-optimized config for 32GB GPUs (uses 8-bit optimizer, INT8 quantization, and reduced LoRA rank)
 - 📄 [IC-LoRA Training](../configs/ltx2_v2v_ic_lora.yaml) - Video-to-video transformation training
 
 ## ⚙️ Configuration Sections

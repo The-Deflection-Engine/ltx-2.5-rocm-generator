@@ -7,7 +7,6 @@ from optimum.quanto import qtype
 from ltx_trainer import logger
 
 QuantizationOptions = Literal[
-    "no_change",
     "int8-quanto",
     "int4-quanto",
     "int2-quanto",
@@ -30,37 +29,40 @@ def quantize_model(
     Returns:
         The quantized model, or the original model if no quantization is performed.
     """
-    if precision is None or precision == "no_change":
-        return model
-
     from optimum.quanto import freeze, quantize  # noqa: PLC0415
 
     weight_quant = _quanto_type_map(precision)
     extra_quanto_args = {
         "exclude": [
-            "proj_in",
-            "time_embed.*",
-            "caption_projection.*",
-            "rope",
-            "*norm*",
+            # Input/output projection layers
+            "patchify_proj",
+            "audio_patchify_proj",
             "proj_out",
+            "audio_proj_out",
+            # Timestep embedding layers - int4 tinygemm requires strict bfloat16 input
+            # and these receive float32 sinusoidal embeddings that are cast to bfloat16
+            "*adaln*",
+            "time_proj",
+            "timestep_embedder*",
+            # Caption/text projection layers
+            "caption_projection*",
+            "audio_caption_projection*",
+            # Normalization layers (usually excluded from quantization)
+            "*norm*",
         ]
     }
     if quantize_activations:
-        logger.info("Freezing model weights and activations")
+        logger.debug("Quantizing model weights and activations")
         extra_quanto_args["activations"] = weight_quant
     else:
-        logger.info("Freezing model weights only")
+        logger.debug("Quantizing model weights only")
 
     quantize(model, weights=weight_quant, **extra_quanto_args)
     freeze(model)
     return model
 
 
-def _quanto_type_map(precision: QuantizationOptions) -> torch.dtype | qtype | None:  # noqa: PLR0911
-    if precision == "no_change":
-        return None
-
+def _quanto_type_map(precision: QuantizationOptions) -> torch.dtype | qtype | None:
     from optimum.quanto import (  # noqa: PLC0415
         qfloat8,
         qfloat8_e4m3fnuz,
