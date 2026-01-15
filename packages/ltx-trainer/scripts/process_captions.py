@@ -220,7 +220,7 @@ class CaptionsDataset(Dataset):
                     break
 
 
-def compute_captions_embeddings(
+def compute_captions_embeddings(  # noqa: PLR0913
     dataset_file: str | Path,
     output_dir: str,
     model_path: str,
@@ -231,6 +231,7 @@ def compute_captions_embeddings(
     remove_llm_prefixes: bool = False,
     batch_size: int = 8,
     device: str = "cuda",
+    load_in_8bit: bool = False,
 ) -> None:
     """
     Process captions and save text embeddings.
@@ -245,6 +246,7 @@ def compute_captions_embeddings(
         remove_llm_prefixes: Whether to remove common LLM-generated prefixes
         batch_size: Batch size for processing
         device: Device to use for computation
+        load_in_8bit: Whether to load the Gemma text encoder in 8-bit precision
     """
 
     console = Console()
@@ -264,7 +266,13 @@ def compute_captions_embeddings(
 
     # Load text encoder
     with console.status("[bold]Loading Gemma text encoder...", spinner="dots"):
-        text_encoder = load_text_encoder(model_path, text_encoder_path, device=device, dtype=torch.bfloat16)
+        text_encoder = load_text_encoder(
+            model_path,
+            text_encoder_path,
+            device=device,
+            dtype=torch.bfloat16,
+            load_in_8bit=load_in_8bit,
+        )
 
     logger.info("Text encoder loaded successfully")
 
@@ -326,7 +334,7 @@ def compute_captions_embeddings(
 
 
 @app.command()
-def main(
+def main(  # noqa: PLR0913
     dataset_file: str = typer.Argument(
         ...,
         help="Path to metadata file (CSV/JSON/JSONL) containing captions and media paths",
@@ -368,6 +376,10 @@ def main(
         default=False,
         help="Remove common LLM-generated prefixes from captions",
     ),
+    load_text_encoder_in_8bit: bool = typer.Option(
+        default=False,
+        help="Load the Gemma text encoder in 8-bit precision to save GPU memory (requires bitsandbytes)",
+    ),
 ) -> None:
     """Process text captions and save embeddings for video generation training.
     This script processes captions from metadata files and saves text embeddings
@@ -408,6 +420,7 @@ def main(
         remove_llm_prefixes=remove_llm_prefixes,
         batch_size=batch_size,
         device=device,
+        load_in_8bit=load_text_encoder_in_8bit,
     )
 
 

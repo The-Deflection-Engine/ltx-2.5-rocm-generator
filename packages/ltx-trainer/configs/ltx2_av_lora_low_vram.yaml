@@ -176,7 +176,7 @@ acceleration:
 
   # Load text encoder in 8-bit precision to save memory
   # Useful when GPU memory is limited
-  load_text_encoder_in_8bit: false
+  load_text_encoder_in_8bit: true
 
 # -----------------------------------------------------------------------------
 # Data Configuration
