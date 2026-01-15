@@ -191,6 +191,7 @@ def load_text_encoder(
     gemma_model_path: str | Path,
     device: Device = "cpu",
     dtype: torch.dtype = torch.bfloat16,
+    load_in_8bit: bool = False,
 ) -> "AVGemmaTextEncoderModel":
     """Load the Gemma text encoder.
     Args:
@@ -198,18 +199,28 @@ def load_text_encoder(
         gemma_model_path: Path to Gemma model directory
         device: Device to load model on
         dtype: Data type for model weights
+        load_in_8bit: Whether to load the Gemma model in 8-bit precision using bitsandbytes.
+            When True, the model is loaded with device_map="auto" and the device argument
+            is ignored for the Gemma backbone (feature extractor still uses dtype).
     Returns:
         Loaded AVGemmaTextEncoderModel
     """
+    if not Path(gemma_model_path).is_dir():
+        raise ValueError(f"Gemma model path is not a directory: {gemma_model_path}")
+
+    # Use 8-bit loading path if requested
+    if load_in_8bit:
+        from ltx_trainer.gemma_8bit import load_8bit_gemma
+
+        return load_8bit_gemma(checkpoint_path, gemma_model_path, dtype)
+
+    # Standard loading path
     from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
     from ltx_core.text_encoders.gemma.encoders.av_encoder import (
         AV_GEMMA_TEXT_ENCODER_KEY_OPS,
         AVGemmaTextEncoderModelConfigurator,
     )
     from ltx_core.text_encoders.gemma.encoders.base_encoder import module_ops_from_gemma_root
-
-    if not Path(gemma_model_path).is_dir():
-        raise ValueError(f"Gemma model path is not a directory: {gemma_model_path}")
 
     torch_device = _to_torch_device(device)
     text_encoder = SingleGPUModelBuilder(
