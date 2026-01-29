@@ -35,6 +35,8 @@ from ltx_core.text_encoders.gemma import (
     AVGemmaTextEncoderModelConfigurator,
     module_ops_from_gemma_root,
 )
+from ltx_core.text_encoders.gemma.encoders.av_encoder import GEMMA_MODEL_OPS
+from ltx_core.utils import find_matching_file
 
 
 class ModelLedger:
@@ -143,12 +145,16 @@ class ModelLedger:
             )
 
             if self.gemma_root_path is not None:
+                module_ops = module_ops_from_gemma_root(self.gemma_root_path)
+                model_folder = find_matching_file(self.gemma_root_path, "model*.safetensors").parent
+                weight_paths = [str(p) for p in model_folder.rglob("*.safetensors")]
+
                 self.text_encoder_builder = Builder(
-                    model_path=self.checkpoint_path,
+                    model_path=(str(self.checkpoint_path), *weight_paths),
                     model_class_configurator=AVGemmaTextEncoderModelConfigurator,
                     model_sd_ops=AV_GEMMA_TEXT_ENCODER_KEY_OPS,
                     registry=self.registry,
-                    module_ops=module_ops_from_gemma_root(self.gemma_root_path),
+                    module_ops=(GEMMA_MODEL_OPS, *module_ops),
                 )
 
         if self.spatial_upsampler_path is not None:

@@ -795,6 +795,7 @@ class LtxvTrainer:
                 seed=self._config.validation.seed,
                 condition_image=condition_image,
                 reference_video=reference_video,
+                reference_downscale_factor=self._config.validation.reference_downscale_factor,
                 generate_audio=generate_audio,
                 include_reference_in_output=self._config.validation.include_reference_in_output,
                 cached_embeddings=cached_embeddings,
@@ -885,8 +886,11 @@ class LtxvTrainer:
             # Cast to configured precision
             state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in state_dict.items()}
 
-            # Save to disk
-            save_file(state_dict, saved_weights_path)
+            # Build metadata for safetensors file
+            metadata = self._build_checkpoint_metadata()
+
+            # Save to disk with metadata
+            save_file(state_dict, saved_weights_path, metadata=metadata)
         else:
             # Cast to configured precision
             full_state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in full_state_dict.items()}
@@ -912,6 +916,21 @@ class LtxvTrainer:
                     logger.info(f"Removed old checkpoints: {old_checkpoint}")
             # Update the list to only contain kept checkpoints
             self._checkpoint_paths = self._checkpoint_paths[-self._config.checkpoints.keep_last_n :]
+
+    def _build_checkpoint_metadata(self) -> dict[str, str]:
+        """Build metadata dictionary for safetensors checkpoint.
+        Delegates to the training strategy to get strategy-specific metadata
+        that downstream inference pipelines may need.
+        Returns:
+            Dictionary of string key-value pairs for safetensors metadata.
+            Values are converted to strings for safetensors compatibility.
+        """
+        raw_metadata = self._training_strategy.get_checkpoint_metadata()
+        # Convert all values to strings for safetensors compatibility
+        metadata = {k: str(v) for k, v in raw_metadata.items()}
+        if metadata:
+            logger.info(f"Saving checkpoint metadata: {metadata}")
+        return metadata
 
     def _save_config(self) -> None:
         """Save the training configuration as a YAML file in the output directory."""

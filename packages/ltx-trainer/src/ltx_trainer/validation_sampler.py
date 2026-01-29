@@ -85,6 +85,7 @@ class GenerationConfig:
     seed: int = 42  # Random seed for reproducibility
     condition_image: Tensor | None = None  # Optional first frame image for image-to-video
     reference_video: Tensor | None = None  # For IC-LoRA: [F, C, H, W] in [0, 1]
+    reference_downscale_factor: int = 1  # For IC-LoRA: downscale factor (1 = same resolution, 2 = half resolution)
     generate_audio: bool = True  # Whether to generate audio alongside video
     include_reference_in_output: bool = False  # For IC-LoRA: concatenate original reference with generated output
     cached_embeddings: CachedPromptEmbeddings | None = None  # Pre-computed text embeddings (avoids loading Gemma)
@@ -251,6 +252,14 @@ class ValidationSampler:
         ref_latent, ref_positions = self._encode_video(ref_video_preprocessed, config.frame_rate, device)
         ref_seq_len = ref_latent.shape[1]
 
+        # Scale reference positions to match target coordinate space
+        # Position tensor shape: [B, 3, seq_len, 2] where dim 1 is (time, height, width)
+        if config.reference_downscale_factor != 1:
+            ref_positions = ref_positions.clone()
+            ref_positions[:, 1, ...] *= config.reference_downscale_factor  # height axis
+            ref_positions[:, 2, ...] *= config.reference_downscale_factor  # width axis
+            # Time axis (index 0) remains unchanged
+
         # Create target video state
         video_tools = self._create_video_latent_tools(config)
         target_clean_state = video_tools.create_initial_state(device=device, dtype=torch.bfloat16)
@@ -375,13 +384,28 @@ class ValidationSampler:
     @staticmethod
     def _preprocess_reference_video(config: GenerationConfig) -> Tensor:
         """Preprocess reference video: resize, crop, and convert to model input format.
+        When reference_downscale_factor > 1, the reference video is downscaled to a smaller
+        resolution for more efficient inference. The positions will be scaled up later
+        to match the target coordinate space.
         Args:
-            config: Generation configuration with reference_video
+            config: Generation configuration
         Returns:
             Preprocessed video tensor [B, C, F, H, W] in [-1, 1] range
         """
         ref_video = config.reference_video  # [F, C, H, W] in [0, 1]
-        target_height, target_width = config.height, config.width
+        scale_factor = config.reference_downscale_factor
+
+        # Target dimensions for reference (scaled down if scale_factor > 1)
+        target_height = config.height // scale_factor
+        target_width = config.width // scale_factor
+
+        # Validate scaled dimensions
+        if target_height % 32 != 0 or target_width % 32 != 0:
+            raise ValueError(
+                f"Scaled reference dimensions ({target_height}x{target_width}) must be divisible by 32. "
+                f"Original: {config.height}x{config.width}, scale_factor: {scale_factor}"
+            )
+
         current_height, current_width = ref_video.shape[2:]
 
         # Resize maintaining aspect ratio and center crop if needed
@@ -745,11 +769,28 @@ class ValidationSampler:
         If the videos have different frame counts, the shorter one is padded with
         its last frame repeated.
         Args:
-            left_video: Left video tensor [C, F1, H, W] in [0, 1]
-            right_video: Right video tensor [C, F2, H, W] in [0, 1]
+            left_video: Left video tensor [C, F1, H1, W1] in [0, 1]
+            right_video: Right video tensor [C, F2, H2, W2] in [0, 1]
         Returns:
-            Concatenated video tensor [C, max(F1,F2), H, W*2] in [0, 1]
+            Concatenated video tensor [C, max(F1,F2), H2, W1_scaled+W2] in [0, 1]
         """
+        left_height, left_width = left_video.shape[2], left_video.shape[3]
+        right_height = right_video.shape[2]
+
+        # Resize left video to match right video's height if needed
+        if left_height != right_height:
+            # Scale width proportionally to maintain aspect ratio
+            scale = right_height / left_height
+            new_width = int(left_width * scale)
+            # Interpolate expects [N, C, H, W], we have [C, F, H, W]
+            # Reshape to [C*F, 1, H, W] -> interpolate -> reshape back
+            c, f, h, w = left_video.shape
+            left_video = left_video.reshape(c * f, 1, h, w)
+            left_video = torch.nn.functional.interpolate(
+                left_video, size=(right_height, new_width), mode="bilinear", align_corners=False
+            )
+            left_video = left_video.reshape(c, f, right_height, new_width)
+
         left_frames = left_video.shape[1]
         right_frames = right_video.shape[1]
 

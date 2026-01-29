@@ -8,6 +8,7 @@ from transformers import AutoImageProcessor, Gemma3ForConditionalGeneration, Gem
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.text_encoders.gemma.feature_extractor import GemmaFeaturesExtractorProjLinear
 from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
+from ltx_core.utils import find_matching_file
 
 
 class GemmaTextEncoderModelBase(torch.nn.Module):
@@ -77,7 +78,7 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
         messages: list[dict[str, str]],
         image: torch.Tensor | None = None,
         max_new_tokens: int = 512,
-        seed: int = 42,
+        seed: int = 10,
     ) -> str:
         text = self.processor.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -107,7 +108,7 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
         prompt: str,
         max_new_tokens: int = 512,
         system_prompt: str | None = None,
-        seed: int = 42,
+        seed: int = 10,
     ) -> str:
         """Enhance a text prompt for T2V generation."""
 
@@ -126,7 +127,7 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
         image: torch.Tensor,
         max_new_tokens: int = 512,
         system_prompt: str | None = None,
-        seed: int = 42,
+        seed: int = 10,
     ) -> str:
         """Enhance a text prompt for I2V generation using a reference image."""
         system_prompt = system_prompt or self.default_gemma_i2v_system_prompt
@@ -219,44 +220,21 @@ def _load_system_prompt(prompt_name: str) -> str:
         return f.read()
 
 
-def _find_matching_dir(root_path: str, pattern: str) -> str:
-    """
-    Recursively search for files matching a glob pattern and return the parent directory of the first match.
-    """
-
-    matches = list(Path(root_path).rglob(pattern))
-    if not matches:
-        raise FileNotFoundError(f"No files matching pattern '{pattern}' found under {root_path}")
-    return str(matches[0].parent)
-
-
 def module_ops_from_gemma_root(gemma_root: str) -> tuple[ModuleOps, ...]:
-    gemma_path = _find_matching_dir(gemma_root, "model*.safetensors")
-    tokenizer_path = _find_matching_dir(gemma_root, "tokenizer.model")
-    processor_path = _find_matching_dir(gemma_root, "preprocessor_config.json")
-
-    def load_gemma(module: GemmaTextEncoderModelBase) -> GemmaTextEncoderModelBase:
-        module.model = Gemma3ForConditionalGeneration.from_pretrained(
-            gemma_path, local_files_only=True, torch_dtype=torch.bfloat16
-        )
-        return module
+    tokenizer_root = str(find_matching_file(gemma_root, "tokenizer.model").parent)
+    processor_root = str(find_matching_file(gemma_root, "preprocessor_config.json").parent)
 
     def load_tokenizer(module: GemmaTextEncoderModelBase) -> GemmaTextEncoderModelBase:
-        module.tokenizer = LTXVGemmaTokenizer(tokenizer_path, 1024)
+        module.tokenizer = LTXVGemmaTokenizer(tokenizer_root, 1024)
         return module
 
     def load_processor(module: GemmaTextEncoderModelBase) -> GemmaTextEncoderModelBase:
-        image_processor = AutoImageProcessor.from_pretrained(processor_path, local_files_only=True)
+        image_processor = AutoImageProcessor.from_pretrained(processor_root, local_files_only=True)
         if not module.tokenizer:
             raise ValueError("Tokenizer model operation must be performed before processor model operation")
         module.processor = Gemma3Processor(image_processor=image_processor, tokenizer=module.tokenizer.tokenizer)
         return module
 
-    gemma_load_ops = ModuleOps(
-        "GemmaLoad",
-        matcher=lambda module: isinstance(module, GemmaTextEncoderModelBase) and module.model is None,
-        mutator=load_gemma,
-    )
     tokenizer_load_ops = ModuleOps(
         "TokenizerLoad",
         matcher=lambda module: isinstance(module, GemmaTextEncoderModelBase) and module.tokenizer is None,
@@ -267,7 +245,7 @@ def module_ops_from_gemma_root(gemma_root: str) -> tuple[ModuleOps, ...]:
         matcher=lambda module: isinstance(module, GemmaTextEncoderModelBase) and module.processor is None,
         mutator=load_processor,
     )
-    return (gemma_load_ops, tokenizer_load_ops, processor_load_ops)
+    return (tokenizer_load_ops, processor_load_ops)
 
 
 def encode_text(text_encoder: GemmaTextEncoderModelBase, prompts: list[str]) -> list[tuple[torch.Tensor, torch.Tensor]]:

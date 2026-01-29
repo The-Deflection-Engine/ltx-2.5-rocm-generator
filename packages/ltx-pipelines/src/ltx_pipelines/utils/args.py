@@ -7,13 +7,14 @@ from ltx_pipelines.utils.constants import (
     DEFAULT_1_STAGE_WIDTH,
     DEFAULT_2_STAGE_HEIGHT,
     DEFAULT_2_STAGE_WIDTH,
-    DEFAULT_CFG_GUIDANCE_SCALE,
+    DEFAULT_AUDIO_GUIDER_PARAMS,
     DEFAULT_FRAME_RATE,
     DEFAULT_LORA_STRENGTH,
     DEFAULT_NEGATIVE_PROMPT,
     DEFAULT_NUM_FRAMES,
     DEFAULT_NUM_INFERENCE_STEPS,
     DEFAULT_SEED,
+    DEFAULT_VIDEO_GUIDER_PARAMS,
 )
 
 
@@ -186,16 +187,6 @@ def basic_arg_parser() -> argparse.ArgumentParser:
 def default_1_stage_arg_parser() -> argparse.ArgumentParser:
     parser = basic_arg_parser()
     parser.add_argument(
-        "--cfg-guidance-scale",
-        type=float,
-        default=DEFAULT_CFG_GUIDANCE_SCALE,
-        help=(
-            f"Classifier-free guidance (CFG) scale controlling how strongly "
-            f"the model adheres to the prompt. Higher values increase prompt "
-            f"adherence but may reduce diversity (default: {DEFAULT_CFG_GUIDANCE_SCALE})."
-        ),
-    )
-    parser.add_argument(
         "--negative-prompt",
         type=str,
         default=DEFAULT_NEGATIVE_PROMPT,
@@ -205,7 +196,126 @@ def default_1_stage_arg_parser() -> argparse.ArgumentParser:
             "Default: a comprehensive negative prompt covering common artifacts and quality issues."
         ),
     )
-
+    parser.add_argument(
+        "--video-cfg-guidance-scale",
+        type=float,
+        default=DEFAULT_VIDEO_GUIDER_PARAMS.cfg_scale,
+        help=(
+            f"Classifier-free guidance (CFG) scale controlling how strongly "
+            f"the model adheres to the video prompt. Higher values increase prompt "
+            "adherence but may reduce diversity. 1.0 means no effect "
+            f"(default: {DEFAULT_VIDEO_GUIDER_PARAMS.cfg_scale})."
+        ),
+    )
+    parser.add_argument(
+        "--video-stg-guidance-scale",
+        type=float,
+        default=DEFAULT_VIDEO_GUIDER_PARAMS.stg_scale,
+        help=(
+            f"STG (Spatio-Temporal Guidance) scale controlling how strongly "
+            f"the model reacts to the perturbation of the video modality. Higher values increase "
+            f"the effect but may reduce quality. 0.0 means no effect "
+            f"(default: {DEFAULT_VIDEO_GUIDER_PARAMS.stg_scale})."
+        ),
+    )
+    parser.add_argument(
+        "--video-rescale-scale",
+        type=float,
+        default=DEFAULT_VIDEO_GUIDER_PARAMS.rescale_scale,
+        help=(
+            f"Rescale scale controlling how strongly "
+            f"the model rescales the video modality after applying other guidance. Higher values tend to decrease "
+            f"oversaturation effects. 0.0 means no effect (default: {DEFAULT_VIDEO_GUIDER_PARAMS.rescale_scale})."
+        ),
+    )
+    parser.add_argument(
+        "--video-stg-blocks",
+        type=int,
+        nargs="*",
+        default=DEFAULT_VIDEO_GUIDER_PARAMS.stg_blocks,
+        help=(f"Which transformer blocks to perturb for STG. Default: {DEFAULT_VIDEO_GUIDER_PARAMS.stg_blocks}."),
+    )
+    parser.add_argument(
+        "--a2v-guidance-scale",
+        type=float,
+        default=DEFAULT_VIDEO_GUIDER_PARAMS.modality_scale,
+        help=(
+            f"A2V (Audio-to-Video) guidance scale controlling how strongly "
+            f"the model reacts to the perturbation of the audio-to-video cross-attention. Higher values may increase "
+            f"lipsync quality. 1.0 means no effect (default: {DEFAULT_VIDEO_GUIDER_PARAMS.modality_scale})."
+        ),
+    )
+    parser.add_argument(
+        "--video-skip-step",
+        type=int,
+        default=DEFAULT_VIDEO_GUIDER_PARAMS.skip_step,
+        help=(
+            "Video skip step N controls periodic skipping during the video diffusion process: "
+            "only steps where step_index % (N + 1) == 0 are processed, all others are skipped "
+            f"(e.g., 0 = no skipping; 1 = skip every other step; 2 = skip 2 of every 3 steps; "
+            f"default: {DEFAULT_VIDEO_GUIDER_PARAMS.skip_step})."
+        ),
+    )
+    parser.add_argument(
+        "--audio-cfg-guidance-scale",
+        type=float,
+        default=DEFAULT_AUDIO_GUIDER_PARAMS.cfg_scale,
+        help=(
+            f"Audio CFG (Classifier-free guidance) scale controlling how strongly "
+            f"the model adheres to the audio prompt. Higher values increase prompt "
+            f"adherence but may reduce diversity. 1.0 means no effect "
+            f"(default: {DEFAULT_AUDIO_GUIDER_PARAMS.cfg_scale})."
+        ),
+    )
+    parser.add_argument(
+        "--audio-stg-guidance-scale",
+        type=float,
+        default=DEFAULT_AUDIO_GUIDER_PARAMS.stg_scale,
+        help=(
+            f"Audio STG (Spatio-Temporal Guidance) scale controlling how strongly "
+            f"the model reacts to the perturbation of the audio modality. Higher values increase "
+            f"the effect but may reduce quality. 0.0 means no effect "
+            f"(default: {DEFAULT_AUDIO_GUIDER_PARAMS.stg_scale})."
+        ),
+    )
+    parser.add_argument(
+        "--audio-rescale-scale",
+        type=float,
+        default=DEFAULT_AUDIO_GUIDER_PARAMS.rescale_scale,
+        help=(
+            f"Audio rescale scale controlling how strongly "
+            f"the model rescales the audio modality after applying other guidance. "
+            f"Experimental. 0.0 means no effect (default: {DEFAULT_AUDIO_GUIDER_PARAMS.rescale_scale})."
+        ),
+    )
+    parser.add_argument(
+        "--audio-stg-blocks",
+        type=int,
+        nargs="*",
+        default=DEFAULT_AUDIO_GUIDER_PARAMS.stg_blocks,
+        help=(f"Which transformer blocks to perturb for Audio STG. Default: {DEFAULT_AUDIO_GUIDER_PARAMS.stg_blocks}."),
+    )
+    parser.add_argument(
+        "--v2a-guidance-scale",
+        type=float,
+        default=DEFAULT_AUDIO_GUIDER_PARAMS.modality_scale,
+        help=(
+            f"V2A (Video-to-Audio) guidance scale controlling how strongly "
+            f"the model reacts to the perturbation of the video-to-audio cross-attention. Higher values may increase "
+            f"lipsync quality. 1.0 means no effect (default: {DEFAULT_AUDIO_GUIDER_PARAMS.modality_scale})."
+        ),
+    )
+    parser.add_argument(
+        "--audio-skip-step",
+        type=int,
+        default=DEFAULT_AUDIO_GUIDER_PARAMS.skip_step,
+        help=(
+            "Audio skip step N controls periodic skipping during the audio diffusion process: "
+            "only steps where step_index % (N + 1) == 0 are processed, all others are skipped "
+            f"(e.g., 0 = no skipping; 1 = skip every other step; 2 = skip 2 of every 3 steps; "
+            f"default: {DEFAULT_AUDIO_GUIDER_PARAMS.skip_step})."
+        ),
+    )
     return parser
 
 

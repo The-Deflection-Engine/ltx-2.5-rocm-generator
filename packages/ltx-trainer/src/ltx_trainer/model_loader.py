@@ -218,16 +218,22 @@ def load_text_encoder(
     from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
     from ltx_core.text_encoders.gemma.encoders.av_encoder import (
         AV_GEMMA_TEXT_ENCODER_KEY_OPS,
+        GEMMA_MODEL_OPS,
         AVGemmaTextEncoderModelConfigurator,
     )
     from ltx_core.text_encoders.gemma.encoders.base_encoder import module_ops_from_gemma_root
+    from ltx_core.utils import find_matching_file
 
     torch_device = _to_torch_device(device)
+
+    gemma_model_folder = find_matching_file(str(gemma_model_path), "model*.safetensors").parent
+    gemma_weight_paths = [str(p) for p in gemma_model_folder.rglob("*.safetensors")]
+
     text_encoder = SingleGPUModelBuilder(
-        model_path=str(checkpoint_path),
+        model_path=(str(checkpoint_path), *gemma_weight_paths),
         model_class_configurator=AVGemmaTextEncoderModelConfigurator,
         model_sd_ops=AV_GEMMA_TEXT_ENCODER_KEY_OPS,
-        module_ops=module_ops_from_gemma_root(str(gemma_model_path)),
+        module_ops=(GEMMA_MODEL_OPS, *module_ops_from_gemma_root(str(gemma_model_path))),
     ).build(device=torch_device, dtype=dtype)
 
     return text_encoder
