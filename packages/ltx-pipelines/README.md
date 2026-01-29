@@ -89,7 +89,7 @@ Do you need to condition on existing images/videos?
 
 ### Features Comparison
 
-| Pipeline | Stages | CFG | Upsampling | Conditioning | Best For |
+| Pipeline | Stages | [Multimodal Guidance](#%EF%B8%8F-multimodal-guidance) | Upsampling | Conditioning | Best For |
 | -------- | ------ | --- | ---------- | ------------- | -------- |
 | **TI2VidTwoStagesPipeline** | 2 | ✅ | ✅ | Image | **Production quality** (recommended) |
 | **TI2VidOneStagePipeline** | 1 | ✅ | ❌ | Image | Educational, prototyping |
@@ -107,7 +107,7 @@ Do you need to condition on existing images/videos?
 
 **Source**: [`src/ltx_pipelines/ti2vid_two_stages.py`](src/ltx_pipelines/ti2vid_two_stages.py)
 
-Two-stage generation: Stage 1 generates low-resolution video with CFG guidance, Stage 2 upsamples to 2x resolution with distilled LoRA refinement. Supports image conditioning. Highest quality output, slower than one-stage but significantly better quality.
+Two-stage generation: Stage 1 generates low-resolution video with [multimodal guidance](#%EF%B8%8F-multimodal-guidance), Stage 2 upsamples to 2x resolution with distilled LoRA refinement. Supports image conditioning. Highest quality output, slower than one-stage but significantly better quality.
 
 **Use when:** Production-quality video generation, higher resolution needed, quality over speed, text-to-video with image conditioning.
 
@@ -121,7 +121,7 @@ Two-stage generation: Stage 1 generates low-resolution video with CFG guidance, 
 
 > **⚠️ Important:** This pipeline is primarily for educational purposes. For production-quality results, use `TI2VidTwoStagesPipeline` or other two-stage pipelines.
 
-Single-stage generation (no upsampling) with CFG guidance and image conditioning support. Faster inference but lower resolution output (typically 512x768).
+Single-stage generation (no upsampling) with [multimodal guidance](#%EF%B8%8F-multimodal-guidance) and image conditioning support. Faster inference but lower resolution output (typically 512x768).
 
 **Use when:** Learning how the pipeline works, quick prototyping, testing, or when high resolution is not needed.
 
@@ -133,7 +133,7 @@ Single-stage generation (no upsampling) with CFG guidance and image conditioning
 
 **Source**: [`src/ltx_pipelines/distilled.py`](src/ltx_pipelines/distilled.py)
 
-Two-stage generation with 8 predefined sigmas (8 steps in stage 1, 4 steps in stage 2). No CFG guidance required. Fastest inference among all pipelines. Supports image conditioning. Requires spatial upsampler.
+Two-stage generation with 8 predefined sigmas (8 steps in stage 1, 4 steps in stage 2). No guidance required. Fastest inference among all pipelines. Supports image conditioning. Requires spatial upsampler.
 
 **Use when:** Fastest inference is critical, batch processing many videos, or when you have a distilled model checkpoint.
 
@@ -157,7 +157,7 @@ Two-stage generation with IC-LoRA support. Can condition on reference videos (vi
 
 **Source**: [`src/ltx_pipelines/keyframe_interpolation.py`](src/ltx_pipelines/keyframe_interpolation.py)
 
-Two-stage generation with keyframe interpolation. Uses guiding latents (additive conditioning) instead of replacing latents for smoother transitions. CFG guidance in stage 1, upsampling in stage 2.
+Two-stage generation with keyframe interpolation. Uses guiding latents (additive conditioning) instead of replacing latents for smoother transitions. [Multimodal guidance](#%EF%B8%8F-multimodal-guidance) in stage 1, upsampling in stage 2.
 
 **Use when:** You have keyframe images and want to interpolate between them, creating smooth transitions, or animation/motion interpolation tasks.
 
@@ -187,6 +187,61 @@ All pipelines support image conditioning, but with different methods:
   - Conditions on entire reference videos
   - Useful for video-to-video transformations
   - Uses `VideoConditionByKeyframeIndex` from [`ltx-core`](../ltx-core/)
+
+---
+
+## 🎛️ Multimodal Guidance
+
+LTX-2 pipelines use **multimodal guidance** to steer the diffusion process for both video and audio modalities. Each modality (video, audio) has its own guider with independent parameters, allowing fine-grained control over generation quality and adherence to prompts.
+
+### Guidance Parameters
+
+The `MultiModalGuiderParams` dataclass controls guidance behavior:
+
+| Parameter | Description |
+| --------- | ----------- |
+| `cfg_scale` | **Classifier-Free Guidance** scale. Higher values make the output adhere more strongly to the text prompt. Typical values: 2.0–5.0. Set to **1.0** to disable. |
+| `stg_scale` | **Spatio-Temporal Guidance** scale. Controls perturbation-based guidance for improved temporal coherence. Typical values: 0.5–1.5. Set to **0.0** to disable. |
+| `stg_blocks` | Which transformer blocks to perturb for STG (e.g., `[29]` for the last block). Set to **`[]`** to disable STG. |
+| `rescale_scale` | Rescales the guided prediction to match the variance of the conditional prediction. Helps prevent over-saturation. Typical values: 0.5–0.7. Set to **0.0** to disable. |
+| `modality_scale` | **Modality CFG** scale. Steers the model away from unsynced video and audio results, improving audio-visual coherence. Set to **1.0** to disable. |
+| `skip_step` | Skip guidance every N steps. Can speed up inference with minimal quality loss. Set to **0** to disable (never skip). |
+
+### How It Works
+
+The multimodal guider combines three guidance signals during each denoising step:
+
+1. **CFG (Text Guidance)**: Steers generation toward the text prompt by computing `(cond - uncond_text)`.
+2. **STG (Perturbation Guidance)**: Improves structural coherence by perturbing specific transformer blocks and steering away from the perturbed prediction.
+3. **Modality CFG**: For joint audio-video generation, steers the model away from unsynced video and audio results.
+
+### Example Configuration
+
+```python
+from ltx_core.components.guiders import MultiModalGuiderParams
+
+# Video guider: moderate CFG, STG enabled, modality isolation
+video_guider_params = MultiModalGuiderParams(
+    cfg_scale=3.0,
+    stg_scale=1.0,
+    rescale_scale=0.7,
+    modality_scale=3.0,
+    stg_blocks=[29],
+)
+
+# Audio guider: higher CFG for stronger prompt adherence
+audio_guider_params = MultiModalGuiderParams(
+    cfg_scale=7.0,
+    stg_scale=1.0,
+    rescale_scale=0.7,
+    modality_scale=3.0,
+    stg_blocks=[29],
+)
+```
+
+> **Tip:** Start with the default values from [`constants.py`](src/ltx_pipelines/utils/constants.py) and adjust based on your use case. Higher `cfg_scale` = stronger prompt adherence but potentially less natural motion; higher `stg_scale` = better temporal coherence but slower inference (requires extra forward passes).
+>
+> **Tip:** When generating video with audio, set `modality_scale` > 1.0 (e.g., 3.0) to improve audio-visual sync. If generating video-only, set it to 1.0 to disable.
 
 ---
 
@@ -276,6 +331,7 @@ This allows you to use **20-30 steps instead of 40** while maintaining quality. 
 ```python
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
+from ltx_core.components.guiders import MultiModalGuiderParams
 
 distilled_lora = [
     LoraPathStrengthAndSDOps(
@@ -293,6 +349,24 @@ pipeline = TI2VidTwoStagesPipeline(
     loras=[],
 )
 
+video_guider_params = MultiModalGuiderParams(
+    cfg_scale=3.0,
+    stg_scale=1.0,
+    rescale_scale=0.7,
+    modality_scale=3.0,
+    skip_step=0,
+    stg_blocks=[29],
+)
+
+audio_guider_params = MultiModalGuiderParams(
+    cfg_scale=7.0,
+    stg_scale=1.0,
+    rescale_scale=0.7,
+    modality_scale=3.0,
+    skip_step=0,
+    stg_blocks=[29],
+)
+
 # Generate video from image
 pipeline(
     prompt="A serene landscape with mountains in the background",
@@ -303,7 +377,8 @@ pipeline(
     num_frames=121,
     frame_rate=25.0,
     num_inference_steps=40,
-    cfg_guidance_scale=3.0,
+    video_guider_params=video_guider_params,
+    audio_guider_params=audio_guider_params,
     images=[("input_image.jpg", 0, 1.0)],  # Image at frame 0, strength 1.0
 )
 ```

@@ -128,6 +128,15 @@ class TrainingStrategy(ABC):
             Scalar loss tensor
         """
 
+    def get_checkpoint_metadata(self) -> dict[str, Any]:
+        """Get strategy-specific metadata to include in checkpoint files.
+        Override this method in subclasses to add custom metadata,
+        e.g. any parameters that a downstream inference pipeline may need.
+        Returns:
+            Dictionary of metadata key-value pairs (values must be JSON-serializable)
+        """
+        return {}
+
     def _get_video_positions(
         self,
         num_frames: int,

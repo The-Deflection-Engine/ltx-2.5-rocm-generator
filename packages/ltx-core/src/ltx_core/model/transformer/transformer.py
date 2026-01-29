@@ -140,7 +140,11 @@ class BasicAVTransformerBlock(torch.nn.Module):
         audio: TransformerArgs | None,
         perturbations: BatchedPerturbationConfig | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
-        batch_size = video.x.shape[0]
+        if video is None and audio is None:
+            raise ValueError("At least one of video or audio must be provided")
+
+        batch_size = (video or audio).x.shape[0]
+
         if perturbations is None:
             perturbations = BatchedPerturbationConfig.empty(batch_size)
 
@@ -211,7 +215,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 video.cross_gate_timestep,
             )
 
-            if run_a2v:
+            if run_a2v and not perturbations.all_in_batch(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx):
                 vx_scaled = vx_norm3 * (1 + scale_ca_video_hidden_states_a2v) + shift_ca_video_hidden_states_a2v
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_a2v) + shift_ca_audio_hidden_states_a2v
                 a2v_mask = perturbations.mask_like(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx, vx)
@@ -226,7 +230,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     * a2v_mask
                 )
 
-            if run_v2a:
+            if run_v2a and not perturbations.all_in_batch(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx):
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_v2a) + shift_ca_audio_hidden_states_v2a
                 vx_scaled = vx_norm3 * (1 + scale_ca_video_hidden_states_v2a) + shift_ca_video_hidden_states_v2a
                 v2a_mask = perturbations.mask_like(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx, ax)

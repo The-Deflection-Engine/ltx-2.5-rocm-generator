@@ -891,6 +891,50 @@ def parse_resolution_buckets(resolution_buckets_str: str) -> list[tuple[int, int
     return resolution_buckets
 
 
+def compute_scaled_resolution_buckets(
+    resolution_buckets: list[tuple[int, int, int]],
+    scale_factor: int,
+) -> list[tuple[int, int, int]]:
+    """Compute scaled resolution buckets and validate the results."""
+    if scale_factor == 1:
+        return resolution_buckets
+
+    scaled_buckets = []
+    for frames, height, width in resolution_buckets:
+        # Validate that scale factor evenly divides the dimensions
+        if height % scale_factor != 0:
+            raise ValueError(
+                f"Height {height} is not evenly divisible by scale factor {scale_factor}. "
+                f"Choose a scale factor that divides {height} evenly."
+            )
+        if width % scale_factor != 0:
+            raise ValueError(
+                f"Width {width} is not evenly divisible by scale factor {scale_factor}. "
+                f"Choose a scale factor that divides {width} evenly."
+            )
+
+        scaled_height = height // scale_factor
+        scaled_width = width // scale_factor
+
+        # Validate scaled dimensions are divisible by VAE spatial factor
+        if scaled_height % VAE_SPATIAL_FACTOR != 0:
+            raise ValueError(
+                f"Scaled height {scaled_height} (from {height} / {scale_factor}) "
+                f"is not divisible by {VAE_SPATIAL_FACTOR}. "
+                f"Choose a different scale factor or adjust your resolution buckets."
+            )
+        if scaled_width % VAE_SPATIAL_FACTOR != 0:
+            raise ValueError(
+                f"Scaled width {scaled_width} (from {width} / {scale_factor}) "
+                f"is not divisible by {VAE_SPATIAL_FACTOR}. "
+                f"Choose a different scale factor or adjust your resolution buckets."
+            )
+
+        scaled_buckets.append((frames, scaled_height, scaled_width))
+
+    return scaled_buckets
+
+
 @app.command()
 def main(  # noqa: PLR0913
     dataset_file: str = typer.Argument(

@@ -9,7 +9,7 @@ dependencies = [
     "torchaudio",
     "einops",
     "numpy",
-    "transformers",
+    "transformers~=4.57.0",
     "safetensors",
     "accelerate",
     "scipy>=1.14",

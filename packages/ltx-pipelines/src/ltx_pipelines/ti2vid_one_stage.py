@@ -4,7 +4,7 @@ from collections.abc import Iterator
 import torch
 
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
-from ltx_core.components.guiders import CFGGuider
+from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
@@ -23,8 +23,8 @@ from ltx_pipelines.utils.helpers import (
     euler_denoising_loop,
     generate_enhanced_prompt,
     get_device,
-    guider_denoising_func,
     image_conditionings_by_replacing_latent,
+    multi_modal_guider_denoising_func,
 )
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import PipelineComponents
@@ -73,7 +73,8 @@ class TI2VidOneStagePipeline:
         num_frames: int,
         frame_rate: float,
         num_inference_steps: int,
-        cfg_guidance_scale: float,
+        video_guider_params: MultiModalGuiderParams,
+        audio_guider_params: MultiModalGuiderParams,
         images: list[tuple[str, int, float]],
         enhance_prompt: bool = False,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
@@ -82,7 +83,6 @@ class TI2VidOneStagePipeline:
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
         stepper = EulerDiffusionStep()
-        cfg_guider = CFGGuider(cfg_guidance_scale)
         dtype = torch.bfloat16
 
         text_encoder = self.model_ledger.text_encoder()
@@ -111,12 +111,17 @@ class TI2VidOneStagePipeline:
                 video_state=video_state,
                 audio_state=audio_state,
                 stepper=stepper,
-                denoise_fn=guider_denoising_func(
-                    cfg_guider,
-                    v_context_p,
-                    v_context_n,
-                    a_context_p,
-                    a_context_n,
+                denoise_fn=multi_modal_guider_denoising_func(
+                    video_guider=MultiModalGuider(
+                        params=video_guider_params,
+                        negative_context=v_context_n,
+                    ),
+                    audio_guider=MultiModalGuider(
+                        params=audio_guider_params,
+                        negative_context=a_context_n,
+                    ),
+                    v_context=v_context_p,
+                    a_context=a_context_p,
                     transformer=transformer,  # noqa: F821
                 ),
             )
@@ -175,7 +180,22 @@ def main() -> None:
         num_frames=args.num_frames,
         frame_rate=args.frame_rate,
         num_inference_steps=args.num_inference_steps,
-        cfg_guidance_scale=args.cfg_guidance_scale,
+        video_guider_params=MultiModalGuiderParams(
+            cfg_scale=args.video_cfg_guidance_scale,
+            stg_scale=args.video_stg_guidance_scale,
+            rescale_scale=args.video_rescale_scale,
+            modality_scale=args.a2v_guidance_scale,
+            skip_step=args.video_skip_step,
+            stg_blocks=args.video_stg_blocks,
+        ),
+        audio_guider_params=MultiModalGuiderParams(
+            cfg_scale=args.audio_cfg_guidance_scale,
+            stg_scale=args.audio_stg_guidance_scale,
+            rescale_scale=args.audio_rescale_scale,
+            modality_scale=args.v2a_guidance_scale,
+            skip_step=args.audio_skip_step,
+            stg_blocks=args.audio_stg_blocks,
+        ),
         images=args.images,
     )
 

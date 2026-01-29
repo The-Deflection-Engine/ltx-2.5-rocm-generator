@@ -207,6 +207,14 @@ class ValidationConfig(ConfigBaseModel):
         "One video path must be provided for each validation prompt",
     )
 
+    reference_downscale_factor: int = Field(
+        default=1,
+        description="Downscale factor for reference videos in IC-LoRA validation. "
+        "When > 1, reference videos are processed at 1/n resolution (e.g., 2 means half resolution). "
+        "Must match the factor used during dataset preprocessing.",
+        ge=1,
+    )
+
     video_dims: tuple[int, int, int] = Field(
         default=(960, 544, 97),
         description="Dimensions of validation videos (width, height, frames). "
@@ -333,6 +341,41 @@ class ValidationConfig(ConfigBaseModel):
                 raise ValueError(f"Reference video path '{video_path}' does not exist")
 
         return v
+
+    @model_validator(mode="after")
+    def validate_scaled_reference_dimensions(self) -> "ValidationConfig":
+        """Validate that scaled reference dimensions are valid when reference_downscale_factor > 1."""
+        if self.reference_downscale_factor > 1:
+            width, height, _frames = self.video_dims
+
+            # Validate that downscale factor evenly divides the target dimensions
+            if width % self.reference_downscale_factor != 0:
+                raise ValueError(
+                    f"Width {width} is not evenly divisible by reference_downscale_factor "
+                    f"{self.reference_downscale_factor}. Choose a downscale factor that divides {width} evenly."
+                )
+            if height % self.reference_downscale_factor != 0:
+                raise ValueError(
+                    f"Height {height} is not evenly divisible by reference_downscale_factor "
+                    f"{self.reference_downscale_factor}. Choose a downscale factor that divides {height} evenly."
+                )
+
+            scaled_width = width // self.reference_downscale_factor
+            scaled_height = height // self.reference_downscale_factor
+
+            # Validate scaled dimensions are divisible by 32
+            if scaled_width % 32 != 0:
+                raise ValueError(
+                    f"Scaled reference width {scaled_width} (from {width} / {self.reference_downscale_factor}) "
+                    f"is not divisible by 32. Choose a different downscale factor or adjust video_dims."
+                )
+            if scaled_height % 32 != 0:
+                raise ValueError(
+                    f"Scaled reference height {scaled_height} (from {height} / {self.reference_downscale_factor}) "
+                    f"is not divisible by 32. Choose a different downscale factor or adjust video_dims."
+                )
+
+        return self
 
 
 class CheckpointsConfig(ConfigBaseModel):
