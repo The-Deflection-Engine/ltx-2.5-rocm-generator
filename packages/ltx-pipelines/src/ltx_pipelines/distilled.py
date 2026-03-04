@@ -13,19 +13,22 @@ from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.text_encoders.gemma import encode_text
-from ltx_core.types import LatentState, VideoPixelShape
-from ltx_pipelines.utils import ModelLedger
-from ltx_pipelines.utils.args import default_2_stage_distilled_arg_parser
+from ltx_core.types import Audio, LatentState, VideoPixelShape
+from ltx_pipelines.utils import ModelLedger, euler_denoising_loop
+from ltx_pipelines.utils.args import (
+    ImageConditioningInput,
+    default_2_stage_distilled_arg_parser,
+    detect_checkpoint_path,
+)
 from ltx_pipelines.utils.constants import (
-    AUDIO_SAMPLE_RATE,
     DISTILLED_SIGMA_VALUES,
     STAGE_2_DISTILLED_SIGMA_VALUES,
+    detect_params,
 )
 from ltx_pipelines.utils.helpers import (
     assert_resolution,
     cleanup_memory,
     denoise_audio_video,
-    euler_denoising_loop,
     generate_enhanced_prompt,
     get_device,
     image_conditionings_by_replacing_latent,
@@ -40,13 +43,13 @@ device = get_device()
 class DistilledPipeline:
     """
     Two-stage distilled video generation pipeline.
-    Stage 1 generates video at the target resolution, then Stage 2 upsamples
+    Stage 1 generates video at half of the target resolution, then Stage 2 upsamples
     by 2x and refines with additional denoising steps for higher quality output.
     """
 
     def __init__(
         self,
-        checkpoint_path: str,
+        distilled_checkpoint_path: str,
         gemma_root: str,
         spatial_upsampler_path: str,
         loras: list[LoraPathStrengthAndSDOps],
@@ -59,7 +62,7 @@ class DistilledPipeline:
         self.model_ledger = ModelLedger(
             dtype=self.dtype,
             device=device,
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=distilled_checkpoint_path,
             spatial_upsampler_path=spatial_upsampler_path,
             gemma_root_path=gemma_root,
             loras=loras,
@@ -79,10 +82,10 @@ class DistilledPipeline:
         width: int,
         num_frames: int,
         frame_rate: float,
-        images: list[tuple[str, int, float]],
+        images: list[ImageConditioningInput],
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
-    ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
+    ) -> tuple[Iterator[torch.Tensor], Audio]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
@@ -198,10 +201,12 @@ class DistilledPipeline:
 @torch.inference_mode()
 def main() -> None:
     logging.getLogger().setLevel(logging.INFO)
-    parser = default_2_stage_distilled_arg_parser()
+    checkpoint_path = detect_checkpoint_path(distilled=True)
+    params = detect_params(checkpoint_path)
+    parser = default_2_stage_distilled_arg_parser(params=params)
     args = parser.parse_args()
     pipeline = DistilledPipeline(
-        checkpoint_path=args.checkpoint_path,
+        distilled_checkpoint_path=args.distilled_checkpoint_path,
         spatial_upsampler_path=args.spatial_upsampler_path,
         gemma_root=args.gemma_root,
         loras=args.lora,
@@ -225,7 +230,6 @@ def main() -> None:
         video=video,
         fps=args.frame_rate,
         audio=audio,
-        audio_sample_rate=AUDIO_SAMPLE_RATE,
         output_path=args.output_path,
         video_chunks_number=video_chunks_number,
     )

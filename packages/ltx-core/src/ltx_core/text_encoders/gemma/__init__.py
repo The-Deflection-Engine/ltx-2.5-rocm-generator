@@ -1,31 +1,25 @@
 """Gemma text encoder components."""
 
-from ltx_core.text_encoders.gemma.encoders.av_encoder import (
-    AV_GEMMA_TEXT_ENCODER_KEY_OPS,
-    AVGemmaEncoderOutput,
-    AVGemmaTextEncoderModel,
-    AVGemmaTextEncoderModelConfigurator,
-)
 from ltx_core.text_encoders.gemma.encoders.base_encoder import (
-    GemmaTextEncoderModelBase,
+    GemmaEncoderOutput,
+    GemmaTextEncoder,
     encode_text,
     module_ops_from_gemma_root,
 )
-from ltx_core.text_encoders.gemma.encoders.video_only_encoder import (
-    VideoGemmaEncoderOutput,
-    VideoGemmaTextEncoderModel,
-    VideoGemmaTextEncoderModelConfigurator,
+from ltx_core.text_encoders.gemma.encoders.encoder_configurator import (
+    AV_GEMMA_TEXT_ENCODER_KEY_OPS,
+    GEMMA_MODEL_OPS,
+    VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS,
+    GemmaTextEncoderConfigurator,
 )
 
 __all__ = [
     "AV_GEMMA_TEXT_ENCODER_KEY_OPS",
-    "AVGemmaEncoderOutput",
-    "AVGemmaTextEncoderModel",
-    "AVGemmaTextEncoderModelConfigurator",
-    "GemmaTextEncoderModelBase",
-    "VideoGemmaEncoderOutput",
-    "VideoGemmaTextEncoderModel",
-    "VideoGemmaTextEncoderModelConfigurator",
+    "GEMMA_MODEL_OPS",
+    "VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS",
+    "GemmaEncoderOutput",
+    "GemmaTextEncoder",
+    "GemmaTextEncoderConfigurator",
     "encode_text",
     "module_ops_from_gemma_root",
 ]

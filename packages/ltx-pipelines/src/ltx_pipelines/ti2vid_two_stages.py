@@ -4,7 +4,11 @@ from collections.abc import Iterator
 import torch
 
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
-from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
+from ltx_core.components.guiders import (
+    MultiModalGuiderFactory,
+    MultiModalGuiderParams,
+    create_multimodal_guider_factory,
+)
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
@@ -15,14 +19,9 @@ from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.text_encoders.gemma import encode_text
-from ltx_core.types import LatentState, VideoPixelShape
-from ltx_pipelines.utils import ModelLedger
-from ltx_pipelines.utils.args import default_2_stage_arg_parser
-from ltx_pipelines.utils.constants import (
-    AUDIO_SAMPLE_RATE,
-    STAGE_2_DISTILLED_SIGMA_VALUES,
-)
-from ltx_pipelines.utils.helpers import (
+from ltx_core.types import Audio, LatentState, VideoPixelShape
+from ltx_pipelines.utils import (
+    ModelLedger,
     assert_resolution,
     cleanup_memory,
     denoise_audio_video,
@@ -30,9 +29,11 @@ from ltx_pipelines.utils.helpers import (
     generate_enhanced_prompt,
     get_device,
     image_conditionings_by_replacing_latent,
-    multi_modal_guider_denoising_func,
+    multi_modal_guider_factory_denoising_func,
     simple_denoising_func,
 )
+from ltx_pipelines.utils.args import ImageConditioningInput, default_2_stage_arg_parser, detect_checkpoint_path
+from ltx_pipelines.utils.constants import STAGE_2_DISTILLED_SIGMA_VALUES, detect_params
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import PipelineComponents
 
@@ -42,9 +43,10 @@ device = get_device()
 class TI2VidTwoStagesPipeline:
     """
     Two-stage text/image-to-video generation pipeline.
-    Stage 1 generates video at the target resolution with CFG guidance, then
-    Stage 2 upsamples by 2x and refines using a distilled LoRA for higher
-    quality output. Supports optional image conditioning via the images parameter.
+    Stage 1 generates video at half of the target resolution with CFG guidance (assuming
+    full model is used), then Stage 2 upsamples by 2x and refines using a distilled
+    LoRA for higher quality output. Supports optional image conditioning via the
+    images parameter.
     """
 
     def __init__(
@@ -54,7 +56,7 @@ class TI2VidTwoStagesPipeline:
         spatial_upsampler_path: str,
         gemma_root: str,
         loras: list[LoraPathStrengthAndSDOps],
-        device: str = device,
+        device: torch.device = device,
         quantization: QuantizationPolicy | None = None,
     ):
         self.device = device
@@ -78,7 +80,6 @@ class TI2VidTwoStagesPipeline:
             device=device,
         )
 
-    @torch.inference_mode()
     def __call__(  # noqa: PLR0913
         self,
         prompt: str,
@@ -89,12 +90,12 @@ class TI2VidTwoStagesPipeline:
         num_frames: int,
         frame_rate: float,
         num_inference_steps: int,
-        video_guider_params: MultiModalGuiderParams,
-        audio_guider_params: MultiModalGuiderParams,
-        images: list[tuple[str, int, float]],
+        video_guider_params: MultiModalGuiderParams | MultiModalGuiderFactory,
+        audio_guider_params: MultiModalGuiderParams | MultiModalGuiderFactory,
+        images: list[ImageConditioningInput],
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
-    ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
+    ) -> tuple[Iterator[torch.Tensor], Audio]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
@@ -128,12 +129,12 @@ class TI2VidTwoStagesPipeline:
                 video_state=video_state,
                 audio_state=audio_state,
                 stepper=stepper,
-                denoise_fn=multi_modal_guider_denoising_func(
-                    video_guider=MultiModalGuider(
+                denoise_fn=multi_modal_guider_factory_denoising_func(
+                    video_guider_factory=create_multimodal_guider_factory(
                         params=video_guider_params,
                         negative_context=v_context_n,
                     ),
-                    audio_guider=MultiModalGuider(
+                    audio_guider_factory=create_multimodal_guider_factory(
                         params=audio_guider_params,
                         negative_context=a_context_n,
                     ),
@@ -237,14 +238,15 @@ class TI2VidTwoStagesPipeline:
         decoded_audio = vae_decode_audio(
             audio_state.latent, self.stage_2_model_ledger.audio_decoder(), self.stage_2_model_ledger.vocoder()
         )
-
         return decoded_video, decoded_audio
 
 
 @torch.inference_mode()
 def main() -> None:
     logging.getLogger().setLevel(logging.INFO)
-    parser = default_2_stage_arg_parser()
+    checkpoint_path = detect_checkpoint_path()
+    params = detect_params(checkpoint_path)
+    parser = default_2_stage_arg_parser(params=params)
     args = parser.parse_args()
     pipeline = TI2VidTwoStagesPipeline(
         checkpoint_path=args.checkpoint_path,
@@ -289,7 +291,6 @@ def main() -> None:
         video=video,
         fps=args.frame_rate,
         audio=audio,
-        audio_sample_rate=AUDIO_SAMPLE_RATE,
         output_path=args.output_path,
         video_chunks_number=video_chunks_number,
     )

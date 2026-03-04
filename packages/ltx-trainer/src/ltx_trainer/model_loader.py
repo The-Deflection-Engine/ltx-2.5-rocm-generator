@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from ltx_core.model.audio_vae import AudioDecoder, AudioEncoder, Vocoder
     from ltx_core.model.transformer import LTXModel
     from ltx_core.model.video_vae import VideoDecoder, VideoEncoder
-    from ltx_core.text_encoders.gemma import AVGemmaTextEncoderModel
+    from ltx_core.text_encoders.gemma import GemmaTextEncoder
 
 
 def _to_torch_device(device: Device) -> torch.device:
@@ -192,7 +192,7 @@ def load_text_encoder(
     device: Device = "cpu",
     dtype: torch.dtype = torch.bfloat16,
     load_in_8bit: bool = False,
-) -> "AVGemmaTextEncoderModel":
+) -> "GemmaTextEncoder":
     """Load the Gemma text encoder.
     Args:
         checkpoint_path: Path to the LTX-2 safetensors checkpoint file
@@ -203,7 +203,7 @@ def load_text_encoder(
             When True, the model is loaded with device_map="auto" and the device argument
             is ignored for the Gemma backbone (feature extractor still uses dtype).
     Returns:
-        Loaded AVGemmaTextEncoderModel
+        Loaded GemmaTextEncoder (unified encoder handling V1/V2/V3)
     """
     if not Path(gemma_model_path).is_dir():
         raise ValueError(f"Gemma model path is not a directory: {gemma_model_path}")
@@ -216,12 +216,12 @@ def load_text_encoder(
 
     # Standard loading path
     from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
-    from ltx_core.text_encoders.gemma.encoders.av_encoder import (
+    from ltx_core.text_encoders.gemma import (
         AV_GEMMA_TEXT_ENCODER_KEY_OPS,
         GEMMA_MODEL_OPS,
-        AVGemmaTextEncoderModelConfigurator,
+        GemmaTextEncoderConfigurator,
+        module_ops_from_gemma_root,
     )
-    from ltx_core.text_encoders.gemma.encoders.base_encoder import module_ops_from_gemma_root
     from ltx_core.utils import find_matching_file
 
     torch_device = _to_torch_device(device)
@@ -231,7 +231,7 @@ def load_text_encoder(
 
     text_encoder = SingleGPUModelBuilder(
         model_path=(str(checkpoint_path), *gemma_weight_paths),
-        model_class_configurator=AVGemmaTextEncoderModelConfigurator,
+        model_class_configurator=GemmaTextEncoderConfigurator,
         model_sd_ops=AV_GEMMA_TEXT_ENCODER_KEY_OPS,
         module_ops=(GEMMA_MODEL_OPS, *module_ops_from_gemma_root(str(gemma_model_path))),
     ).build(device=torch_device, dtype=dtype)
@@ -253,7 +253,7 @@ class LtxModelComponents:
     video_vae_decoder: "VideoDecoder | None" = None
     audio_vae_decoder: "AudioDecoder | None" = None
     vocoder: "Vocoder | None" = None
-    text_encoder: "AVGemmaTextEncoderModel | None" = None
+    text_encoder: "GemmaTextEncoder | None" = None
     scheduler: "LTX2Scheduler | None" = None
 
 

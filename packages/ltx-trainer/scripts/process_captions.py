@@ -303,14 +303,13 @@ def compute_captions_embeddings(  # noqa: PLR0913
     ) as progress:
         task = progress.add_task("Processing captions", total=len(dataloader))
         for batch in dataloader:
-            # Encode prompts using _preprocess_text (returns embeddings before connector)
-            # This is what we want to save - the connector is applied during training
+            # Encode prompts using precompute() (returns video/audio features before connector)
+            # The connector is applied during training via embeddings_processor
             with torch.inference_mode():
-                # TODO(batch-tokenization): When tokenizer supports batching, encode all prompts at once:
-                #   prompt_embeds, prompt_attention_mask = text_encoder._preprocess_text(batch["prompt"]) # noqa: ERA001
+                # TODO(batch-tokenization): When tokenizer supports batching, encode all prompts at once.
                 # For now, process one at a time:
                 for i in range(len(batch["prompt"])):
-                    prompt_embeds, prompt_attention_mask = text_encoder._preprocess_text(
+                    video_prompt_embeds, audio_prompt_embeds, prompt_attention_mask = text_encoder.precompute(
                         batch["prompt"][i], padding_side="left"
                     )
 
@@ -321,9 +320,11 @@ def compute_captions_embeddings(  # noqa: PLR0913
                     output_dir_path.mkdir(parents=True, exist_ok=True)
 
                     embedding_data = {
-                        "prompt_embeds": prompt_embeds[0].cpu().contiguous(),
+                        "video_prompt_embeds": video_prompt_embeds[0].cpu().contiguous(),
                         "prompt_attention_mask": prompt_attention_mask[0].cpu().contiguous(),
                     }
+                    if audio_prompt_embeds is not None:
+                        embedding_data["audio_prompt_embeds"] = audio_prompt_embeds[0].cpu().contiguous()
 
                     output_file = output_path / output_rel_path
                     torch.save(embedding_data, output_file)
