@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from ltx_core.model.audio_vae import AudioDecoder, Vocoder
     from ltx_core.model.transformer import LTXModel
     from ltx_core.model.video_vae import VideoDecoder, VideoEncoder
-    from ltx_core.text_encoders.gemma import AVGemmaTextEncoderModel
+    from ltx_core.text_encoders.gemma import GemmaTextEncoder
 
 VIDEO_SCALE_FACTORS = SpatioTemporalScaleFactors.default()
 
@@ -124,7 +124,7 @@ class ValidationSampler:
         transformer: "LTXModel",
         vae_decoder: "VideoDecoder",
         vae_encoder: "VideoEncoder | None",
-        text_encoder: "AVGemmaTextEncoderModel | None" = None,
+        text_encoder: "GemmaTextEncoder | None" = None,
         audio_decoder: "AudioDecoder | None" = None,
         vocoder: "Vocoder | None" = None,
         sampling_context: SamplingContext | None = None,
@@ -497,6 +497,7 @@ class ValidationSampler:
         video = Modality(
             enabled=True,
             latent=video_state.latent,
+            sigma=sigmas[0].repeat(video_state.latent.shape[0]),
             timesteps=video_state.denoise_mask,
             positions=video_state.positions,
             context=v_ctx_pos,
@@ -509,6 +510,7 @@ class ValidationSampler:
             audio = Modality(
                 enabled=True,
                 latent=audio_state.latent,
+                sigma=sigmas[0].repeat(audio_state.latent.shape[0]),
                 timesteps=audio_state.denoise_mask,
                 positions=audio_state.positions,
                 context=a_ctx_pos,
@@ -525,6 +527,7 @@ class ValidationSampler:
                 video = replace(
                     video,
                     latent=video_state.latent,
+                    sigma=sigma.repeat(video_state.latent.shape[0]),
                     timesteps=sigma * video_state.denoise_mask,
                     positions=video_state.positions,
                 )
@@ -533,6 +536,7 @@ class ValidationSampler:
                     audio = replace(
                         audio,
                         latent=audio_state.latent,
+                        sigma=sigma.repeat(audio_state.latent.shape[0]),
                         timesteps=sigma * audio_state.denoise_mask,
                         positions=audio_state.positions,
                     )
@@ -703,7 +707,8 @@ class ValidationSampler:
         # Move the base Gemma model to CPU but keep embeddings connectors on GPU
         # as this module is also used during training
         self._text_encoder.model.to("cpu")
-        self._text_encoder.feature_extractor_linear.to("cpu")
+        if self._text_encoder.feature_extractor is not None:
+            self._text_encoder.feature_extractor.to("cpu")
 
         return v_ctx_pos, a_ctx_pos, v_ctx_neg, a_ctx_neg
 

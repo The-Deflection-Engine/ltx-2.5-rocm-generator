@@ -18,28 +18,26 @@ import logging
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import torch
 
 from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
-from ltx_core.text_encoders.gemma.embeddings_connector import Embeddings1DConnectorConfigurator
-from ltx_core.text_encoders.gemma.encoders.av_encoder import (
-    AV_GEMMA_TEXT_ENCODER_KEY_OPS,
-    AVGemmaTextEncoderModel,
+from ltx_core.text_encoders.gemma import AV_GEMMA_TEXT_ENCODER_KEY_OPS
+from ltx_core.text_encoders.gemma.embeddings_connector import (
+    AudioEmbeddings1DConnectorConfigurator,
+    Embeddings1DConnectorConfigurator,
 )
-from ltx_core.text_encoders.gemma.feature_extractor import GemmaFeaturesExtractorProjLinear
+from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor
+from ltx_core.text_encoders.gemma.encoders.base_encoder import GemmaTextEncoder
+from ltx_core.text_encoders.gemma.encoders.encoder_configurator import _create_feature_extractor
 from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
-
-if TYPE_CHECKING:
-    from ltx_core.text_encoders.gemma import AVGemmaTextEncoderModel
 
 
 def load_8bit_gemma(
     checkpoint_path: str | Path,
     gemma_model_path: str | Path,
     dtype: torch.dtype = torch.bfloat16,
-) -> "AVGemmaTextEncoderModel":
+) -> GemmaTextEncoder:
     """Load the Gemma text encoder in 8-bit precision using bitsandbytes.
     This function bypasses ltx-core's standard loading path to enable 8-bit quantization
     via the bitsandbytes library. The Gemma model is loaded with load_in_8bit=True and
@@ -50,7 +48,7 @@ def load_8bit_gemma(
         gemma_model_path: Path to Gemma model directory
         dtype: Data type for non-quantized model weights (feature extractor, connectors)
     Returns:
-        Loaded AVGemmaTextEncoderModel with 8-bit quantized Gemma backbone
+        Loaded GemmaTextEncoder with 8-bit quantized Gemma backbone
     Raises:
         ImportError: If bitsandbytes is not installed
         FileNotFoundError: If required model files are not found
@@ -88,28 +86,35 @@ def load_8bit_gemma(
     def extract_state_dict(prefix: str) -> dict[str, torch.Tensor]:
         return {k.replace(prefix, ""): v for k, v in sd.sd.items() if k.startswith(prefix)}
 
-    # Create and load feature extractor
-    feature_extractor = GemmaFeaturesExtractorProjLinear()
-    feature_extractor.load_state_dict(extract_state_dict("feature_extractor_linear."))
-    feature_extractor = feature_extractor.to(device=gemma_model.device, dtype=dtype)
-
     # Create and load video embeddings connector
     embeddings_connector = Embeddings1DConnectorConfigurator.from_config(config)
-    embeddings_connector.load_state_dict(extract_state_dict("embeddings_connector."))
+    embeddings_connector.load_state_dict(extract_state_dict("embeddings_processor.video_connector."))
     embeddings_connector = embeddings_connector.to(device=gemma_model.device, dtype=dtype)
 
     # Create and load audio embeddings connector
-    audio_embeddings_connector = Embeddings1DConnectorConfigurator.from_config(config)
-    audio_embeddings_connector.load_state_dict(extract_state_dict("audio_embeddings_connector."))
+    audio_embeddings_connector = AudioEmbeddings1DConnectorConfigurator.from_config(config)
+    audio_embeddings_connector.load_state_dict(extract_state_dict("embeddings_processor.audio_connector."))
     audio_embeddings_connector = audio_embeddings_connector.to(device=gemma_model.device, dtype=dtype)
 
-    # Construct the text encoder
-    text_encoder = AVGemmaTextEncoderModel(
-        feature_extractor_linear=feature_extractor,
-        embeddings_connector=embeddings_connector,
-        audio_embeddings_connector=audio_embeddings_connector,
+    # Create embeddings processor
+    embeddings_processor = EmbeddingsProcessor(
+        video_connector=embeddings_connector,
+        audio_connector=audio_embeddings_connector,
+    )
+
+    transformer_config = config.get("transformer", {})
+    feature_extractor = _create_feature_extractor(transformer_config)
+    feature_extractor.load_state_dict(
+        {k.removeprefix("feature_extractor."): v for k, v in sd.sd.items() if k.startswith("feature_extractor.")},
+    )
+    feature_extractor = feature_extractor.to(device=gemma_model.device, dtype=dtype)
+
+    text_encoder = GemmaTextEncoder(
+        feature_extractor=feature_extractor,
+        embeddings_processor=embeddings_processor,
         tokenizer=tokenizer,
         model=gemma_model,
+        dtype=dtype,
     )
 
     return text_encoder

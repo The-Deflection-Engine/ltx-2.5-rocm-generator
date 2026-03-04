@@ -309,9 +309,22 @@ class LtxvTrainer:
         """Perform a single training step using the configured strategy."""
         # Apply embedding connectors to transform pre-computed text embeddings
         conditions = batch["conditions"]
-        video_embeds, audio_embeds, attention_mask = self._text_encoder._run_connectors(
-            conditions["prompt_embeds"], conditions["prompt_attention_mask"]
+
+        if "video_prompt_embeds" in conditions:
+            # New format: separate video/audio features from precompute()
+            video_features = conditions["video_prompt_embeds"]
+            audio_features = conditions.get("audio_prompt_embeds")
+        else:
+            # Legacy format: single prompt_embeds tensor — duplicate for both modalities
+            video_features = conditions["prompt_embeds"]
+            audio_features = conditions["prompt_embeds"]
+
+        mask = conditions["prompt_attention_mask"]
+        additive_mask = self._text_encoder._convert_to_additive_mask(mask, video_features.dtype)
+        video_embeds, audio_embeds, attention_mask = self._text_encoder.embeddings_processor.create_embeddings(
+            video_features, audio_features, additive_mask
         )
+
         conditions["video_prompt_embeds"] = video_embeds
         conditions["audio_prompt_embeds"] = audio_embeds
         conditions["prompt_attention_mask"] = attention_mask
@@ -375,7 +388,7 @@ class LtxvTrainer:
         # Unload heavy components to free VRAM, keeping only the embedding connectors
         self._text_encoder.model = None
         self._text_encoder.tokenizer = None
-        self._text_encoder.feature_extractor_linear = None
+        self._text_encoder.feature_extractor = None
 
         logger.debug("Validation prompt embeddings cached. Gemma model unloaded")
         return cached_embeddings
@@ -822,7 +835,7 @@ class LtxvTrainer:
                         output_path=output_path,
                         fps=self._config.validation.frame_rate,
                         audio=audio,
-                        audio_sample_rate=self._vocoder.output_sample_rate if audio is not None else None,
+                        audio_sample_rate=self._vocoder.output_sampling_rate if audio is not None else None,
                     )
                 video_paths.append(output_path)
 

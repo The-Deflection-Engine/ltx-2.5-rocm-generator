@@ -8,9 +8,12 @@ from ltx_core.loader.registry import DummyRegistry, Registry
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
 from ltx_core.model.audio_vae import (
     AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
+    AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
     VOCODER_COMFY_KEYS_FILTER,
     AudioDecoder,
     AudioDecoderConfigurator,
+    AudioEncoder,
+    AudioEncoderConfigurator,
     Vocoder,
     VocoderConfigurator,
 )
@@ -31,11 +34,11 @@ from ltx_core.model.video_vae import (
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.text_encoders.gemma import (
     AV_GEMMA_TEXT_ENCODER_KEY_OPS,
-    AVGemmaTextEncoderModel,
-    AVGemmaTextEncoderModelConfigurator,
+    GEMMA_MODEL_OPS,
+    GemmaTextEncoder,
+    GemmaTextEncoderConfigurator,
     module_ops_from_gemma_root,
 )
-from ltx_core.text_encoders.gemma.encoders.av_encoder import GEMMA_MODEL_OPS
 from ltx_core.utils import find_matching_file
 
 
@@ -131,6 +134,13 @@ class ModelLedger:
                 registry=self.registry,
             )
 
+            self.audio_encoder_builder = Builder[AudioEncoder](
+                model_path=self.checkpoint_path,
+                model_class_configurator=AudioEncoderConfigurator,
+                model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+                registry=self.registry,
+            )
+
             self.audio_decoder_builder = Builder(
                 model_path=self.checkpoint_path,
                 model_class_configurator=AudioDecoderConfigurator,
@@ -152,7 +162,7 @@ class ModelLedger:
 
                 self.text_encoder_builder = Builder(
                     model_path=(str(self.checkpoint_path), *weight_paths),
-                    model_class_configurator=AVGemmaTextEncoderModelConfigurator,
+                    model_class_configurator=GemmaTextEncoderConfigurator,
                     model_sd_ops=AV_GEMMA_TEXT_ENCODER_KEY_OPS,
                     registry=self.registry,
                     module_ops=(GEMMA_MODEL_OPS, *module_ops),
@@ -225,7 +235,7 @@ class ModelLedger:
 
         return self.vae_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
 
-    def text_encoder(self) -> AVGemmaTextEncoderModel:
+    def text_encoder(self) -> GemmaTextEncoder:
         if not hasattr(self, "text_encoder_builder"):
             raise ValueError(
                 "Text encoder not initialized. Please provide a checkpoint path and gemma root path to the "
@@ -233,6 +243,14 @@ class ModelLedger:
             )
 
         return self.text_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+
+    def audio_encoder(self) -> AudioEncoder:
+        if not hasattr(self, "audio_encoder_builder"):
+            raise ValueError(
+                "Audio encoder not initialized. Please provide a checkpoint path to the ModelLedger constructor."
+            )
+
+        return self.audio_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
 
     def audio_decoder(self) -> AudioDecoder:
         if not hasattr(self, "audio_decoder_builder"):
