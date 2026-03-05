@@ -20,7 +20,6 @@ from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.text_encoders.gemma import encode_text
 from ltx_core.tools import LatentTools
 from ltx_core.types import (
     Audio,
@@ -30,10 +29,11 @@ from ltx_core.types import (
     VideoPixelShape,
 )
 from ltx_pipelines.utils import ModelLedger
-from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES
+from ltx_pipelines.utils.args import QuantizationAction
+from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, detect_params
 from ltx_pipelines.utils.helpers import (
     cleanup_memory,
-    generate_enhanced_prompt,
+    encode_prompts,
     get_device,
     multi_modal_guider_denoising_func,
     noise_audio_state,
@@ -197,7 +197,6 @@ class RetakePipeline:
     #  Public entry point                                                     #
     # --------------------------------------------------------------------- #
 
-    @torch.inference_mode()
     def __call__(  # noqa: PLR0913, PLR0915
         self,
         video_path: str,
@@ -214,6 +213,7 @@ class RetakePipeline:
         regenerate_audio: bool = True,
         enhance_prompt: bool = False,
         distilled: bool = False,
+        tiling_config: TilingConfig | None = None,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         """Regenerate ``[start_time, end_time]`` of the source video (retake).
         Parameters
@@ -321,22 +321,17 @@ class RetakePipeline:
         del audio_encoder
         cleanup_memory()
 
-        text_encoder = self.model_ledger.text_encoder()
-        if enhance_prompt:
-            prompt = generate_enhanced_prompt(text_encoder, prompt, None, seed=effective_seed)
+        prompts_to_encode = [prompt] if distilled else [prompt, negative_prompt]
+        contexts = encode_prompts(
+            prompts_to_encode,
+            self.model_ledger,
+            enhance_first_prompt=enhance_prompt,
+            enhance_prompt_seed=effective_seed,
+        )
 
-        if distilled:
-            # Distilled mode: single prompt, no negative
-            context_p = encode_text(text_encoder, prompts=[prompt])[0]
-            v_context_p, a_context_p = context_p
-        else:
-            context_p, context_n = encode_text(text_encoder, prompts=[prompt, negative_prompt])
-            v_context_p, a_context_p = context_p
-            v_context_n, a_context_n = context_n
-
-        torch.cuda.synchronize()
-        del text_encoder
-        cleanup_memory()
+        v_context_p, a_context_p = contexts[0].video_encoding, contexts[0].audio_encoding
+        if not distilled:
+            v_context_n, a_context_n = contexts[1].video_encoding, contexts[1].audio_encoding
 
         transformer = self.model_ledger.transformer()
 
@@ -412,7 +407,9 @@ class RetakePipeline:
         del transformer
         cleanup_memory()
 
-        decoded_video = vae_decode_video(video_state.latent, self.model_ledger.video_decoder(), generator=generator)
+        decoded_video = vae_decode_video(
+            video_state.latent, self.model_ledger.video_decoder(), tiling_config, generator
+        )
         decoded_audio = vae_decode_audio(
             audio_state.latent, self.model_ledger.audio_decoder(), self.model_ledger.vocoder()
         )
@@ -420,6 +417,7 @@ class RetakePipeline:
         return decoded_video, decoded_audio
 
 
+@torch.inference_mode()
 def main() -> None:
     """CLI entry point for retake (regenerate a time region)."""
     logging.getLogger().setLevel(logging.INFO)
@@ -433,6 +431,15 @@ def main() -> None:
     parser.add_argument("--gemma-root", type=str, required=True, help="Path to Gemma text encoder weights.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed. Use -1 for a random seed.")
     parser.add_argument("--loras", nargs="*", default=[], help="LoRA paths (optional).")
+    parser.add_argument(
+        "--quantization",
+        dest="quantization",
+        action=QuantizationAction,
+        nargs="+",
+        metavar=("POLICY", "AMAX_PATH"),
+        default=None,
+        help="Quantization policy: fp8-cast or fp8-scaled-mm [AMAX_PATH].",
+    )
     args = parser.parse_args()
 
     if args.start_time >= args.end_time:
@@ -452,16 +459,21 @@ def main() -> None:
     pipeline = RetakePipeline(
         checkpoint_path=args.checkpoint_path,
         gemma_root=args.gemma_root,
-        loras=args.loras or [],
+        loras=tuple(args.loras) if args.loras else (),
+        quantization=args.quantization,
     )
+    params = detect_params(args.checkpoint_path)
+    tiling_config = TilingConfig.default()
     video_iter, audio = pipeline(
         video_path=args.video_path,
         prompt=args.prompt,
         start_time=args.start_time,
         end_time=args.end_time,
         seed=args.seed,
+        video_guider_params=params.video_guider_params,
+        audio_guider_params=params.audio_guider_params,
+        tiling_config=tiling_config,
     )
-    tiling_config = TilingConfig.default()
     video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
     encode_video(
         video=video_iter,

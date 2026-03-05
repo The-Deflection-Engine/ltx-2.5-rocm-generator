@@ -1,33 +1,22 @@
 import functools
 from pathlib import Path
-from typing import NamedTuple
 
 import torch
 from transformers import AutoImageProcessor, Gemma3ForConditionalGeneration, Gemma3Processor
 
 from ltx_core.loader.module_ops import ModuleOps
-from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor
 from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
 from ltx_core.utils import find_matching_file
 
 
-class GemmaEncoderOutput(NamedTuple):
-    video_encoding: torch.Tensor
-    audio_encoding: torch.Tensor | None
-    attention_mask: torch.Tensor
-
-
 class GemmaTextEncoder(torch.nn.Module):
-    """Unified Gemma text encoder with 3-block pipeline.
-    Block 1: Gemma model (runs LLM, gets hidden states)
-    Block 2: Feature extractor
-    Block 3: Embeddings processor (connector with optional audio)
+    """Pure Gemma text encoder — runs the LLM and returns raw hidden states.
+    Prompt enhancement (generate) is also supported since the full
+    Gemma3ForConditionalGeneration model (including lm_head) is loaded.
     """
 
     def __init__(
         self,
-        feature_extractor: torch.nn.Module,
-        embeddings_processor: EmbeddingsProcessor,
         model: Gemma3ForConditionalGeneration | None = None,
         tokenizer: LTXVGemmaTokenizer | None = None,
         processor: Gemma3Processor | None = None,
@@ -37,39 +26,25 @@ class GemmaTextEncoder(torch.nn.Module):
         self.model = model
         self.tokenizer = tokenizer
         self.processor = processor
-        self.feature_extractor = feature_extractor.to(dtype=dtype)
-        self.embeddings_processor = embeddings_processor.to(dtype=dtype)
+        self._dtype = dtype
 
-    def _convert_to_additive_mask(self, attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        return (attention_mask.to(torch.int64) - 1).to(dtype).reshape(
-            (attention_mask.shape[0], 1, -1, attention_mask.shape[-1])
-        ) * torch.finfo(dtype).max
-
-    def precompute(
-        self, text: str, padding_side: str = "left"
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
-        """Blocks 1+2: Gemma model -> feature extraction.
-        Used by process_captions.py for offline precomputation.
-        Returns (video_features, audio_features | None, attention_mask).
+    def encode(
+        self,
+        text: str,
+        padding_side: str = "left",  # noqa: ARG002
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        """Run Gemma LLM and return raw hidden states + attention mask.
+        Calls the inner model (self.model.model) to skip lm_head logits computation (~500 MiB saving).
+        Returns:
+            (hidden_states, attention_mask) where hidden_states is a tuple of per-layer tensors.
         """
-        # Block 1: Run Gemma
         token_pairs = self.tokenizer.tokenize_with_weights(text)["gemma"]
         input_ids = torch.tensor([[t[0] for t in token_pairs]], device=self.model.device)
         attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=self.model.device)
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-
-        # Block 2: Feature extraction
-        video_feats, audio_feats = self.feature_extractor(outputs.hidden_states, attention_mask, padding_side)
-        return video_feats, audio_feats, attention_mask
-
-    def forward(self, text: str, padding_side: str = "left") -> GemmaEncoderOutput:
-        """Full pipeline: precompute -> embeddings processor."""
-        video_feats, audio_feats, attention_mask = self.precompute(text, padding_side)
-        additive_mask = self._convert_to_additive_mask(attention_mask, video_feats.dtype)
-        video_enc, audio_enc, binary_mask = self.embeddings_processor.create_embeddings(
-            video_feats, audio_feats, additive_mask
-        )
-        return GemmaEncoderOutput(video_enc, audio_enc, binary_mask)
+        outputs = self.model.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        hidden_states = outputs.hidden_states
+        del outputs
+        return hidden_states, attention_mask
 
     # --- Prompt enhancement methods ---
 
@@ -225,15 +200,3 @@ def module_ops_from_gemma_root(gemma_root: str) -> tuple[ModuleOps, ...]:
         mutator=load_processor,
     )
     return (tokenizer_load_ops, processor_load_ops)
-
-
-def encode_text(text_encoder: GemmaTextEncoder, prompts: list[str]) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Encode a list of prompts using the provided Gemma text encoder.
-    Returns:
-        List of tuples, each containing (v_context, a_context) tensors for each prompt.
-    """
-    result = []
-    for prompt in prompts:
-        v_context, a_context, _ = text_encoder(prompt)
-        result.append((v_context, a_context))
-    return result

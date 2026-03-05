@@ -8,6 +8,7 @@ from ltx_pipelines.utils.constants import (
     DEFAULT_IMAGE_CRF,
     DEFAULT_LORA_STRENGTH,
     DEFAULT_NEGATIVE_PROMPT,
+    LTX_2_3_HQ_PARAMS,
     LTX_2_3_PARAMS,
     PipelineParams,
 )
@@ -453,6 +454,23 @@ def default_2_stage_arg_parser(params: PipelineParams = LTX_2_3_PARAMS) -> argpa
             "Path to the spatial upsampler model used to increase the resolution "
             "of the generated video in the latent space."
         ),
+    )
+    return parser
+
+
+def hq_2_stage_arg_parser(params: PipelineParams = LTX_2_3_HQ_PARAMS) -> argparse.ArgumentParser:
+    parser = default_2_stage_arg_parser(params=params)
+    parser.add_argument(
+        "--distilled-lora-strength-stage-1",
+        type=float,
+        default=0.25,
+        help=(f"Strength of the distilled LoRA used in the first stage (default: {0.25})."),
+    )
+    parser.add_argument(
+        "--distilled-lora-strength-stage-2",
+        type=float,
+        default=0.5,
+        help=(f"Strength of the distilled LoRA used in the second stage (default: {0.5})."),
     )
     return parser
 

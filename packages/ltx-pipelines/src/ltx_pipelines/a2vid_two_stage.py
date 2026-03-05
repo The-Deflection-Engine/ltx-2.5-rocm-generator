@@ -14,7 +14,6 @@ from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.text_encoders.gemma import encode_text
 from ltx_core.types import Audio, AudioLatentShape, LatentState, VideoPixelShape
 from ltx_pipelines.utils import ModelLedger
 from ltx_pipelines.utils.args import default_2_stage_arg_parser
@@ -24,10 +23,10 @@ from ltx_pipelines.utils.constants import (
 from ltx_pipelines.utils.helpers import (
     assert_resolution,
     cleanup_memory,
+    combined_image_conditionings,
     denoise_video_only,
-    generate_enhanced_prompt,
+    encode_prompts,
     get_device,
-    image_conditionings_by_replacing_latent,
     multi_modal_guider_denoising_func,
     simple_denoising_func,
 )
@@ -69,7 +68,7 @@ class A2VidPipelineTwoStage:
             quantization=quantization,
         )
 
-        self.stage_2_model_ledger = self.stage_1_model_ledger.with_loras(
+        self.stage_2_model_ledger = self.stage_1_model_ledger.with_additional_loras(
             loras=distilled_lora,
         )
 
@@ -103,16 +102,14 @@ class A2VidPipelineTwoStage:
         stepper = EulerDiffusionStep()
         dtype = torch.bfloat16
 
-        text_encoder = self.stage_1_model_ledger.text_encoder()
-        if enhance_prompt:
-            prompt = generate_enhanced_prompt(text_encoder, prompt, images[0][0] if len(images) > 0 else None)
-        context_p, context_n = encode_text(text_encoder, prompts=[prompt, negative_prompt])
-        v_context_p, a_context_p = context_p
-        v_context_n, _ = context_n
-
-        torch.cuda.synchronize()
-        del text_encoder
-        cleanup_memory()
+        ctx_p, ctx_n = encode_prompts(
+            [prompt, negative_prompt],
+            self.stage_1_model_ledger,
+            enhance_first_prompt=enhance_prompt,
+            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+        )
+        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+        v_context_n, _ = ctx_n.video_encoding, ctx_n.audio_encoding
 
         # Encode audio.
         decoded_audio = decode_audio_from_file(audio_path, self.device, audio_start_time, audio_max_duration)
@@ -120,8 +117,28 @@ class A2VidPipelineTwoStage:
         audio_shape = AudioLatentShape.from_duration(batch=1, duration=num_frames / frame_rate, channels=8, mel_bins=16)
         encoded_audio_latent = encoded_audio_latent[:, :, : audio_shape.frames]
 
+        # Stage 1: encode image conditionings with the VAE encoder, then free it
+        # before loading the transformer to reduce peak VRAM.
+        stage_1_output_shape = VideoPixelShape(
+            batch=1,
+            frames=num_frames,
+            width=width // 2,
+            height=height // 2,
+            fps=frame_rate,
+        )
+        video_encoder = self.stage_1_model_ledger.video_encoder()
+        stage_1_conditionings = combined_image_conditionings(
+            images=images,
+            height=stage_1_output_shape.height,
+            width=stage_1_output_shape.width,
+            video_encoder=video_encoder,
+            dtype=dtype,
+            device=self.device,
+        )
+        torch.cuda.synchronize()
+        del video_encoder
         cleanup_memory()
-        # Stage 1: Initial low resolution video generation with audio conditioning.
+
         transformer = self.stage_1_model_ledger.transformer()
         sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(dtype=torch.float32, device=self.device)
 
@@ -147,24 +164,6 @@ class A2VidPipelineTwoStage:
                 ),
             )
 
-        stage_1_output_shape = VideoPixelShape(
-            batch=1,
-            frames=num_frames,
-            width=width // 2,
-            height=height // 2,
-            fps=frame_rate,
-        )
-
-        video_encoder = self.stage_1_model_ledger.video_encoder()
-        stage_1_conditionings = image_conditionings_by_replacing_latent(
-            images=images,
-            height=stage_1_output_shape.height,
-            width=stage_1_output_shape.width,
-            video_encoder=video_encoder,
-            dtype=dtype,
-            device=self.device,
-        )
-
         video_state = denoise_video_only(
             output_shape=stage_1_output_shape,
             conditionings=stage_1_conditionings,
@@ -183,12 +182,23 @@ class A2VidPipelineTwoStage:
         cleanup_memory()
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LoRA.
+        video_encoder = self.stage_1_model_ledger.video_encoder()
         upscaled_video_latent = upsample_video(
             latent=video_state.latent[:1],
             video_encoder=video_encoder,
             upsampler=self.stage_2_model_ledger.spatial_upsampler(),
         )
 
+        stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
+        stage_2_conditionings = combined_image_conditionings(
+            images=images,
+            height=stage_2_output_shape.height,
+            width=stage_2_output_shape.width,
+            video_encoder=video_encoder,
+            dtype=dtype,
+            device=self.device,
+        )
+        del video_encoder
         torch.cuda.synchronize()
         cleanup_memory()
 
@@ -210,15 +220,6 @@ class A2VidPipelineTwoStage:
                 ),
             )
 
-        stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
-        stage_2_conditionings = image_conditionings_by_replacing_latent(
-            images=images,
-            height=stage_2_output_shape.height,
-            width=stage_2_output_shape.width,
-            video_encoder=video_encoder,
-            dtype=dtype,
-            device=self.device,
-        )
         video_state = denoise_video_only(
             output_shape=stage_2_output_shape,
             conditionings=stage_2_conditionings,
@@ -236,7 +237,6 @@ class A2VidPipelineTwoStage:
 
         torch.cuda.synchronize()
         del transformer
-        del video_encoder
         cleanup_memory()
 
         decoded_video = vae_decode_video(
@@ -278,7 +278,7 @@ def main() -> None:
         distilled_lora=args.distilled_lora,
         spatial_upsampler_path=args.spatial_upsampler_path,
         gemma_root=args.gemma_root,
-        loras=args.lora,
+        loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
     )
     tiling_config = TilingConfig.default()

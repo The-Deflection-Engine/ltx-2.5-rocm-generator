@@ -18,17 +18,16 @@ from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.text_encoders.gemma import encode_text
 from ltx_core.types import Audio, LatentState, VideoPixelShape
 from ltx_pipelines.utils import (
     ModelLedger,
     assert_resolution,
     cleanup_memory,
+    combined_image_conditionings,
     denoise_audio_video,
+    encode_prompts,
     euler_denoising_loop,
-    generate_enhanced_prompt,
     get_device,
-    image_conditionings_by_replacing_latent,
     multi_modal_guider_factory_denoising_func,
     simple_denoising_func,
 )
@@ -71,7 +70,7 @@ class TI2VidTwoStagesPipeline:
             quantization=quantization,
         )
 
-        self.stage_2_model_ledger = self.stage_1_model_ledger.with_loras(
+        self.stage_2_model_ledger = self.stage_1_model_ledger.with_additional_loras(
             loras=distilled_lora,
         )
 
@@ -103,21 +102,38 @@ class TI2VidTwoStagesPipeline:
         stepper = EulerDiffusionStep()
         dtype = torch.bfloat16
 
-        text_encoder = self.stage_1_model_ledger.text_encoder()
-        if enhance_prompt:
-            prompt = generate_enhanced_prompt(
-                text_encoder, prompt, images[0][0] if len(images) > 0 else None, seed=seed
-            )
-        context_p, context_n = encode_text(text_encoder, prompts=[prompt, negative_prompt])
-        v_context_p, a_context_p = context_p
-        v_context_n, a_context_n = context_n
+        ctx_p, ctx_n = encode_prompts(
+            [prompt, negative_prompt],
+            self.stage_1_model_ledger,
+            enhance_first_prompt=enhance_prompt,
+            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+            enhance_prompt_seed=seed,
+        )
+        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
+        # Stage 1: encode image conditionings with the VAE encoder, then free it
+        # before loading the transformer to reduce peak VRAM.
+        stage_1_output_shape = VideoPixelShape(
+            batch=1,
+            frames=num_frames,
+            width=width // 2,
+            height=height // 2,
+            fps=frame_rate,
+        )
+        video_encoder = self.stage_1_model_ledger.video_encoder()
+        stage_1_conditionings = combined_image_conditionings(
+            images=images,
+            height=stage_1_output_shape.height,
+            width=stage_1_output_shape.width,
+            video_encoder=video_encoder,
+            dtype=dtype,
+            device=self.device,
+        )
         torch.cuda.synchronize()
-        del text_encoder
+        del video_encoder
         cleanup_memory()
 
-        # Stage 1: Initial low resolution video generation.
-        video_encoder = self.stage_1_model_ledger.video_encoder()
         transformer = self.stage_1_model_ledger.transformer()
         sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(dtype=torch.float32, device=self.device)
 
@@ -144,21 +160,6 @@ class TI2VidTwoStagesPipeline:
                 ),
             )
 
-        stage_1_output_shape = VideoPixelShape(
-            batch=1,
-            frames=num_frames,
-            width=width // 2,
-            height=height // 2,
-            fps=frame_rate,
-        )
-        stage_1_conditionings = image_conditionings_by_replacing_latent(
-            images=images,
-            height=stage_1_output_shape.height,
-            width=stage_1_output_shape.width,
-            video_encoder=video_encoder,
-            dtype=dtype,
-            device=self.device,
-        )
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_1_output_shape,
             conditionings=stage_1_conditionings,
@@ -176,12 +177,23 @@ class TI2VidTwoStagesPipeline:
         cleanup_memory()
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
+        video_encoder = self.stage_1_model_ledger.video_encoder()
         upscaled_video_latent = upsample_video(
             latent=video_state.latent[:1],
             video_encoder=video_encoder,
             upsampler=self.stage_2_model_ledger.spatial_upsampler(),
         )
 
+        stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
+        stage_2_conditionings = combined_image_conditionings(
+            images=images,
+            height=stage_2_output_shape.height,
+            width=stage_2_output_shape.width,
+            video_encoder=video_encoder,
+            dtype=dtype,
+            device=self.device,
+        )
+        del video_encoder
         torch.cuda.synchronize()
         cleanup_memory()
 
@@ -203,15 +215,6 @@ class TI2VidTwoStagesPipeline:
                 ),
             )
 
-        stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
-        stage_2_conditionings = image_conditionings_by_replacing_latent(
-            images=images,
-            height=stage_2_output_shape.height,
-            width=stage_2_output_shape.width,
-            video_encoder=video_encoder,
-            dtype=dtype,
-            device=self.device,
-        )
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_2_output_shape,
             conditionings=stage_2_conditionings,
@@ -229,7 +232,6 @@ class TI2VidTwoStagesPipeline:
 
         torch.cuda.synchronize()
         del transformer
-        del video_encoder
         cleanup_memory()
 
         decoded_video = vae_decode_video(
@@ -253,7 +255,7 @@ def main() -> None:
         distilled_lora=args.distilled_lora,
         spatial_upsampler_path=args.spatial_upsampler_path,
         gemma_root=args.gemma_root,
-        loras=args.lora,
+        loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
     )
     tiling_config = TilingConfig.default()

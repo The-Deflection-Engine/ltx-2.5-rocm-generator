@@ -16,17 +16,16 @@ from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.text_encoders.gemma import encode_text
 from ltx_core.types import Audio, LatentState, VideoPixelShape
 from ltx_pipelines.utils import (
     ModelLedger,
     assert_resolution,
     cleanup_memory,
+    combined_image_conditionings,
     denoise_audio_video,
+    encode_prompts,
     euler_denoising_loop,
-    generate_enhanced_prompt,
     get_device,
-    image_conditionings_by_replacing_latent,
     multi_modal_guider_factory_denoising_func,
 )
 from ltx_pipelines.utils.args import ImageConditioningInput, default_1_stage_arg_parser, detect_checkpoint_path
@@ -91,21 +90,32 @@ class TI2VidOneStagePipeline:
         stepper = EulerDiffusionStep()
         dtype = torch.bfloat16
 
-        text_encoder = self.model_ledger.text_encoder()
-        if enhance_prompt:
-            prompt = generate_enhanced_prompt(
-                text_encoder, prompt, images[0][0] if len(images) > 0 else None, seed=seed
-            )
-        context_p, context_n = encode_text(text_encoder, prompts=[prompt, negative_prompt])
-        v_context_p, a_context_p = context_p
-        v_context_n, a_context_n = context_n
+        ctx_p, ctx_n = encode_prompts(
+            [prompt, negative_prompt],
+            self.model_ledger,
+            enhance_first_prompt=enhance_prompt,
+            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+            enhance_prompt_seed=seed,
+        )
+        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
+        # Encode image conditionings with the VAE encoder, then free it
+        # before loading the transformer to reduce peak VRAM.
+        stage_1_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
+        video_encoder = self.model_ledger.video_encoder()
+        stage_1_conditionings = combined_image_conditionings(
+            images=images,
+            height=stage_1_output_shape.height,
+            width=stage_1_output_shape.width,
+            video_encoder=video_encoder,
+            dtype=dtype,
+            device=self.device,
+        )
         torch.cuda.synchronize()
-        del text_encoder
+        del video_encoder
         cleanup_memory()
 
-        # Stage 1: Initial low resolution video generation.
-        video_encoder = self.model_ledger.video_encoder()
         transformer = self.model_ledger.transformer()
         sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(dtype=torch.float32, device=self.device)
 
@@ -134,16 +144,6 @@ class TI2VidOneStagePipeline:
                     transformer=transformer,  # noqa: F821
                 ),
             )
-
-        stage_1_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
-        stage_1_conditionings = image_conditionings_by_replacing_latent(
-            images=images,
-            height=stage_1_output_shape.height,
-            width=stage_1_output_shape.width,
-            video_encoder=video_encoder,
-            dtype=dtype,
-            device=self.device,
-        )
 
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_1_output_shape,
@@ -178,7 +178,7 @@ def main() -> None:
     pipeline = TI2VidOneStagePipeline(
         checkpoint_path=args.checkpoint_path,
         gemma_root=args.gemma_root,
-        loras=args.lora,
+        loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
     )
     video, audio = pipeline(

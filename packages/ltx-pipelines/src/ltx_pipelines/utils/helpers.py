@@ -21,6 +21,7 @@ from ltx_core.guidance.perturbations import (
 from ltx_core.model.transformer import Modality, X0Model
 from ltx_core.model.video_vae import VideoEncoder
 from ltx_core.text_encoders.gemma import GemmaTextEncoder
+from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessorOutput
 from ltx_core.tools import AudioLatentTools, LatentTools, VideoLatentTools
 from ltx_core.types import AudioLatentShape, LatentState, VideoLatentShape, VideoPixelShape
 from ltx_pipelines.utils.args import ImageConditioningInput
@@ -42,6 +43,84 @@ def cleanup_memory() -> None:
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
+
+
+def encode_prompts(
+    prompts: list[str],
+    model_ledger: object,
+    *,
+    enhance_prompt_image: str | None = None,
+    enhance_prompt_seed: int = 42,
+    enhance_first_prompt: bool = False,
+) -> list[EmbeddingsProcessorOutput]:
+    """Encode prompts through Gemma → embeddings processor, freeing each after use.
+    Loads the text encoder from *model_ledger*, optionally enhances the first
+    prompt, encodes all *prompts*, frees the text encoder, then loads the
+    embeddings processor to produce the final outputs.  Because the text encoder
+    is loaded and freed entirely within this function, there are no lingering
+    references that could prevent GPU memory reclamation.
+    Args:
+        prompts: Text prompts to encode.
+        model_ledger: ModelLedger instance (used to load text encoder and embeddings processor).
+        enhance_prompt_image: Optional image path for prompt enhancement.
+        enhance_prompt_seed: Seed for prompt enhancement (default 42).
+        enhance_first_prompt: If True, enhance ``prompts[0]`` before encoding.
+    Returns:
+        List of EmbeddingsProcessorOutput, one per prompt.
+    """
+    text_encoder = model_ledger.text_encoder()
+    if enhance_first_prompt:
+        prompts = list(prompts)
+        prompts[0] = generate_enhanced_prompt(text_encoder, prompts[0], enhance_prompt_image, seed=enhance_prompt_seed)
+    raw_outputs = [text_encoder.encode(p) for p in prompts]
+    torch.cuda.synchronize()
+    del text_encoder
+    cleanup_memory()
+
+    embeddings_processor = model_ledger.gemma_embeddings_processor()
+    results: list[EmbeddingsProcessorOutput] = [
+        embeddings_processor.process_hidden_states(hs, mask) for hs, mask in raw_outputs
+    ]
+    del embeddings_processor
+    cleanup_memory()
+    return results
+
+
+def combined_image_conditionings(
+    images: list[ImageConditioningInput],
+    height: int,
+    width: int,
+    video_encoder: VideoEncoder,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> list[ConditioningItem]:
+    """Create a list of conditionings by replacing the latent at the first frame with the encoded image if present
+    and using other encoded images as the keyframe conditionings."""
+    conditionings = []
+    for img in images:
+        image = load_image_conditioning(
+            image_path=img.path,
+            height=height,
+            width=width,
+            dtype=dtype,
+            device=device,
+            crf=img.crf,
+        )
+        encoded_image = video_encoder(image)
+        if img.frame_idx == 0:
+            conditioning = VideoConditionByLatentIndex(
+                latent=encoded_image,
+                strength=img.strength,
+                latent_idx=0,
+            )
+        else:
+            conditioning = VideoConditionByKeyframeIndex(
+                keyframes=encoded_image,
+                strength=img.strength,
+                frame_idx=img.frame_idx,
+            )
+        conditionings.append(conditioning)
+    return conditionings
 
 
 def image_conditionings_by_replacing_latent(
