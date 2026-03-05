@@ -22,12 +22,18 @@ from ltx_core.text_encoders.gemma.feature_extractor import (
 
 class GemmaTextEncoderConfigurator(ModelConfigurator[GemmaTextEncoder]):
     @classmethod
-    def from_config(cls, config: dict) -> GemmaTextEncoder:
-        transformer_config = config.get("transformer", {})
-
+    def from_config(cls, config: dict) -> GemmaTextEncoder:  # noqa: ARG003
         gemma_config = Gemma3Config.from_dict(GEMMA3_CONFIG_FOR_LTX.to_dict())
         with torch.device("meta"):
             model = Gemma3ForConditionalGeneration(gemma_config)
+
+        return GemmaTextEncoder(model=model)
+
+
+class EmbeddingsProcessorConfigurator(ModelConfigurator[EmbeddingsProcessor]):
+    @classmethod
+    def from_config(cls, config: dict) -> EmbeddingsProcessor:
+        transformer_config = config.get("transformer", {})
 
         # Create video embeddings connector (always needed)
         video_connector = Embeddings1DConnectorConfigurator.from_config(config)
@@ -35,18 +41,13 @@ class GemmaTextEncoderConfigurator(ModelConfigurator[GemmaTextEncoder]):
         # Create audio embeddings connector
         audio_connector = AudioEmbeddings1DConnectorConfigurator.from_config(config)
 
-        # Create embeddings processor with both connectors
-        embeddings_processor = EmbeddingsProcessor(
-            video_connector=video_connector,
-            audio_connector=audio_connector,
-        )
-
+        # Create feature extractor
         feature_extractor = _create_feature_extractor(transformer_config)
 
-        return GemmaTextEncoder(
+        return EmbeddingsProcessor(
+            video_connector=video_connector,
+            audio_connector=audio_connector,
             feature_extractor=feature_extractor,
-            embeddings_processor=embeddings_processor,
-            model=model,
         )
 
 
@@ -97,8 +98,31 @@ def _create_feature_extractor(transformer_config: dict) -> torch.nn.Module:
     )
 
 
-AV_GEMMA_TEXT_ENCODER_KEY_OPS = (
-    SDOps("AV_GEMMA_TEXT_ENCODER_KEY_OPS")
+# --- Split SDOps: Gemma LLM keys vs Embeddings Processor keys ---
+
+GEMMA_LLM_KEY_OPS = (
+    SDOps("GEMMA_LLM_KEY_OPS")
+    # 1. Map language model layers (note the double .model prefix)
+    .with_matching(prefix="language_model.model.")
+    .with_replacement("language_model.model.", "model.model.language_model.")
+    # 2. Map the Vision Tower
+    .with_matching(prefix="vision_tower.")
+    .with_replacement("vision_tower.", "model.model.vision_tower.")
+    # 3. Map the Multi-Modal Projector
+    .with_matching(prefix="multi_modal_projector.")
+    .with_replacement("multi_modal_projector.", "model.model.multi_modal_projector.")
+    # 4. Duplicate embed_tokens to lm_head (needed for prompt enhancement via generate())
+    .with_kv_operation(
+        operation=lambda key, value: [
+            KeyValueOperationResult(key, value),
+            KeyValueOperationResult("model.lm_head.weight", value),
+        ],
+        key_prefix="model.model.language_model.embed_tokens.weight",
+    )
+)
+
+EMBEDDINGS_PROCESSOR_KEY_OPS = (
+    SDOps("EMBEDDINGS_PROCESSOR_KEY_OPS")
     # 1. Map the feature extractor (V1: aggregate_embed inside feature_extractor)
     .with_matching(prefix="text_embedding_projection.aggregate_embed.")
     .with_replacement("text_embedding_projection.aggregate_embed.", "feature_extractor.aggregate_embed.")
@@ -109,30 +133,13 @@ AV_GEMMA_TEXT_ENCODER_KEY_OPS = (
     .with_replacement("text_embedding_projection.audio_aggregate_embed.", "feature_extractor.audio_aggregate_embed.")
     # 2. Map the connectors
     .with_matching(prefix="model.diffusion_model.video_embeddings_connector.")
-    .with_replacement("model.diffusion_model.video_embeddings_connector.", "embeddings_processor.video_connector.")
+    .with_replacement("model.diffusion_model.video_embeddings_connector.", "video_connector.")
     .with_matching(prefix="model.diffusion_model.audio_embeddings_connector.")
-    .with_replacement("model.diffusion_model.audio_embeddings_connector.", "embeddings_processor.audio_connector.")
-    # 3. Map language model layers (note the double .model prefix)
-    .with_matching(prefix="language_model.model.")
-    .with_replacement("language_model.model.", "model.model.language_model.")
-    # 4. Map the Vision Tower
-    .with_matching(prefix="vision_tower.")
-    .with_replacement("vision_tower.", "model.model.vision_tower.")
-    # 5. Map the Multi-Modal Projector
-    .with_matching(prefix="multi_modal_projector.")
-    .with_replacement("multi_modal_projector.", "model.model.multi_modal_projector.")
-    .with_kv_operation(
-        operation=lambda key, value: [
-            KeyValueOperationResult(key, value),
-            KeyValueOperationResult("model.lm_head.weight", value),
-        ],
-        key_prefix="model.model.language_model.embed_tokens.weight",
-    )
+    .with_replacement("model.diffusion_model.audio_embeddings_connector.", "audio_connector.")
 )
 
-
-VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS = (
-    SDOps("VIDEO_ONLY_GEMMA_TEXT_ENCODER_KEY_OPS")
+VIDEO_ONLY_EMBEDDINGS_PROCESSOR_KEY_OPS = (
+    SDOps("VIDEO_ONLY_EMBEDDINGS_PROCESSOR_KEY_OPS")
     # 1. Map the feature extractor (V1: aggregate_embed inside feature_extractor)
     .with_matching(prefix="text_embedding_projection.aggregate_embed.")
     .with_replacement("text_embedding_projection.aggregate_embed.", "feature_extractor.aggregate_embed.")

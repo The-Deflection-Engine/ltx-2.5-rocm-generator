@@ -14,30 +14,29 @@ from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.text_encoders.gemma import encode_text
 from ltx_core.tools import VideoLatentShape
 from ltx_core.types import Audio, LatentState, VideoPixelShape
 from ltx_pipelines.utils import (
     ModelLedger,
     assert_resolution,
     cleanup_memory,
+    combined_image_conditionings,
     denoise_audio_video,
-    generate_enhanced_prompt,
+    encode_prompts,
     get_device,
-    image_conditionings_by_replacing_latent,
     multi_modal_guider_denoising_func,
     res2s_audio_video_denoising_loop,
     simple_denoising_func,
 )
-from ltx_pipelines.utils.args import ImageConditioningInput, default_2_stage_arg_parser, detect_checkpoint_path
-from ltx_pipelines.utils.constants import STAGE_2_DISTILLED_SIGMA_VALUES, detect_params
+from ltx_pipelines.utils.args import ImageConditioningInput, hq_2_stage_arg_parser
+from ltx_pipelines.utils.constants import LTX_2_3_HQ_PARAMS, STAGE_2_DISTILLED_SIGMA_VALUES
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import PipelineComponents
 
 device = get_device()
 
 
-class TI2VidTwoStagesRes2sPipeline:
+class TI2VidTwoStagesHQPipeline:
     """
     Two-stage text/image-to-video generation pipeline using the res_2s sampler.
     Same structure as :class:`TI2VidTwoStagesPipeline`: stage 1 generates video at
@@ -53,26 +52,38 @@ class TI2VidTwoStagesRes2sPipeline:
         self,
         checkpoint_path: str,
         distilled_lora: list[LoraPathStrengthAndSDOps],
+        distilled_lora_strength_stage_1: float,
+        distilled_lora_strength_stage_2: float,
         spatial_upsampler_path: str,
         gemma_root: str,
-        loras: list[LoraPathStrengthAndSDOps],
+        loras: tuple[LoraPathStrengthAndSDOps, ...],
         device: str = device,
         quantization: QuantizationPolicy | None = None,
     ):
         self.device = device
         self.dtype = torch.bfloat16
+        distilled_lora_stage_1 = LoraPathStrengthAndSDOps(
+            path=distilled_lora[0].path,
+            strength=distilled_lora_strength_stage_1,
+            sd_ops=distilled_lora[0].sd_ops,
+        )
+        distilled_lora_stage_2 = LoraPathStrengthAndSDOps(
+            path=distilled_lora[0].path,
+            strength=distilled_lora_strength_stage_2,
+            sd_ops=distilled_lora[0].sd_ops,
+        )
         self.stage_1_model_ledger = ModelLedger(
             dtype=self.dtype,
             device=device,
             checkpoint_path=checkpoint_path,
             gemma_root_path=gemma_root,
             spatial_upsampler_path=spatial_upsampler_path,
-            loras=loras,
+            loras=(*loras, distilled_lora_stage_1),
             quantization=quantization,
         )
 
         self.stage_2_model_ledger = self.stage_1_model_ledger.with_loras(
-            loras=distilled_lora,
+            loras=(*loras, distilled_lora_stage_2),
         )
 
         self.pipeline_components = PipelineComponents(
@@ -103,23 +114,18 @@ class TI2VidTwoStagesRes2sPipeline:
         noiser = GaussianNoiser(generator=generator)
         dtype = torch.bfloat16
 
-        text_encoder = self.stage_1_model_ledger.text_encoder()
-        if enhance_prompt:
-            prompt = generate_enhanced_prompt(
-                text_encoder, prompt, images[0][0] if len(images) > 0 else None, seed=seed
-            )
-        context_p, context_n = encode_text(text_encoder, prompts=[prompt, negative_prompt])
-        v_context_p, a_context_p = context_p
-        v_context_n, a_context_n = context_n
+        ctx_p, ctx_n = encode_prompts(
+            [prompt, negative_prompt],
+            self.stage_1_model_ledger,
+            enhance_first_prompt=enhance_prompt,
+            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+            enhance_prompt_seed=seed,
+        )
+        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
-        torch.cuda.synchronize()
-        del text_encoder
-        cleanup_memory()
-
-        # Stage 1: Initial low resolution video generation.
-        video_encoder = self.stage_1_model_ledger.video_encoder()
-        transformer = self.stage_1_model_ledger.transformer()
-
+        # Stage 1: encode image conditionings with the VAE encoder, then free it
+        # before loading the transformer to reduce peak VRAM.
         stage_1_output_shape = VideoPixelShape(
             batch=1,
             frames=num_frames,
@@ -127,6 +133,21 @@ class TI2VidTwoStagesRes2sPipeline:
             height=height // 2,
             fps=frame_rate,
         )
+        video_encoder = self.stage_1_model_ledger.video_encoder()
+        stage_1_conditionings = combined_image_conditionings(
+            images=images,
+            height=stage_1_output_shape.height,
+            width=stage_1_output_shape.width,
+            video_encoder=video_encoder,
+            dtype=dtype,
+            device=self.device,
+        )
+        torch.cuda.synchronize()
+        del video_encoder
+        cleanup_memory()
+
+        transformer = self.stage_1_model_ledger.transformer()
+
         empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_output_shape).to_torch_shape())
         stepper = Res2sDiffusionStep()
         sigmas = (
@@ -158,14 +179,6 @@ class TI2VidTwoStagesRes2sPipeline:
                 ),
             )
 
-        stage_1_conditionings = image_conditionings_by_replacing_latent(
-            images=images,
-            height=stage_1_output_shape.height,
-            width=stage_1_output_shape.width,
-            video_encoder=video_encoder,
-            dtype=dtype,
-            device=self.device,
-        )
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_1_output_shape,
             conditionings=stage_1_conditionings,
@@ -183,13 +196,24 @@ class TI2VidTwoStagesRes2sPipeline:
         cleanup_memory()
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
+        video_encoder = self.stage_1_model_ledger.video_encoder()
         upscaled_video_latent = upsample_video(
             latent=video_state.latent[:1],
             video_encoder=video_encoder,
             upsampler=self.stage_2_model_ledger.spatial_upsampler(),
         )
 
+        stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
+        stage_2_conditionings = combined_image_conditionings(
+            images=images,
+            height=stage_2_output_shape.height,
+            width=stage_2_output_shape.width,
+            video_encoder=video_encoder,
+            dtype=dtype,
+            device=self.device,
+        )
         torch.cuda.synchronize()
+        del video_encoder
         cleanup_memory()
 
         transformer = self.stage_2_model_ledger.transformer()
@@ -210,15 +234,6 @@ class TI2VidTwoStagesRes2sPipeline:
                 ),
             )
 
-        stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
-        stage_2_conditionings = image_conditionings_by_replacing_latent(
-            images=images,
-            height=stage_2_output_shape.height,
-            width=stage_2_output_shape.width,
-            video_encoder=video_encoder,
-            dtype=dtype,
-            device=self.device,
-        )
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_2_output_shape,
             conditionings=stage_2_conditionings,
@@ -236,7 +251,6 @@ class TI2VidTwoStagesRes2sPipeline:
 
         torch.cuda.synchronize()
         del transformer
-        del video_encoder
         cleanup_memory()
 
         decoded_video = vae_decode_video(
@@ -251,16 +265,16 @@ class TI2VidTwoStagesRes2sPipeline:
 @torch.inference_mode()
 def main() -> None:
     logging.getLogger().setLevel(logging.INFO)
-    checkpoint_path = detect_checkpoint_path()
-    params = detect_params(checkpoint_path)
-    parser = default_2_stage_arg_parser(params=params)
+    parser = hq_2_stage_arg_parser(params=LTX_2_3_HQ_PARAMS)
     args = parser.parse_args()
-    pipeline = TI2VidTwoStagesRes2sPipeline(
+    pipeline = TI2VidTwoStagesHQPipeline(
         checkpoint_path=args.checkpoint_path,
         distilled_lora=args.distilled_lora,
+        distilled_lora_strength_stage_1=args.distilled_lora_strength_stage_1,
+        distilled_lora_strength_stage_2=args.distilled_lora_strength_stage_2,
         spatial_upsampler_path=args.spatial_upsampler_path,
         gemma_root=args.gemma_root,
-        loras=args.lora,
+        loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
     )
     tiling_config = TilingConfig.default()

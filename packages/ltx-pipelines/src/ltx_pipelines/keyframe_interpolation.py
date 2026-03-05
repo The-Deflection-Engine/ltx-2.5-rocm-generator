@@ -18,7 +18,6 @@ from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.text_encoders.gemma import encode_text
 from ltx_core.types import Audio, LatentState, VideoPixelShape
 from ltx_pipelines.utils import ModelLedger
 from ltx_pipelines.utils.args import ImageConditioningInput, default_2_stage_arg_parser, detect_checkpoint_path
@@ -27,7 +26,7 @@ from ltx_pipelines.utils.helpers import (
     assert_resolution,
     cleanup_memory,
     denoise_audio_video,
-    generate_enhanced_prompt,
+    encode_prompts,
     get_device,
     image_conditionings_by_adding_guiding_latent,
     multi_modal_guider_factory_denoising_func,
@@ -71,7 +70,7 @@ class KeyframeInterpolationPipeline:
             loras=loras,
             quantization=quantization,
         )
-        self.stage_2_model_ledger = self.stage_1_model_ledger.with_loras(
+        self.stage_2_model_ledger = self.stage_1_model_ledger.with_additional_loras(
             loras=distilled_lora,
         )
         self.pipeline_components = PipelineComponents(
@@ -102,18 +101,15 @@ class KeyframeInterpolationPipeline:
         stepper = EulerDiffusionStep()
         dtype = torch.bfloat16
 
-        text_encoder = self.stage_1_model_ledger.text_encoder()
-        if enhance_prompt:
-            prompt = generate_enhanced_prompt(
-                text_encoder, prompt, images[0][0] if len(images) > 0 else None, seed=seed
-            )
-        context_p, context_n = encode_text(text_encoder, prompts=[prompt, negative_prompt])
-        v_context_p, a_context_p = context_p
-        v_context_n, a_context_n = context_n
-
-        torch.cuda.synchronize()
-        del text_encoder
-        cleanup_memory()
+        ctx_p, ctx_n = encode_prompts(
+            [prompt, negative_prompt],
+            self.stage_1_model_ledger,
+            enhance_first_prompt=enhance_prompt,
+            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+            enhance_prompt_seed=seed,
+        )
+        v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
+        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
 
         # Stage 1: Initial low resolution video generation.
         video_encoder = self.stage_1_model_ledger.video_encoder()
@@ -252,7 +248,7 @@ def main() -> None:
         distilled_lora=args.distilled_lora,
         spatial_upsampler_path=args.spatial_upsampler_path,
         gemma_root=args.gemma_root,
-        loras=args.lora,
+        loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
     )
     tiling_config = TilingConfig.default()

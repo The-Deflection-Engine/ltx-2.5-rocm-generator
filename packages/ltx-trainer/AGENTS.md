@@ -14,7 +14,7 @@ This file provides guidance to AI coding assistants (Claude, Cursor, etc.) when 
 **Supported model versions:**
 
 - **LTX-2** (19B, initial audio-video model)
-- **LTX-2.3** (20B, improved text conditioning and audio quality)
+- **LTX-2.3** (22B, improved text conditioning and audio quality)
 
 Version detection is fully automatic — ltx-core reads the checkpoint config and selects the correct architecture
 components. The trainer does not need version-specific code paths.
@@ -80,9 +80,10 @@ packages/ltx-trainer/
 
 - `ltx_trainer.model_loader` provides component loaders using `ltx-core`
 - Individual loaders: `load_transformer()`, `load_video_vae_encoder()`, `load_video_vae_decoder()`,
-  `load_text_encoder()`, etc.
+  `load_text_encoder()`, `load_embeddings_processor()`, etc.
 - Combined loader: `load_model()` returns `LtxModelComponents` dataclass
 - Uses `SingleGPUModelBuilder` from ltx-core internally
+- Text encoder and embeddings processor are loaded separately (the text encoder only needs Gemma weights; the embeddings processor only needs the LTX checkpoint)
 - 8-bit text encoder loading via `gemma_8bit.py` (bitsandbytes)
 
 **Training Flow:**
@@ -146,7 +147,7 @@ Both model versions share the same latent space interface (see [Latent Space Con
 The differences lie in how text conditioning and audio generation work. Version detection is automatic via checkpoint
 config — the trainer uses a unified API.
 
-| Component             | LTX-2 (19B)                                                                     | LTX-2.3 (20B)                                                                                       |
+| Component             | LTX-2 (19B)                                                                     | LTX-2.3 (22B)                                                                                       |
 |-----------------------|---------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------|
 | Feature extractor     | `FeatureExtractorV1`: single `aggregate_embed`, same output for video and audio | `FeatureExtractorV2`: separate `video_aggregate_embed` + `audio_aggregate_embed`, per-token RMSNorm |
 | Caption projection    | Inside the transformer (`caption_projection`)                                   | Inside the feature extractor (before connector)                                                     |
@@ -309,7 +310,7 @@ Key classes:
 - Implements distributed training with Accelerate
 - Handles mixed precision, gradient accumulation, checkpointing
 - `_training_step()` applies embedding connectors then delegates to strategy
-- `_load_text_encoder_and_cache_embeddings()` caches validation embeddings and unloads heavy components
+- `_load_text_encoder_and_cache_embeddings()` loads the text encoder + embeddings processor, caches validation embeddings, then unloads the Gemma LLM (keeps only the embeddings processor connectors for training)
 - Uses training strategies for mode-specific logic
 
 **`src/ltx_trainer/training_strategies/`** - Strategy pattern
@@ -334,7 +335,8 @@ Component loaders:
 - `load_video_vae_decoder()` → `VideoDecoder`
 - `load_audio_vae_decoder()` → `AudioDecoder`
 - `load_vocoder()` → `Vocoder` or `VocoderWithBWE` (auto-detected)
-- `load_text_encoder()` → `GemmaTextEncoder` (unified, handles V1/V2 automatically)
+- `load_text_encoder(gemma_model_path)` → `GemmaTextEncoder` (pure Gemma LLM, no checkpoint needed)
+- `load_embeddings_processor(checkpoint_path)` → `EmbeddingsProcessor` (feature extractor + connectors)
 - `load_model()` → `LtxModelComponents` (convenience wrapper)
 
 **`src/ltx_trainer/validation_sampler.py`** - Inference for validation
@@ -506,7 +508,7 @@ packages/ltx-core/src/ltx_core/
 │   ├── encoders/
 │   │   ├── base_encoder.py         # GemmaTextEncoder (unified 3-block pipeline)
 │   │   └── encoder_configurator.py # GemmaTextEncoderConfigurator, _create_feature_extractor
-│   ├── feature_extractor.py        # FeatureExtractorV1 (19B), FeatureExtractorV2 (20B)
+│   ├── feature_extractor.py        # FeatureExtractorV1 (19B), FeatureExtractorV2 (22B)
 │   ├── embeddings_connector.py     # Embeddings1DConnector, Embeddings1DConnectorConfigurator,
 │   │                               #   AudioEmbeddings1DConnectorConfigurator
 │   ├── embeddings_processor.py     # EmbeddingsProcessor (wraps video + audio connectors)

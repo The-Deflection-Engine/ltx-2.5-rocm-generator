@@ -56,7 +56,7 @@ python -m ltx_pipelines.ti2vid_two_stages --help
 Available pipeline modules:
 
 - `ltx_pipelines.ti2vid_two_stages` - Two-stage text/image-to-video (recommended).
-- `ltx_pipelines.ti2vid_two_stages_res2s` - Two-stage text/image-to-video (use 2 times less steps).
+- `ltx_pipelines.ti2vid_two_stages_hq` - Two-stage text/image-to-video (different sampler, better quality).
 - `ltx_pipelines.ti2vid_one_stage` - Single-stage text/image-to-video.
 - `ltx_pipelines.distilled` - Fast text/image-to-video pipeline using only the distilled model.
 - `ltx_pipelines.ic_lora` - Video-to-video with IC-LoRA.
@@ -94,14 +94,14 @@ Do you need to condition on existing images/videos?
       └─ YES → Use DistilledPipeline (with 8 predefined sigmas)
 ```
 
-> **Note:** [`TI2VidOneStagePipeline`](src/ltx_pipelines/ti2vid_one_stage.py) is primarily for educational purposes. For best quality, use two-stage pipelines ([`TI2VidTwoStagesPipeline`](src/ltx_pipelines/ti2vid_two_stages.py), [`TI2VidTwoStagesRes2sPipeline`](src/ltx_pipelines/ti2vid_two_stages_res2s.py), [`ICLoraPipeline`](src/ltx_pipelines/ic_lora.py), [`KeyframeInterpolationPipeline`](src/ltx_pipelines/keyframe_interpolation.py), [`A2VidPipelineTwoStage`](src/ltx_pipelines/a2vid_two_stage.py), or [`DistilledPipeline`](src/ltx_pipelines/distilled.py)). For editing existing videos, use [`RetakePipeline`](src/ltx_pipelines/retake.py).
+> **Note:** [`TI2VidOneStagePipeline`](src/ltx_pipelines/ti2vid_one_stage.py) is primarily for educational purposes. For best quality, use two-stage pipelines ([`TI2VidTwoStagesPipeline`](src/ltx_pipelines/ti2vid_two_stages.py), [`TI2VidTwoStagesHQPipeline`](src/ltx_pipelines/ti2vid_two_stages_hq.py), [`ICLoraPipeline`](src/ltx_pipelines/ic_lora.py), [`KeyframeInterpolationPipeline`](src/ltx_pipelines/keyframe_interpolation.py), [`A2VidPipelineTwoStage`](src/ltx_pipelines/a2vid_two_stage.py), or [`DistilledPipeline`](src/ltx_pipelines/distilled.py)). For editing existing videos, use [`RetakePipeline`](src/ltx_pipelines/retake.py).
 
 ### Features Comparison
 
 | Pipeline | Stages | [Multimodal Guidance](#%EF%B8%8F-multimodal-guidance) | Upsampling | Conditioning | Best For |
 | -------- | ------ | --- | ---------- | ------------- | -------- |
 | **TI2VidTwoStagesPipeline** | 2 | ✅ | ✅ | Image | **Production quality** (recommended) |
-| **TI2VidTwoStagesRes2sPipeline** | 2 | ✅ | ✅ | Image | Same as above, res_2s sampler (fewer steps) |
+| **TI2VidTwoStagesHQPipeline** | 2 | ✅ | ✅ | Image | Same as above, res_2s sampler (higher quality) |
 | **TI2VidOneStagePipeline** | 1 | ✅ | ❌ | Image | Educational, prototyping |
 | **DistilledPipeline** | 2 | ❌ | ✅ | Image | Fastest inference (8 sigmas) |
 | **ICLoraPipeline** | 2 | ✅ | ✅ | Image + Video | Video-to-video transformations |
@@ -125,11 +125,11 @@ Two-stage generation: Stage 1 generates low-resolution video with [multimodal gu
 
 ---
 
-### 2. TI2VidTwoStagesRes2sPipeline
+### 2. TI2VidTwoStagesHQPipeline
 
 **Best for:** Same two-stage text/image-to-video as TI2VidTwoStagesPipeline but with a different sampler and step count.
 
-**Source**: [`src/ltx_pipelines/ti2vid_two_stages_res2s.py`](src/ltx_pipelines/ti2vid_two_stages_res2s.py)
+**Source**: [`src/ltx_pipelines/ti2vid_two_stages_hq.py`](src/ltx_pipelines/ti2vid_two_stages_hq.py)
 
 Uses the **res_2s** second-order sampler instead of Euler. Same stage structure (stage 1 at target resolution with CFG, stage 2 upsampling with distilled LoRA) and image conditioning support. Typically allows fewer steps for comparable quality; trade-offs differ from the default Euler-based pipeline.
 

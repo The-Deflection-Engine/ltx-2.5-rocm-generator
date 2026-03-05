@@ -140,19 +140,20 @@ class BasicAVTransformerBlock(torch.nn.Module):
         batch_size: int,
         scale_shift_timestep: torch.Tensor,
         gate_timestep: torch.Tensor,
+        scale_shift_indices: slice,
         num_scale_shift_values: int = 4,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         scale_shift_ada_values = self.get_ada_values(
-            scale_shift_table[:num_scale_shift_values, :], batch_size, scale_shift_timestep, slice(None, None)
+            scale_shift_table[:num_scale_shift_values, :], batch_size, scale_shift_timestep, scale_shift_indices
         )
         gate_ada_values = self.get_ada_values(
             scale_shift_table[num_scale_shift_values:, :], batch_size, gate_timestep, slice(None, None)
         )
 
-        scale_shift_chunks = [t.squeeze(2) for t in scale_shift_ada_values]
-        gate_ada_values = [t.squeeze(2) for t in gate_ada_values]
+        scale, shift = (t.squeeze(2) for t in scale_shift_ada_values)
+        (gate,) = (t.squeeze(2) for t in gate_ada_values)
 
-        return (*scale_shift_chunks, *gate_ada_values)
+        return scale, shift, gate
 
     def _apply_text_cross_attention(
         self,
@@ -287,37 +288,26 @@ class BasicAVTransformerBlock(torch.nn.Module):
             vx_norm3 = rms_norm(vx, eps=self.norm_eps)
             ax_norm3 = rms_norm(ax, eps=self.norm_eps)
 
-            (
-                scale_ca_audio_hidden_states_a2v,
-                shift_ca_audio_hidden_states_a2v,
-                scale_ca_audio_hidden_states_v2a,
-                shift_ca_audio_hidden_states_v2a,
-                gate_out_v2a,
-            ) = self.get_av_ca_ada_values(
-                self.scale_shift_table_a2v_ca_audio,
-                ax.shape[0],
-                audio.cross_scale_shift_timestep,
-                audio.cross_gate_timestep,
-            )
-
-            (
-                scale_ca_video_hidden_states_a2v,
-                shift_ca_video_hidden_states_a2v,
-                scale_ca_video_hidden_states_v2a,
-                shift_ca_video_hidden_states_v2a,
-                gate_out_a2v,
-            ) = self.get_av_ca_ada_values(
-                self.scale_shift_table_a2v_ca_video,
-                vx.shape[0],
-                video.cross_scale_shift_timestep,
-                video.cross_gate_timestep,
-            )
-
             if run_a2v and not perturbations.all_in_batch(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx):
-                vx_scaled = vx_norm3 * (1 + scale_ca_video_hidden_states_a2v) + shift_ca_video_hidden_states_a2v
-                del scale_ca_video_hidden_states_a2v, shift_ca_video_hidden_states_a2v
-                ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_a2v) + shift_ca_audio_hidden_states_a2v
-                del scale_ca_audio_hidden_states_a2v, shift_ca_audio_hidden_states_a2v
+                scale_ca_video_a2v, shift_ca_video_a2v, gate_out_a2v = self.get_av_ca_ada_values(
+                    self.scale_shift_table_a2v_ca_video,
+                    vx.shape[0],
+                    video.cross_scale_shift_timestep,
+                    video.cross_gate_timestep,
+                    slice(0, 2),
+                )
+                vx_scaled = vx_norm3 * (1 + scale_ca_video_a2v) + shift_ca_video_a2v
+                del scale_ca_video_a2v, shift_ca_video_a2v
+
+                scale_ca_audio_a2v, shift_ca_audio_a2v, _ = self.get_av_ca_ada_values(
+                    self.scale_shift_table_a2v_ca_audio,
+                    ax.shape[0],
+                    audio.cross_scale_shift_timestep,
+                    audio.cross_gate_timestep,
+                    slice(0, 2),
+                )
+                ax_scaled = ax_norm3 * (1 + scale_ca_audio_a2v) + shift_ca_audio_a2v
+                del scale_ca_audio_a2v, shift_ca_audio_a2v
                 a2v_mask = perturbations.mask_like(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx, vx)
                 vx = vx + (
                     self.audio_to_video_attn(
@@ -330,11 +320,26 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     * a2v_mask
                 )
                 del gate_out_a2v, a2v_mask, vx_scaled, ax_scaled
+
             if run_v2a and not perturbations.all_in_batch(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx):
-                ax_scaled = ax_norm3 * (1 + scale_ca_audio_hidden_states_v2a) + shift_ca_audio_hidden_states_v2a
-                del scale_ca_audio_hidden_states_v2a, shift_ca_audio_hidden_states_v2a
-                vx_scaled = vx_norm3 * (1 + scale_ca_video_hidden_states_v2a) + shift_ca_video_hidden_states_v2a
-                del scale_ca_video_hidden_states_v2a, shift_ca_video_hidden_states_v2a
+                scale_ca_audio_v2a, shift_ca_audio_v2a, gate_out_v2a = self.get_av_ca_ada_values(
+                    self.scale_shift_table_a2v_ca_audio,
+                    ax.shape[0],
+                    audio.cross_scale_shift_timestep,
+                    audio.cross_gate_timestep,
+                    slice(2, 4),
+                )
+                ax_scaled = ax_norm3 * (1 + scale_ca_audio_v2a) + shift_ca_audio_v2a
+                del scale_ca_audio_v2a, shift_ca_audio_v2a
+                scale_ca_video_v2a, shift_ca_video_v2a, _ = self.get_av_ca_ada_values(
+                    self.scale_shift_table_a2v_ca_video,
+                    vx.shape[0],
+                    video.cross_scale_shift_timestep,
+                    video.cross_gate_timestep,
+                    slice(2, 4),
+                )
+                vx_scaled = vx_norm3 * (1 + scale_ca_video_v2a) + shift_ca_video_v2a
+                del scale_ca_video_v2a, shift_ca_video_v2a
                 v2a_mask = perturbations.mask_like(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx, ax)
                 ax = ax + (
                     self.video_to_audio_attn(
@@ -347,6 +352,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     * v2a_mask
                 )
                 del gate_out_v2a, v2a_mask, ax_scaled, vx_scaled
+
             del vx_norm3, ax_norm3
 
         if run_vx:

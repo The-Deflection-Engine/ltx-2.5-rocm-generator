@@ -110,7 +110,7 @@ class FeatureExtractorV1(nn.Module):
 
 
 class FeatureExtractorV2(nn.Module):
-    """20B: per-token RMS norm → rescale → dual aggregate embeds"""
+    """22B: per-token RMS norm → rescale → dual aggregate embeds"""
 
     def __init__(
         self,

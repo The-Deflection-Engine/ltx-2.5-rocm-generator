@@ -71,6 +71,27 @@ LTX_2_3_PARAMS = replace(
     video_guider_params=replace(LTX_2_PARAMS.video_guider_params, stg_blocks=[28]),
     audio_guider_params=replace(LTX_2_PARAMS.audio_guider_params, stg_blocks=[28]),
 )
+LTX_2_3_HQ_PARAMS = PipelineParams(
+    num_inference_steps=15,
+    stage_1_height=1088 // 2,
+    stage_1_width=1920 // 2,
+    video_guider_params=MultiModalGuiderParams(
+        cfg_scale=3.0,
+        stg_scale=0.0,
+        rescale_scale=0.45,
+        modality_scale=3.0,
+        skip_step=0,
+        stg_blocks=[],
+    ),
+    audio_guider_params=MultiModalGuiderParams(
+        cfg_scale=7.0,
+        stg_scale=0.0,
+        rescale_scale=1.0,
+        modality_scale=3.0,
+        skip_step=0,
+        stg_blocks=[],
+    ),
+)
 
 DEFAULT_LORA_STRENGTH = 1.0
 DEFAULT_IMAGE_CRF = 33

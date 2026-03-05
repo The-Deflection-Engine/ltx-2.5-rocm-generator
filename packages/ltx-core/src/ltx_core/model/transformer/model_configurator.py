@@ -128,12 +128,12 @@ def _build_caption_projections(
 ) -> tuple[torch.nn.Module | None, torch.nn.Module | None]:
     """Build caption projections for the transformer when projection is NOT in the text encoder.
     19B models: projection is in the transformer (caption_proj_before_connector=False).
-    20B models: projection is in the text encoder, so no projections are created here.
+    22B models: projection is in the text encoder, so no projections are created here.
     Args:
         config: Full model config dict (must contain "transformer" key).
         is_av: Whether this is an audio-video model. When False, audio projection is skipped.
     Returns:
-        Tuple of (video_caption_projection, audio_caption_projection), both None for 20B models.
+        Tuple of (video_caption_projection, audio_caption_projection), both None for 22B models.
     """
     transformer_config = config.get("transformer", {})
     if transformer_config.get("caption_proj_before_connector", False):
