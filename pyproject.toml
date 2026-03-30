@@ -11,6 +11,8 @@ url = "https://pypi.org/simple"
 
 [dependency-groups]
 dev = [
+    "google-cloud-storage>=2.0",
+    "matplotlib>=3.7",
     "pre-commit>=4.3.0",
     "ruff>=0.14.3",
     "pytest~=9.0",

@@ -133,6 +133,7 @@ class OptimizationConfig(ConfigBaseModel):
         "cosine",
         "cosine_with_restarts",
         "polynomial",
+        "step",
     ] = Field(
         default="linear",
         description="Type of scheduler to use for training",
@@ -396,6 +397,21 @@ class CheckpointsConfig(ConfigBaseModel):
     precision: Literal["bfloat16", "float32"] = Field(
         default="bfloat16",
         description="Precision to use when saving checkpoint weights. Options: 'bfloat16' or 'float32'.",
+    )
+
+    no_resume: bool = Field(
+        default=False,
+        description="When True, ignore any saved training state and start from step 0. "
+        "Model weights from load_checkpoint are still loaded, but optimizer/scheduler "
+        "state and step counter are reset.",
+    )
+
+    save_training_state: Literal["full", "minimal", "off"] = Field(
+        default="minimal",
+        description="Save training state alongside checkpoints for resume. "
+        "'full': optimizer + scheduler + RNG + step (~800MB for LoRA, much larger for full fine-tuning). "
+        "'minimal': scheduler + RNG + step only (~few KB, sufficient for LoRA). "
+        "'off': nothing saved, resume not possible.",
     )
 
 
