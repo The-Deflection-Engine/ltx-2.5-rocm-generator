@@ -5,32 +5,17 @@ import torch
 from einops import rearrange
 from safetensors import safe_open
 
-from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.noisers import GaussianNoiser
-from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.conditioning import (
     ConditioningItem,
     ConditioningItemAttentionStrengthWrapper,
     VideoConditionByReferenceLatent,
 )
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
-from ltx_core.model.upsampler import upsample_video
+from ltx_core.loader.registry import Registry
 from ltx_core.model.video_vae import TilingConfig, VideoEncoder, get_video_chunks_number
-from ltx_core.model.video_vae import decode_video as vae_decode_video
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.types import Audio, LatentState, VideoLatentShape, VideoPixelShape
-from ltx_pipelines.utils import (
-    ModelLedger,
-    assert_resolution,
-    cleanup_memory,
-    combined_image_conditionings,
-    denoise_audio_video,
-    encode_prompts,
-    euler_denoising_loop,
-    get_device,
-    simple_denoising_func,
-)
+from ltx_core.types import Audio, VideoLatentShape, VideoPixelShape
 from ltx_pipelines.utils.args import (
     ImageConditioningInput,
     VideoConditioningAction,
@@ -38,15 +23,23 @@ from ltx_pipelines.utils.args import (
     default_2_stage_distilled_arg_parser,
     detect_checkpoint_path,
 )
+from ltx_pipelines.utils.blocks import (
+    AudioDecoder,
+    DiffusionStage,
+    ImageConditioner,
+    PromptEncoder,
+    VideoDecoder,
+    VideoUpsampler,
+)
 from ltx_pipelines.utils.constants import (
     DISTILLED_SIGMA_VALUES,
     STAGE_2_DISTILLED_SIGMA_VALUES,
     detect_params,
 )
-from ltx_pipelines.utils.media_io import encode_video, load_video_conditioning
-from ltx_pipelines.utils.types import PipelineComponents
-
-device = get_device()
+from ltx_pipelines.utils.denoisers import SimpleDenoiser
+from ltx_pipelines.utils.helpers import assert_resolution, combined_image_conditionings, get_device
+from ltx_pipelines.utils.media_io import decode_video_by_frame, encode_video, video_preprocess
+from ltx_pipelines.utils.types import ModalitySpec
 
 
 class ICLoraPipeline:
@@ -66,33 +59,41 @@ class ICLoraPipeline:
         spatial_upsampler_path: str,
         gemma_root: str,
         loras: list[LoraPathStrengthAndSDOps],
-        device: torch.device = device,
+        device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
+        registry: Registry | None = None,
+        torch_compile: bool = False,
     ):
+        self.device = device or get_device()
         self.dtype = torch.bfloat16
-        self.stage_1_model_ledger = ModelLedger(
-            dtype=self.dtype,
-            device=device,
-            checkpoint_path=distilled_checkpoint_path,
-            spatial_upsampler_path=spatial_upsampler_path,
-            gemma_root_path=gemma_root,
-            loras=loras,
+
+        self.prompt_encoder = PromptEncoder(
+            distilled_checkpoint_path, gemma_root, self.dtype, self.device, registry=registry
+        )
+        self.image_conditioner = ImageConditioner(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
+        self.stage_1 = DiffusionStage(
+            distilled_checkpoint_path,
+            self.dtype,
+            self.device,
+            loras=tuple(loras),
             quantization=quantization,
+            registry=registry,
+            torch_compile=torch_compile,
         )
-        self.stage_2_model_ledger = ModelLedger(
-            dtype=self.dtype,
-            device=device,
-            checkpoint_path=distilled_checkpoint_path,
-            spatial_upsampler_path=spatial_upsampler_path,
-            gemma_root_path=gemma_root,
-            loras=[],
+        self.stage_2 = DiffusionStage(
+            distilled_checkpoint_path,
+            self.dtype,
+            self.device,
+            loras=(),
             quantization=quantization,
+            registry=registry,
+            torch_compile=torch_compile,
         )
-        self.pipeline_components = PipelineComponents(
-            dtype=self.dtype,
-            device=device,
+        self.upsampler = VideoUpsampler(
+            distilled_checkpoint_path, spatial_upsampler_path, self.dtype, self.device, registry=registry
         )
-        self.device = device
+        self.video_decoder = VideoDecoder(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
+        self.audio_decoder = AudioDecoder(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
 
         # Read reference downscale factor from LoRA metadata.
         # IC-LoRAs trained with low-resolution reference videos store this factor
@@ -124,6 +125,7 @@ class ICLoraPipeline:
         conditioning_attention_strength: float = 1.0,
         skip_stage_2: bool = False,
         conditioning_attention_mask: torch.Tensor | None = None,
+        streaming_prefetch_count: int | None = None,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         """
         Generate video with IC-LoRA conditioning.
@@ -165,15 +167,13 @@ class ICLoraPipeline:
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
-        stepper = EulerDiffusionStep()
-        dtype = torch.bfloat16
 
-        (ctx_p,) = encode_prompts(
+        (ctx_p,) = self.prompt_encoder(
             [prompt],
-            self.stage_1_model_ledger,
             enhance_first_prompt=enhance_prompt,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
             enhance_prompt_seed=seed,
+            streaming_prefetch_count=streaming_prefetch_count,
         )
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
 
@@ -186,130 +186,87 @@ class ICLoraPipeline:
             fps=frame_rate,
         )
 
-        # Encode conditionings before loading transformer to reduce peak VRAM
-        video_encoder = self.stage_1_model_ledger.video_encoder()
-        stage_1_conditionings = self._create_conditionings(
-            images=images,
-            video_conditioning=video_conditioning,
-            height=stage_1_output_shape.height,
-            width=stage_1_output_shape.width,
-            video_encoder=video_encoder,
-            num_frames=num_frames,
-            conditioning_attention_strength=conditioning_attention_strength,
-            conditioning_attention_mask=conditioning_attention_mask,
+        # Encode conditionings using the video encoder block
+        stage_1_conditionings = self.image_conditioner(
+            lambda enc: self._create_conditionings(
+                images=images,
+                video_conditioning=video_conditioning,
+                height=stage_1_output_shape.height,
+                width=stage_1_output_shape.width,
+                video_encoder=enc,
+                num_frames=num_frames,
+                conditioning_attention_strength=conditioning_attention_strength,
+                conditioning_attention_mask=conditioning_attention_mask,
+            )
         )
 
-        transformer = self.stage_1_model_ledger.transformer()
         stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
 
-        def first_stage_denoising_loop(
-            sigmas: torch.Tensor, video_state: LatentState, audio_state: LatentState, stepper: DiffusionStepProtocol
-        ) -> tuple[LatentState, LatentState]:
-            return euler_denoising_loop(
-                sigmas=sigmas,
-                video_state=video_state,
-                audio_state=audio_state,
-                stepper=stepper,
-                denoise_fn=simple_denoising_func(
-                    video_context=video_context,
-                    audio_context=audio_context,
-                    transformer=transformer,  # noqa: F821
-                ),
-            )
-
-        video_state, audio_state = denoise_audio_video(
-            output_shape=stage_1_output_shape,
-            conditionings=stage_1_conditionings,
-            noiser=noiser,
+        video_state, audio_state = self.stage_1(
+            denoiser=SimpleDenoiser(video_context, audio_context),
             sigmas=stage_1_sigmas,
-            stepper=stepper,
-            denoising_loop_fn=first_stage_denoising_loop,
-            components=self.pipeline_components,
-            dtype=dtype,
-            device=self.device,
+            noiser=noiser,
+            width=stage_1_output_shape.width,
+            height=stage_1_output_shape.height,
+            frames=num_frames,
+            fps=frame_rate,
+            video=ModalitySpec(
+                context=video_context,
+                conditionings=stage_1_conditionings,
+            ),
+            audio=ModalitySpec(
+                context=audio_context,
+            ),
+            streaming_prefetch_count=streaming_prefetch_count,
         )
-
-        torch.cuda.synchronize()
-        del transformer
-        cleanup_memory()
 
         if skip_stage_2:
             # Skip Stage 2: Decode directly from Stage 1 output at half resolution
             logging.info("[IC-LoRA] Skipping Stage 2 (--skip-stage-2 enabled)")
-            decoded_video = vae_decode_video(
-                video_state.latent, self.stage_1_model_ledger.video_decoder(), tiling_config, generator
-            )
-            decoded_audio = vae_decode_audio(
-                audio_state.latent, self.stage_1_model_ledger.audio_decoder(), self.stage_1_model_ledger.vocoder()
-            )
-            del video_encoder
-            cleanup_memory()
+            decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
+            decoded_audio = self.audio_decoder(audio_state.latent)
             return decoded_video, decoded_audio
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
-        upscaled_video_latent = upsample_video(
-            latent=video_state.latent[:1],
-            video_encoder=video_encoder,
-            upsampler=self.stage_2_model_ledger.spatial_upsampler(),
-        )
+        upscaled_video_latent = self.upsampler(video_state.latent[:1])
 
-        torch.cuda.synchronize()
-        cleanup_memory()
-
-        transformer = self.stage_2_model_ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
-
-        def second_stage_denoising_loop(
-            sigmas: torch.Tensor, video_state: LatentState, audio_state: LatentState, stepper: DiffusionStepProtocol
-        ) -> tuple[LatentState, LatentState]:
-            return euler_denoising_loop(
-                sigmas=sigmas,
-                video_state=video_state,
-                audio_state=audio_state,
-                stepper=stepper,
-                denoise_fn=simple_denoising_func(
-                    video_context=video_context,
-                    audio_context=audio_context,
-                    transformer=transformer,  # noqa: F821
-                ),
-            )
-
         stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
-        stage_2_conditionings = combined_image_conditionings(
-            images=images,
-            height=stage_2_output_shape.height,
-            width=stage_2_output_shape.width,
-            video_encoder=video_encoder,
-            dtype=self.dtype,
-            device=self.device,
+        stage_2_conditionings = self.image_conditioner(
+            lambda enc: combined_image_conditionings(
+                images=images,
+                height=stage_2_output_shape.height,
+                width=stage_2_output_shape.width,
+                video_encoder=enc,
+                dtype=self.dtype,
+                device=self.device,
+            )
         )
 
-        video_state, audio_state = denoise_audio_video(
-            output_shape=stage_2_output_shape,
-            conditionings=stage_2_conditionings,
-            noiser=noiser,
+        video_state, audio_state = self.stage_2(
+            denoiser=SimpleDenoiser(video_context, audio_context),
             sigmas=distilled_sigmas,
-            stepper=stepper,
-            denoising_loop_fn=second_stage_denoising_loop,
-            components=self.pipeline_components,
-            dtype=dtype,
-            device=self.device,
-            noise_scale=distilled_sigmas[0],
-            initial_video_latent=upscaled_video_latent,
-            initial_audio_latent=audio_state.latent,
+            noiser=noiser,
+            width=width,
+            height=height,
+            frames=num_frames,
+            fps=frame_rate,
+            video=ModalitySpec(
+                context=video_context,
+                conditionings=stage_2_conditionings,
+                noise_scale=distilled_sigmas[0].item(),
+                initial_latent=upscaled_video_latent,
+            ),
+            audio=ModalitySpec(
+                context=audio_context,
+                noise_scale=distilled_sigmas[0].item(),
+                initial_latent=audio_state.latent,
+            ),
+            streaming_prefetch_count=streaming_prefetch_count,
         )
 
-        torch.cuda.synchronize()
-        del transformer
-        del video_encoder
-        cleanup_memory()
-
-        decoded_video = vae_decode_video(
-            video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config, generator
-        )
-        decoded_audio = vae_decode_audio(
-            audio_state.latent, self.stage_2_model_ledger.audio_decoder(), self.stage_2_model_ledger.vocoder()
-        )
+        decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
+        decoded_audio = self.audio_decoder(audio_state.latent)
         return decoded_video, decoded_audio
 
     def _create_conditionings(
@@ -358,14 +315,8 @@ class ICLoraPipeline:
 
         for video_path, strength in video_conditioning:
             # Load video at scaled-down resolution (if scale > 1)
-            video = load_video_conditioning(
-                video_path=video_path,
-                height=ref_height,
-                width=ref_width,
-                frame_cap=num_frames,
-                dtype=self.dtype,
-                device=self.device,
-            )
+            frame_gen = decode_video_by_frame(path=video_path, frame_cap=num_frames, device=self.device)
+            video = video_preprocess(frame_gen, ref_height, ref_width, self.dtype, self.device)
             encoded_video = video_encoder(video)
             reference_video_shape = VideoLatentShape.from_torch_shape(encoded_video.shape)
 
@@ -509,6 +460,7 @@ def main() -> None:
         gemma_root=args.gemma_root,
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
+        torch_compile=args.compile,
     )
     tiling_config = TilingConfig.default()
     video_chunks_number = get_video_chunks_number(args.num_frames, tiling_config)
@@ -525,6 +477,7 @@ def main() -> None:
         conditioning_attention_strength=conditioning_attention_strength,
         skip_stage_2=args.skip_stage_2,
         conditioning_attention_mask=conditioning_attention_mask,
+        streaming_prefetch_count=args.streaming_prefetch_count,
     )
 
     encode_video(
@@ -553,17 +506,12 @@ def _load_mask_video(
     Returns:
         Tensor of shape ``(1, 1, F, H, W)`` with values in ``[0, 1]``.
     """
-    mask_video = load_video_conditioning(
-        video_path=mask_path,
-        height=height,
-        width=width,
-        frame_cap=num_frames,
-        dtype=torch.bfloat16,
-        device=device,
-    )
+    device = get_device()
+    frame_gen = decode_video_by_frame(path=mask_path, frame_cap=num_frames, device=device)
+    mask_video = video_preprocess(frame_gen, height, width, torch.bfloat16, device)
     # mask_video shape: (1, C, F, H, W) — take mean over channels for grayscale
     mask = mask_video.mean(dim=1, keepdim=True)  # (1, 1, F, H, W)
-    # Normalise to [0, 1] — load_video_conditioning applies normalize_latent,
+    # Normalise to [0, 1] — video_preprocess applies normalize_latent,
     # so undo that: values are in [-1, 1], remap to [0, 1]
     mask = (mask + 1.0) / 2.0
     return mask.clamp(0.0, 1.0)

@@ -7,7 +7,6 @@ This package provides ready-to-use pipelines for video generation:
 - ICLoraPipeline: Image/video conditioning with distilled LoRA
 - KeyframeInterpolationPipeline: Keyframe-based video interpolation
 - RetakePipeline: Regenerate a time region (retake) of an existing video
-- ModelLedger: Central coordinator for loading and building models
 For more detailed components and utilities, import from specific submodules
 like `ltx_pipelines.utils.media_io` or `ltx_pipelines.utils.constants`.
 """

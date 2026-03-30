@@ -767,8 +767,9 @@ class ValidationSampler:
     def _decode_audio(self, audio_state: LatentState, device: torch.device) -> Tensor:
         """Decode audio latents to waveform."""
         self._audio_decoder.to(device)
-        # Ensure latent is bfloat16 to match decoder weights
-        latent = audio_state.latent.to(dtype=torch.bfloat16)
+        first_param = next(self._audio_decoder.parameters(), None)
+        decoder_dtype = first_param.dtype if first_param is not None else audio_state.latent.dtype
+        latent = audio_state.latent.to(dtype=decoder_dtype, device=device)
         decoded_audio = self._audio_decoder(latent)
         self._audio_decoder.to("cpu")
 

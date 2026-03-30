@@ -53,6 +53,21 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
     def lora(self, lora_path: str, strength: float = 1.0, sd_ops: SDOps | None = None) -> "SingleGPUModelBuilder":
         return replace(self, loras=(*self.loras, LoraPathStrengthAndSDOps(lora_path, strength, sd_ops)))
 
+    def with_sd_ops(self, sd_ops: SDOps | None) -> "SingleGPUModelBuilder":
+        return replace(self, model_sd_ops=sd_ops)
+
+    def with_module_ops(self, module_ops: tuple[ModuleOps, ...]) -> "SingleGPUModelBuilder":
+        return replace(self, module_ops=module_ops)
+
+    def with_loras(self, loras: tuple[LoraPathStrengthAndSDOps, ...]) -> "SingleGPUModelBuilder":
+        return replace(self, loras=loras)
+
+    def with_registry(self, registry: Registry) -> "SingleGPUModelBuilder":
+        return replace(self, registry=registry)
+
+    def with_lora_load_device(self, device: torch.device) -> "SingleGPUModelBuilder":
+        return replace(self, lora_load_device=device)
+
     def model_config(self) -> dict:
         first_shard_path = self.model_path[0] if isinstance(self.model_path, tuple) else self.model_path
         return self.model_loader.metadata(first_shard_path)
@@ -83,7 +98,12 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         retval = meta_model.to(device)
         return retval
 
-    def build(self, device: torch.device | None = None, dtype: torch.dtype | None = None) -> ModelType:
+    def build(
+        self,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+        **kwargs: object,  # noqa: ARG002
+    ) -> ModelType:
         device = torch.device("cuda") if device is None else device
         config = self.model_config()
         meta_model = self.meta_model(config, self.module_ops)
