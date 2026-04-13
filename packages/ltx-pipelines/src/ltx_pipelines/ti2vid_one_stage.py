@@ -55,6 +55,7 @@ class TI2VidOneStagePipeline:
     ):
         self.dtype = torch.bfloat16
         self.device = device or get_device()
+        self._scheduler = LTX2Scheduler()
         self.prompt_encoder = PromptEncoder(
             checkpoint_path=checkpoint_path,
             gemma_root=gemma_root,
@@ -107,6 +108,7 @@ class TI2VidOneStagePipeline:
         streaming_prefetch_count: int | None = None,
         tiling_config: TilingConfig | None = None,
         max_batch_size: int = 1,
+        sigmas: torch.Tensor | None = None,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         assert_resolution(height=height, width=width, is_two_stage=False)
 
@@ -135,7 +137,9 @@ class TI2VidOneStagePipeline:
             )
         )
 
-        sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(dtype=torch.float32, device=self.device)
+        sigmas = (sigmas if sigmas is not None else self._scheduler.execute(steps=num_inference_steps)).to(
+            dtype=torch.float32, device=self.device
+        )
 
         video_guider_factory = create_multimodal_guider_factory(
             params=video_guider_params,

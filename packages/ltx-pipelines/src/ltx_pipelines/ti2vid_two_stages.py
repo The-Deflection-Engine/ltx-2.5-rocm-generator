@@ -25,7 +25,7 @@ from ltx_pipelines.utils.blocks import (
     VideoUpsampler,
 )
 from ltx_pipelines.utils.constants import (
-    STAGE_2_DISTILLED_SIGMA_VALUES,
+    STAGE_2_DISTILLED_SIGMAS,
     detect_params,
 )
 from ltx_pipelines.utils.denoisers import FactoryGuidedDenoiser, SimpleDenoiser
@@ -61,6 +61,7 @@ class TI2VidTwoStagesPipeline:
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
+        self._scheduler = LTX2Scheduler()
 
         self.prompt_encoder = PromptEncoder(checkpoint_path, gemma_root, self.dtype, self.device, registry=registry)
         self.image_conditioner = ImageConditioner(checkpoint_path, self.dtype, self.device, registry=registry)
@@ -106,6 +107,8 @@ class TI2VidTwoStagesPipeline:
         enhance_prompt: bool = False,
         streaming_prefetch_count: int | None = None,
         max_batch_size: int = 1,
+        stage_1_sigmas: torch.Tensor | None = None,
+        stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -142,7 +145,9 @@ class TI2VidTwoStagesPipeline:
             )
         )
 
-        sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(dtype=torch.float32, device=self.device)
+        sigmas = (
+            stage_1_sigmas if stage_1_sigmas is not None else self._scheduler.execute(steps=num_inference_steps)
+        ).to(dtype=torch.float32, device=self.device)
 
         video_state, audio_state = self.stage_1(
             denoiser=FactoryGuidedDenoiser(
@@ -172,7 +177,7 @@ class TI2VidTwoStagesPipeline:
         # Stage 2: Upsample and refine the video at higher resolution with distilled LoRA.
         upscaled_video_latent = self.upsampler(video_state.latent[:1])
 
-        distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
+        stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
         stage_2_conditionings = self.image_conditioner(
             lambda enc: combined_image_conditionings(
                 images=images,
@@ -186,7 +191,7 @@ class TI2VidTwoStagesPipeline:
 
         video_state, audio_state = self.stage_2(
             denoiser=SimpleDenoiser(v_context=v_context_p, a_context=a_context_p),
-            sigmas=distilled_sigmas,
+            sigmas=stage_2_sigmas,
             noiser=noiser,
             width=width,
             height=height,
@@ -195,12 +200,12 @@ class TI2VidTwoStagesPipeline:
             video=ModalitySpec(
                 context=v_context_p,
                 conditionings=stage_2_conditionings,
-                noise_scale=distilled_sigmas[0].item(),
+                noise_scale=stage_2_sigmas[0].item(),
                 initial_latent=upscaled_video_latent,
             ),
             audio=ModalitySpec(
                 context=a_context_p,
-                noise_scale=distilled_sigmas[0].item(),
+                noise_scale=stage_2_sigmas[0].item(),
                 initial_latent=audio_state.latent,
             ),
             streaming_prefetch_count=streaming_prefetch_count,

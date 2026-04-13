@@ -2063,7 +2063,7 @@ wheels = [
 
 [[package]]
 name = "ltx-core"
-version = "1.1.0"
+version = "1.1.1"
 source = { editable = "packages/ltx-core" }
 dependencies = [
     { name = "accelerate" },
@@ -2121,7 +2121,7 @@ dev = [{ name = "scikit-image", specifier = ">=0.25.2" }]
 
 [[package]]
 name = "ltx-pipelines"
-version = "1.1.0"
+version = "1.1.1"
 source = { editable = "packages/ltx-pipelines" }
 dependencies = [
     { name = "av" },
@@ -2141,7 +2141,7 @@ requires-dist = [
 
 [[package]]
 name = "ltx-trainer"
-version = "1.1.0"
+version = "1.1.1"
 source = { editable = "packages/ltx-trainer" }
 dependencies = [
     { name = "accelerate" },

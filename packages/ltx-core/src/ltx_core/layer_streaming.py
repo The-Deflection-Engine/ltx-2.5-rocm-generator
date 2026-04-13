@@ -44,32 +44,26 @@ def _resolve_attr(module: nn.Module, dotted_path: str) -> nn.ModuleList:
 
 
 class _LayerStore:
-    """Manages on-demand pinning of layer parameters for GPU streaming.
-    Stores references to each layer's source data (which may be file-backed
-    mmap views or in-memory tensors).  When a layer needs to be transferred
-    to GPU, its source data is pinned on demand and copied; on eviction the
-    pinned copy is freed and the source data is restored.
+    """Manages CPU-pinned copies of layer parameters/buffers.
+    Tracks which layers currently reside on GPU so the prefetcher and evictor
+    can make correct decisions.
     """
 
     def __init__(self, layers: nn.ModuleList, target_device: torch.device) -> None:
         self.target_device = target_device
         self.num_layers = len(layers)
+
+        # CPU-pinned copies keyed by (layer_idx, param_name)
+        self._pinned: list[dict[str, torch.Tensor]] = []
         self._on_gpu: set[int] = set()
 
-        # Keep a reference to the source data for each layer so we can pin it
-        # on demand and restore it after eviction.
-        self._source_data: list[dict[str, torch.Tensor]] = []
         for layer in layers:
-            source: dict[str, torch.Tensor] = {}
+            pinned: dict[str, torch.Tensor] = {}
             for name, tensor in itertools.chain(layer.named_parameters(), layer.named_buffers()):
-                source[name] = tensor.data
-            self._source_data.append(source)
-
-        # Hold pinned tensors alive until the H2D transfer completes.
-        # Without this, the CachingHostAllocator can reclaim a pinned tensor
-        # as soon as its Python reference is dropped, even if an async H2D
-        # transfer is still reading from it.
-        self._pinned_in_flight: dict[int, list[torch.Tensor]] = {}
+                pinned_tensor = tensor.data.pin_memory()
+                tensor.data = pinned_tensor
+                pinned[name] = pinned_tensor
+            self._pinned.append(pinned)
 
     def _check_idx(self, idx: int) -> None:
         if idx < 0 or idx >= self.num_layers:
@@ -79,45 +73,34 @@ class _LayerStore:
         return idx in self._on_gpu
 
     def move_to_gpu(self, idx: int, layer: nn.Module, *, non_blocking: bool = False) -> None:
-        """Pin layer *idx* on demand, then transfer to GPU."""
+        """Move layer *idx* parameters from pinned CPU to *target_device*."""
         self._check_idx(idx)
         if idx in self._on_gpu:
             return
-        source = self._source_data[idx]
-        pinned_refs: list[torch.Tensor] = []
+        pinned = self._pinned[idx]
         for name, param in itertools.chain(layer.named_parameters(), layer.named_buffers()):
-            pinned = source[name].pin_memory()
-            param.data = pinned.to(self.target_device, non_blocking=non_blocking)
-            pinned_refs.append(pinned)
-        # Keep pinned tensors alive until eviction — the async H2D transfer
-        # may still be reading from them.
-        self._pinned_in_flight[idx] = pinned_refs
+            param.data = pinned[name].to(self.target_device, non_blocking=non_blocking)
         self._on_gpu.add(idx)
 
     def evict_to_cpu(self, idx: int, layer: nn.Module) -> None:
-        """Restore source data, freeing the GPU and pinned copies."""
+        """Swap layer *idx* parameters back to their pinned CPU copies."""
         self._check_idx(idx)
         if idx not in self._on_gpu:
             return
-        source = self._source_data[idx]
+        pinned = self._pinned[idx]
         for name, param in itertools.chain(layer.named_parameters(), layer.named_buffers()):
-            param.data = source[name]
-        # Release pinned tensors — the H2D transfer is complete by now
-        # (the compute stream waited on the prefetch event before using
-        # the layer, and we only evict after compute finishes).
-        self._pinned_in_flight.pop(idx, None)
+            param.data = pinned[name]
         self._on_gpu.discard(idx)
 
     def cleanup(self) -> None:
-        """Release all source data and in-flight pinned references.
-        After this call, the source tensors can be garbage-collected once
+        """Release all pinned memory references.
+        After this call, the pinned tensors can be garbage-collected once
         the layer parameters (which still reference them via ``.data``) are
         also released (e.g. via ``.to("meta")``).
         """
-        for source_dict in self._source_data:
-            source_dict.clear()
-        self._source_data.clear()
-        self._pinned_in_flight.clear()
+        for pinned_dict in self._pinned:
+            pinned_dict.clear()
+        self._pinned.clear()
 
 
 class _AsyncPrefetcher:
@@ -228,8 +211,6 @@ class LayerStreamingWrapper(nn.Module):
         idx_map: dict[int, int] = {id(layer): idx for idx, layer in enumerate(self._layers)}
         num_layers = len(self._layers)
 
-        compute_stream = torch.cuda.current_stream(self._target_device)
-
         def _pre_hook(
             module: nn.Module,
             _args: Any,  # noqa: ANN401
@@ -246,6 +227,7 @@ class LayerStreamingWrapper(nn.Module):
             # caching allocator would allow the prefetch stream to reuse their
             # memory immediately after eviction — even if the compute kernel
             # that reads them hasn't finished yet.
+            compute_stream = torch.cuda.current_stream(self._target_device)
             for param in itertools.chain(module.parameters(), module.buffers()):
                 param.data.record_stream(compute_stream)
 
@@ -270,12 +252,12 @@ class LayerStreamingWrapper(nn.Module):
             self._hooks.extend([h1, h2])
 
     def teardown(self) -> None:
-        """Remove hooks, release resources, and move parameters back to CPU.
+        """Remove hooks, release pinned memory, and move parameters back to CPU.
         After this call the wrapper is inert: hooks are removed, the prefetch
-        stream is drained and destroyed, all parameters reside on CPU, and the
-        ``_LayerStore`` source data references are cleared.  Callers should
-        still follow up with ``.to("meta")`` to release the CPU copies if the
-        model is no longer needed.
+        stream is drained and destroyed, all parameters reside on regular
+        (non-pinned) CPU memory, and the ``_LayerStore`` pinned-tensor cache is
+        cleared.  Callers should still follow up with ``.to("meta")`` to release
+        the CPU copies if the model is no longer needed.
         """
         for h in self._hooks:
             h.remove()
@@ -298,10 +280,10 @@ class LayerStreamingWrapper(nn.Module):
         for b in self._model.buffers():
             b.data = b.data.to("cpu")
 
-        # Release source data references.  After evict_to_cpu() the layer
-        # params point to the source data.  The caller is expected to follow
-        # up with .to("meta") to drop the param refs; cleanup() drops the
-        # store's refs.
+        # Release pinned memory.  After evict_to_cpu() the layer parameters
+        # still reference the pinned tensors (since .to("cpu") on a pinned
+        # tensor is a no-op).  The caller is expected to follow up with
+        # .to("meta") to drop the param refs; cleanup() drops the store's refs.
         self._store.cleanup()
 
     # ------------------------------------------------------------------

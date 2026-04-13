@@ -23,7 +23,7 @@ from ltx_pipelines.utils.blocks import (
 )
 from ltx_pipelines.utils.constants import (
     LTX_2_3_HQ_PARAMS,
-    STAGE_2_DISTILLED_SIGMA_VALUES,
+    STAGE_2_DISTILLED_SIGMAS,
 )
 from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
@@ -64,6 +64,7 @@ class TI2VidTwoStagesHQPipeline:
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
+        self._scheduler = LTX2Scheduler()
 
         distilled_lora_stage_1 = LoraPathStrengthAndSDOps(
             path=distilled_lora[0].path,
@@ -121,6 +122,8 @@ class TI2VidTwoStagesHQPipeline:
         enhance_prompt: bool = False,
         streaming_prefetch_count: int | None = None,
         max_batch_size: int = 1,
+        stage_1_sigmas: torch.Tensor | None = None,
+        stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -157,13 +160,12 @@ class TI2VidTwoStagesHQPipeline:
             )
         )
 
-        empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_output_shape).to_torch_shape())
         stepper = Res2sDiffusionStep()
-        sigmas = (
-            LTX2Scheduler()
-            .execute(latent=empty_latent, steps=num_inference_steps)
-            .to(dtype=torch.float32, device=self.device)
-        )
+
+        if stage_1_sigmas is None:
+            empty_latent = torch.empty(VideoLatentShape.from_pixel_shape(stage_1_output_shape).to_torch_shape())
+            stage_1_sigmas = self._scheduler.execute(latent=empty_latent, steps=num_inference_steps)
+        sigmas = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
 
         video_state, audio_state = self.stage_1(
             denoiser=GuidedDenoiser(
@@ -195,7 +197,7 @@ class TI2VidTwoStagesHQPipeline:
         # Stage 2: Upsample and refine the video at higher resolution with distilled LoRA.
         upscaled_video_latent = self.upsampler(video_state.latent[:1])
 
-        distilled_sigmas = torch.tensor(STAGE_2_DISTILLED_SIGMA_VALUES, device=self.device)
+        stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
         stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
         stage_2_conditionings = self.image_conditioner(
             lambda enc: combined_image_conditionings(
@@ -210,7 +212,7 @@ class TI2VidTwoStagesHQPipeline:
 
         video_state, audio_state = self.stage_2(
             denoiser=SimpleDenoiser(v_context=v_context_p, a_context=a_context_p),
-            sigmas=distilled_sigmas,
+            sigmas=stage_2_sigmas,
             noiser=noiser,
             stepper=stepper,
             width=width,
@@ -220,12 +222,12 @@ class TI2VidTwoStagesHQPipeline:
             video=ModalitySpec(
                 context=v_context_p,
                 conditionings=stage_2_conditionings,
-                noise_scale=distilled_sigmas[0].item(),
+                noise_scale=stage_2_sigmas[0].item(),
                 initial_latent=upscaled_video_latent,
             ),
             audio=ModalitySpec(
                 context=a_context_p,
-                noise_scale=distilled_sigmas[0].item(),
+                noise_scale=stage_2_sigmas[0].item(),
                 initial_latent=audio_state.latent,
             ),
             loop=res2s_audio_video_denoising_loop,
