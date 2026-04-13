@@ -25,7 +25,7 @@ from ltx_pipelines.utils.blocks import (
     PromptEncoder,
     VideoDecoder,
 )
-from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, detect_params
+from ltx_pipelines.utils.constants import DISTILLED_SIGMAS, detect_params
 from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
     audio_latent_from_file,
@@ -78,6 +78,8 @@ class RetakePipeline:
         self.device = device or get_device()
         self.dtype = torch.bfloat16
         self.distilled = distilled
+        if not distilled:
+            self._scheduler = LTX2Scheduler()
         self.prompt_encoder = PromptEncoder(
             checkpoint_path=checkpoint_path,
             gemma_root=gemma_root,
@@ -141,6 +143,7 @@ class RetakePipeline:
         tiling_config: TilingConfig | None = None,
         streaming_prefetch_count: int | None = None,
         max_batch_size: int = 1,
+        sigmas: torch.Tensor | None = None,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         """Regenerate ``[start_time, end_time]`` of the source video (retake).
         Parameters
@@ -227,15 +230,18 @@ class RetakePipeline:
             initial_latent=initial_audio_latent,
             frozen=initial_audio_latent is not None and not regenerate_audio,
         )
-        # Build denoiser
+
+        # Build denoiser and resolve sigma schedule.
+        if sigmas is None:
+            sigmas = DISTILLED_SIGMAS if self.distilled else self._scheduler.execute(steps=num_inference_steps)
+        sigmas = sigmas.to(dtype=torch.float32, device=self.device)
+
         if self.distilled:
-            sigmas = torch.tensor(DISTILLED_SIGMA_VALUES).to(dtype=torch.float32, device=self.device)
             denoiser = SimpleDenoiser(
                 v_context=v_context_p,
                 a_context=a_context_p,
             )
         else:
-            sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(dtype=torch.float32, device=self.device)
             v_context_n, a_context_n = contexts[1].video_encoding, contexts[1].audio_encoding
             video_guider = MultiModalGuider(
                 params=video_guider_params,

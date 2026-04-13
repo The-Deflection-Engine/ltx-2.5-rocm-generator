@@ -32,8 +32,8 @@ from ltx_pipelines.utils.blocks import (
     VideoUpsampler,
 )
 from ltx_pipelines.utils.constants import (
-    DISTILLED_SIGMA_VALUES,
-    STAGE_2_DISTILLED_SIGMA_VALUES,
+    DISTILLED_SIGMAS,
+    STAGE_2_DISTILLED_SIGMAS,
     detect_params,
 )
 from ltx_pipelines.utils.denoisers import SimpleDenoiser
@@ -126,6 +126,8 @@ class ICLoraPipeline:
         skip_stage_2: bool = False,
         conditioning_attention_mask: torch.Tensor | None = None,
         streaming_prefetch_count: int | None = None,
+        stage_1_sigmas: torch.Tensor = DISTILLED_SIGMAS,
+        stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         """
         Generate video with IC-LoRA conditioning.
@@ -200,7 +202,7 @@ class ICLoraPipeline:
             )
         )
 
-        stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
+        stage_1_sigmas = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
 
         video_state, audio_state = self.stage_1(
             denoiser=SimpleDenoiser(video_context, audio_context),
@@ -230,7 +232,7 @@ class ICLoraPipeline:
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
         upscaled_video_latent = self.upsampler(video_state.latent[:1])
 
-        distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
+        stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
         stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
         stage_2_conditionings = self.image_conditioner(
             lambda enc: combined_image_conditionings(
@@ -245,7 +247,7 @@ class ICLoraPipeline:
 
         video_state, audio_state = self.stage_2(
             denoiser=SimpleDenoiser(video_context, audio_context),
-            sigmas=distilled_sigmas,
+            sigmas=stage_2_sigmas,
             noiser=noiser,
             width=width,
             height=height,
@@ -254,12 +256,12 @@ class ICLoraPipeline:
             video=ModalitySpec(
                 context=video_context,
                 conditionings=stage_2_conditionings,
-                noise_scale=distilled_sigmas[0].item(),
+                noise_scale=stage_2_sigmas[0].item(),
                 initial_latent=upscaled_video_latent,
             ),
             audio=ModalitySpec(
                 context=audio_context,
-                noise_scale=distilled_sigmas[0].item(),
+                noise_scale=stage_2_sigmas[0].item(),
                 initial_latent=audio_state.latent,
             ),
             streaming_prefetch_count=streaming_prefetch_count,

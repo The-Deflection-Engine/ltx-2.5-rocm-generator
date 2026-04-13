@@ -23,8 +23,8 @@ from ltx_pipelines.utils.blocks import (
     VideoUpsampler,
 )
 from ltx_pipelines.utils.constants import (
-    DISTILLED_SIGMA_VALUES,
-    STAGE_2_DISTILLED_SIGMA_VALUES,
+    DISTILLED_SIGMAS,
+    STAGE_2_DISTILLED_SIGMAS,
     detect_params,
 )
 from ltx_pipelines.utils.denoisers import SimpleDenoiser
@@ -77,7 +77,7 @@ class DistilledPipeline:
         self.video_decoder = VideoDecoder(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
         self.audio_decoder = AudioDecoder(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
 
-    def __call__(
+    def __call__(  # noqa: PLR0913
         self,
         prompt: str,
         seed: int,
@@ -89,6 +89,8 @@ class DistilledPipeline:
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
         streaming_prefetch_count: int | None = None,
+        stage_1_sigmas: torch.Tensor = DISTILLED_SIGMAS,
+        stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -105,7 +107,7 @@ class DistilledPipeline:
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
 
         # Stage 1: Initial low resolution video generation.
-        stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
+        stage_1_sigmas = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
         stage_1_w, stage_1_h = width // 2, height // 2
         stage_1_conditionings = self.image_conditioner(
             lambda enc: combined_image_conditionings(
@@ -134,7 +136,7 @@ class DistilledPipeline:
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
         upscaled_video_latent = self.upsampler(video_state.latent[:1])
 
-        stage_2_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
+        stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
         stage_2_conditionings = self.image_conditioner(
             lambda enc: combined_image_conditionings(
                 images=images,
