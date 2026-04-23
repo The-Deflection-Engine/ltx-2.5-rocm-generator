@@ -56,7 +56,7 @@ Inference pipelines for LTX-2 audio-video generation. Depends on `ltx-core` for 
 ### Memory management
 
 - **Model lifecycle**: All blocks build their model on call and free it on exit. `gpu_model()` moves params to `"meta"` device on exit, immediately releasing storage. No model persists between calls.
-- **Layer streaming**: When `streaming_prefetch_count` is set, `DiffusionStage` wraps the transformer in `LayerStreamingWrapper`. Layers live on pinned CPU memory; only `1 + prefetch_count` layers are on GPU at a time, with async H2D prefetch on a separate CUDA stream.
+- **Block streaming**: When offloading is enabled, `DiffusionStage` wraps the transformer in `BlockStreamingWrapper`. Blocks live on pinned CPU memory; only 2 blocks are buffered on GPU at a time (one for compute, one for async H2D copy on a separate CUDA stream).
 - **Batch splitting**: `BatchSplitAdapter` wraps the transformer and splits inputs exceeding `max_batch_size` into sequential chunks. If guidance needs B=4 but `max_batch_size=1`, it runs 4 sequential B=1 passes. Higher `max_batch_size` reduces layer-streaming PCIe transfers at the cost of peak memory.
 
 ## Denoisers (`utils/denoisers.py`)
