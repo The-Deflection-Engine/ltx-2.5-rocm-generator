@@ -102,7 +102,7 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
     registry: Registry = field(default_factory=DummyRegistry)
     lora_load_device: torch.device = field(default_factory=lambda: torch.device("cpu"))
 
-    def lora(self, lora_path: str, strength: float = 1.0, sd_ops: SDOps | None = None) -> "SingleGPUModelBuilder":
+    def lora(self, lora_path: str, strength: float, sd_ops: SDOps) -> "SingleGPUModelBuilder":
         return replace(self, loras=(*self.loras, LoraPathStrengthAndSDOps(lora_path, strength, sd_ops)))
 
     def with_sd_ops(self, sd_ops: SDOps | None) -> "SingleGPUModelBuilder":

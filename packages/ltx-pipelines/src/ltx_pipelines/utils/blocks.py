@@ -21,7 +21,8 @@ from ltx_core.components.noisers import Noiser
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.loader import SDOps
-from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
+from ltx_core.loader.module_ops import ModuleOps
+from ltx_core.loader.primitives import BuilderProtocol, LoraPathStrengthAndSDOps, ModelBuilderProtocol
 from ltx_core.loader.registry import DummyRegistry, Registry
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
 from ltx_core.model.audio_vae import (
@@ -37,12 +38,14 @@ from ltx_core.model.audio_vae import (
 )
 from ltx_core.model.transformer import (
     LTXV_MODEL_COMFY_RENAMING_MAP,
+    LTXModel,
     LTXModelConfigurator,
     X0Model,
 )
 from ltx_core.model.transformer.compiling import COMPILE_TRANSFORMER, modify_sd_ops_for_compilation
 from ltx_core.model.upsampler import LatentUpsamplerConfigurator, upsample_video
 from ltx_core.model.video_vae import (
+    MEMORY_EFFICIENT_DECODE,
     VAE_DECODER_COMFY_KEYS_FILTER,
     VAE_ENCODER_COMFY_KEYS_FILTER,
     TilingConfig,
@@ -59,10 +62,11 @@ from ltx_core.text_encoders.gemma import (
     GemmaTextEncoderConfigurator,
     module_ops_from_gemma_root,
 )
-from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessorOutput
+from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor, EmbeddingsProcessorOutput
 from ltx_core.tools import AudioLatentTools, LatentTools, VideoLatentTools
 from ltx_core.types import Audio, AudioLatentShape, LatentState, VideoLatentShape, VideoPixelShape
 from ltx_core.utils import find_matching_file
+from ltx_pipelines.multigpu.delegating_builder import DelegatingBuilder
 from ltx_pipelines.utils.gpu_model import gpu_model
 from ltx_pipelines.utils.helpers import (
     cleanup_memory,
@@ -81,6 +85,20 @@ _M = TypeVar("_M", bound=torch.nn.Module)
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _chain_quantization(
+    sd_ops: SDOps,
+    module_ops: tuple[ModuleOps, ...],
+    quantization: QuantizationPolicy,
+) -> tuple[SDOps, tuple[ModuleOps, ...]]:
+    chained_sd_ops = sd_ops
+    if quantization.sd_ops is not None:
+        chained_sd_ops = SDOps(
+            name=f"sd_ops_chain_{sd_ops.name}+{quantization.sd_ops.name}",
+            mapping=(*sd_ops.mapping, *quantization.sd_ops.mapping),
+        )
+    return chained_sd_ops, (*module_ops, *quantization.module_ops)
 
 
 @contextmanager
@@ -154,16 +172,43 @@ class DiffusionStage:
         registry: Registry | None = None,
         torch_compile: bool = False,
         offload_mode: OffloadMode = OffloadMode.NONE,
+        transformer_builder: ModelBuilderProtocol[LTXModel] | DelegatingBuilder[LTXModel] | None = None,
     ) -> None:
+        self._dtype = dtype
+        self._device = device
+        self._quantization = quantization
+        self._torch_compile = torch_compile
+        self._offload_mode = offload_mode
+        if transformer_builder is not None:
+            self._transformer_builder = transformer_builder
+        else:
+            self._transformer_builder = Builder(
+                model_path=checkpoint_path,
+                model_class_configurator=LTXModelConfigurator,
+                model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
+                loras=tuple(loras),
+                registry=registry or DummyRegistry(),
+            )
+
         if offload_mode != OffloadMode.NONE:
             if torch_compile:
                 raise ValueError("torch.compile is not supported with layer streaming")
+            streaming_sd_ops: SDOps = LTXV_MODEL_COMFY_RENAMING_MAP
+            streaming_module_ops: tuple[ModuleOps, ...] = ()
             if quantization is not None:
-                raise ValueError("quantization is not supported with layer streaming")
+                if quantization.kind != QuantizationPolicy.Kind.FP8_CAST:
+                    raise ValueError(
+                        f"Layer streaming supports only QuantizationPolicy.fp8_cast(); "
+                        f"got kind={quantization.kind!r} which produces heterogeneous block layouts."
+                    )
+                streaming_sd_ops, streaming_module_ops = _chain_quantization(
+                    streaming_sd_ops, streaming_module_ops, quantization
+                )
             self._streaming_builder = StreamingModelBuilder(
                 model_class_configurator=LTXModelConfigurator,
                 model_path=checkpoint_path,
-                model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
+                model_sd_ops=streaming_sd_ops,
+                module_ops=streaming_module_ops,
                 loras=tuple(loras),
                 registry=registry or DummyRegistry(),
                 blocks_attr="velocity_model.transformer_blocks",
@@ -171,19 +216,6 @@ class DiffusionStage:
                 state_dict_prefix="velocity_model.",
                 model_wrapper=lambda m: X0Model(m).eval(),
             )
-
-        self._dtype = dtype
-        self._device = device
-        self._quantization = quantization
-        self._torch_compile = torch_compile
-        self._offload_mode = offload_mode
-        self._transformer_builder = Builder(
-            model_path=checkpoint_path,
-            model_class_configurator=LTXModelConfigurator,
-            model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
-            loras=tuple(loras),
-            registry=registry or DummyRegistry(),
-        )
 
     def _build_transformer(self, *, device: torch.device | None = None, **kwargs: object) -> X0Model:
         target = device or self._device
@@ -198,18 +230,12 @@ class DiffusionStage:
                 LoraPathStrengthAndSDOps(
                     lora.path,
                     lora.strength,
-                    modify_sd_ops_for_compilation(
-                        lora.sd_ops if lora.sd_ops is not None else SDOps(name="identity"), number_of_layers
-                    ),
+                    modify_sd_ops_for_compilation(lora.sd_ops, number_of_layers),
                 )
                 for lora in loras
             )
         if self._quantization is not None:
-            module_ops = (*module_ops, *self._quantization.module_ops)
-            sd_ops = SDOps(
-                name=f"sd_ops_chain_{sd_ops.name}+{self._quantization.sd_ops.name}",
-                mapping=(*sd_ops.mapping, *self._quantization.sd_ops.mapping),
-            )
+            sd_ops, module_ops = _chain_quantization(sd_ops, module_ops, self._quantization)
 
         builder = self._transformer_builder.with_module_ops(module_ops).with_sd_ops(sd_ops).with_loras(loras)
         return X0Model(builder.build(device=target, **kwargs)).to(target).eval()
@@ -359,31 +385,40 @@ class PromptEncoder:
         device: torch.device,
         registry: Registry | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
+        text_encoder_builder: BuilderProtocol | None = None,
     ) -> None:
         self._dtype = dtype
         self._device = device
         self._offload_mode = offload_mode
 
-        module_ops = module_ops_from_gemma_root(gemma_root)
-        model_folder = find_matching_file(gemma_root, "model*.safetensors").parent
-        weight_paths = [str(p) for p in model_folder.rglob("*.safetensors")]
-
-        self._text_encoder_builder = Builder(
-            model_path=tuple(weight_paths),
-            model_class_configurator=GemmaTextEncoderConfigurator,
-            model_sd_ops=GEMMA_LLM_KEY_OPS,
-            module_ops=(GEMMA_MODEL_OPS, *module_ops),
-            registry=registry or DummyRegistry(),
-        )
-        self._streaming_text_encoder_builder = StreamingModelBuilder(
-            model_path=tuple(weight_paths),
-            model_class_configurator=GemmaTextEncoderConfigurator,
-            model_sd_ops=GEMMA_LLM_KEY_OPS,
-            module_ops=(GEMMA_MODEL_OPS, *module_ops),
-            registry=registry or DummyRegistry(),
-            blocks_attr="model.model.language_model.layers",
-            blocks_prefix="model.model.language_model.layers",
-        )
+        if text_encoder_builder is not None:
+            if offload_mode != OffloadMode.NONE:
+                raise ValueError(
+                    "text_encoder_builder cannot be used with offload_mode != OffloadMode.NONE "
+                    "because no streaming text encoder builder is available."
+                )
+            self._text_encoder_builder = text_encoder_builder
+            self._streaming_text_encoder_builder = None
+        else:
+            module_ops = module_ops_from_gemma_root(gemma_root)
+            model_folder = find_matching_file(gemma_root, "model*.safetensors").parent
+            weight_paths = [str(p) for p in model_folder.rglob("*.safetensors")]
+            self._text_encoder_builder = Builder(
+                model_path=tuple(weight_paths),
+                model_class_configurator=GemmaTextEncoderConfigurator,
+                model_sd_ops=GEMMA_LLM_KEY_OPS,
+                module_ops=(GEMMA_MODEL_OPS, *module_ops),
+                registry=registry or DummyRegistry(),
+            )
+            self._streaming_text_encoder_builder = StreamingModelBuilder(
+                model_path=tuple(weight_paths),
+                model_class_configurator=GemmaTextEncoderConfigurator,
+                model_sd_ops=GEMMA_LLM_KEY_OPS,
+                module_ops=(GEMMA_MODEL_OPS, *module_ops),
+                registry=registry or DummyRegistry(),
+                blocks_attr="model.model.language_model.layers",
+                blocks_prefix="model.model.language_model.layers",
+            )
         self._embeddings_processor_builder = Builder(
             model_path=checkpoint_path,
             model_class_configurator=EmbeddingsProcessorConfigurator,
@@ -391,10 +426,18 @@ class PromptEncoder:
             registry=registry or DummyRegistry(),
         )
 
+    def _build_text_encoder(self) -> torch.nn.Module:
+        """Build the Gemma text encoder (non-streaming path)."""
+        return self._text_encoder_builder.build(device=self._device, dtype=self._dtype).eval()
+
+    def _build_embeddings_processor(self) -> EmbeddingsProcessor:
+        """Build the embeddings processor on the target device."""
+        return self._embeddings_processor_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
+
     def _text_encoder_ctx(self) -> AbstractContextManager:
         if self._offload_mode != OffloadMode.NONE:
             return _streaming_model(self._streaming_text_encoder_builder, self._offload_mode, self._device, self._dtype)
-        return gpu_model(self._text_encoder_builder.build(device=self._device, dtype=self._dtype).eval())
+        return gpu_model(self._build_text_encoder())
 
     def __call__(
         self,
@@ -413,9 +456,7 @@ class PromptEncoder:
                 )
             raw_outputs = [text_encoder.encode(p) for p in prompts]
 
-        with gpu_model(
-            self._embeddings_processor_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
-        ) as embeddings_processor:
+        with gpu_model(self._build_embeddings_processor()) as embeddings_processor:
             return [embeddings_processor.process_hidden_states(hs, mask) for hs, mask in raw_outputs]
 
 
@@ -513,32 +554,31 @@ class VideoDecoder:
         dtype: torch.dtype,
         device: torch.device,
         registry: Registry | None = None,
+        memory_efficient: bool = True,
+        decoder_builder: BuilderProtocol | None = None,
     ) -> None:
         self._dtype = dtype
         self._device = device
-        self._decoder_builder = Builder(
-            model_path=checkpoint_path,
-            model_class_configurator=VideoDecoderConfigurator,
-            model_sd_ops=VAE_DECODER_COMFY_KEYS_FILTER,
-            registry=registry or DummyRegistry(),
-        )
+        if decoder_builder is not None:
+            self._decoder_builder = decoder_builder
+        else:
+            self._decoder_builder = Builder(
+                model_path=checkpoint_path,
+                model_class_configurator=VideoDecoderConfigurator,
+                model_sd_ops=VAE_DECODER_COMFY_KEYS_FILTER,
+                registry=registry or DummyRegistry(),
+                module_ops=(MEMORY_EFFICIENT_DECODE,) if memory_efficient else (),
+            )
 
     def __call__(
         self,
         latent: torch.Tensor,
         tiling_config: TilingConfig | None = None,
         generator: torch.Generator | None = None,
-        *,
-        output_dtype: torch.dtype = torch.uint8,
     ) -> Iterator[torch.Tensor]:
-        """Decode *latent* to pixel-space video chunks. Decoder freed after exhaustion.
-        Args:
-            output_dtype: Target dtype for output tensors.  ``torch.uint8``
-                (default) maps to ``[0, 255]``.  Any floating dtype returns
-                ``[0, 1]`` cast to that dtype.
-        """
+        """Decode *latent* to pixel-space video chunks. Decoder freed after exhaustion."""
         decoder = self._decoder_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
-        return _cleanup_iter(decoder.decode_video(latent, tiling_config, generator, output_dtype=output_dtype), decoder)
+        return _cleanup_iter(decoder.decode_video(latent, tiling_config, generator), decoder)
 
 
 # ---------------------------------------------------------------------------

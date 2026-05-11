@@ -64,6 +64,7 @@ Available pipeline modules:
 - `ltx_pipelines.a2vid_two_stage` - Audio-to-video generation conditioned on an input audio.
 - `ltx_pipelines.retake` - Regenerate a time region of an existing video.
 - `ltx_pipelines.hdr_ic_lora` - Video-to-video with HDR output (linear float via LogC3 inverse decode).
+- `ltx_pipelines.lipdub` - Lip dubbing / re-voicing with IC-LoRA and audio reference conditioning.
 
 Use `--help` with any pipeline module to see all available options and parameters.
 
@@ -113,6 +114,7 @@ Do you need to condition on existing images/videos?
 | **A2VidPipelineTwoStage** | 2 | ✅ | ✅ | Audio + Image | Audio-driven video generation |
 | **RetakePipeline** | 1 | ✅ | ❌ | Source Video | Regenerating a time region of a video |
 | **HDRICLoraPipeline** | 2 | ❌ | ✅ | Video | HDR video-to-video (linear float output for EXR) |
+| **LipDubPipeline** | 2 | ✅ | ✅ | Video + Audio | Lip dubbing with audio ref conditioning |
 
 ---
 
@@ -235,6 +237,20 @@ Two-stage video-to-video on the distilled model with an HDR IC-LoRA. Decoded lat
 **Extra CLI arguments:** `--input` (mp4 or directory, required), `--output-dir` (required), `--hdr-lora` (required), `--text-embeddings` (pre-computed `.safetensors`, required), `--num-frames`, `--spatial-tile` (tiled VAE decode tile size; reduce on lower-VRAM GPUs), `--skip-mp4` (EXR only, no H.264 preview), `--exr-half` (float16 EXR), `--high-quality` (generates 2x frames internally for smoother output, ~2x slower), `--offload {none,cpu,disk}` (weight offloading; disables FP8 quantization when not `none`).
 
 **Use when:** You need linear HDR float output for EXR export, color grading, or custom tonemapping workflows.
+
+---
+
+### 10. LipDubPipeline
+
+**Best for:** Lip dubbing, rephrasing while keeping the same speaker identity and matching lip movements to new audio.
+
+**Source**: [`src/ltx_pipelines/lipdub.py`](src/ltx_pipelines/lipdub.py)
+
+Uses IC-LoRA on a **distilled** checkpoint with a **single** lip-dub IC-LoRA applied in **both** stages. The reference clip provides video and audio reference tokens whose VAE latents are appended to the target audio sequence as frozen reference tokens. The frame count and frame rate are derived from the reference video (frame count is silently snapped to the nearest `8k+1`), so the CLI does not accept `--num-frames` or `--frame-rate`. Required: `--reference-video`. Optional: `--reference-strength`. LoRA: [`Lightricks/LTX-2.3-22b-IC-LoRA-LipDub`](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-LipDub).
+
+**Note:** Requires a distilled model checkpoint and one lip-dub IC-LoRA (`--lora` exactly once).
+
+**Use when:** Dubbing, rephrasing with matched lips and speaker identity.
 
 ---
 

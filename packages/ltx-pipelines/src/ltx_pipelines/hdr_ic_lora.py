@@ -48,7 +48,7 @@ from ltx_core.model.video_vae import TilingConfig, VideoEncoder
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.tiling import DimensionTilingConfig, TileCountConfig
 from ltx_core.tools import VideoLatentTools
-from ltx_core.types import VideoLatentShape
+from ltx_core.types import VideoLatentShape, VideoPixelShape
 from ltx_pipelines.utils.blocks import (
     DiffusionStage,
     ImageConditioner,
@@ -412,7 +412,22 @@ class HDRICLoraPipeline:
                 high_quality_hdr=high_quality_hdr,
             )
         )
-        with self.stage_2.model_context() as transformer:
+        # video_tools is required by TiledDataParallelBuilder when stage_2 is
+        # wrapped for multi-GPU
+        stage2_video_tools = VideoLatentTools(
+            VideoLatentPatchifier(patch_size=1),
+            VideoLatentShape.from_pixel_shape(
+                VideoPixelShape(
+                    batch=1,
+                    frames=gen_num_frames,
+                    height=gen_h,
+                    width=gen_w,
+                    fps=frame_rate,
+                )
+            ),
+            frame_rate,
+        )
+        with self.stage_2.model_context(video_tools=stage2_video_tools) as transformer:
             phase_latent = upscaled_video_latent
             for phase_idx, (tiling, sigmas_list, use_ic) in enumerate(
                 zip(stage2_tilings, stage2_sigmas, stage2_use_ic_lora, strict=True)
@@ -542,10 +557,10 @@ class HDRICLoraPipeline:
         """
         # Cast to float32 so tiled-decode accumulation buffers and blending
         # masks run in full precision, avoiding bfloat16 seam artifacts.
-        # Request float32 [0, 1] output — apply_hdr_decode_postprocess expects it.
+        # apply_hdr_decode_postprocess expects float32 [0, 1].
         latent = latent.float()
         decoded = torch.cat(
-            list(self.video_decoder(latent, tiling_config, generator, output_dtype=torch.float32)),
+            [chunk.float() for chunk in self.video_decoder(latent, tiling_config, generator)],
             dim=0,
         )
         decoded = rearrange(decoded, "f h w c -> 1 c f h w")
