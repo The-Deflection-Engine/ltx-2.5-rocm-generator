@@ -9,6 +9,29 @@ import torch
 from ltx_core.block_streaming.disk import LoraSource
 from ltx_core.block_streaming.pool import WeightPool
 from ltx_core.block_streaming.source import WeightSource
+from ltx_core.block_streaming.utils import FP8_DTYPES
+from ltx_core.loader.fuse_loras import aggregate_lora_products, fuse_cast_fp8_weight
+
+
+def _contiguous_byte_view(weights: dict[str, torch.Tensor]) -> torch.Tensor | None:
+    """Return a ``uint8`` view spanning every tensor in *weights*, or ``None`` if
+    they don't share one contiguous storage region."""
+    tensors = list(weights.values())
+    if not tensors:
+        return None
+    storage = tensors[0].untyped_storage()
+    storage_ptr = storage.data_ptr()
+    start = end = tensors[0].storage_offset() * tensors[0].element_size()
+    for t in tensors:
+        if t.untyped_storage().data_ptr() != storage_ptr or not t.is_contiguous():
+            return None
+        offset = t.storage_offset() * t.element_size()
+        nbytes = t.numel() * t.element_size()
+        start = min(start, offset)
+        end = max(end, offset + nbytes)
+    view = torch.empty(0, dtype=torch.uint8, device=tensors[0].device)
+    view.set_(storage, start, (end - start,), (1,))
+    return view
 
 
 class WeightsProvider:
@@ -70,8 +93,13 @@ class WeightsProvider:
         instrumentation regions wrapping it -- observe the full transfer time.
         """
         with torch.cuda.stream(self._copy_stream):
-            for name, gpu_tensor in gpu_weights.items():
-                gpu_tensor.copy_(cpu_weights[name], non_blocking=True)
+            gpu_view = _contiguous_byte_view(gpu_weights)
+            cpu_view = _contiguous_byte_view(cpu_weights)
+            if gpu_view is not None and cpu_view is not None and gpu_view.numel() == cpu_view.numel():
+                gpu_view.copy_(cpu_view, non_blocking=True)
+            else:
+                for name, gpu_tensor in gpu_weights.items():
+                    gpu_tensor.copy_(cpu_weights[name], non_blocking=True)
             if self._lora_sources:
                 self._fuse_block_loras(idx, gpu_weights)
             h2d_event = torch.cuda.Event()
@@ -102,9 +130,18 @@ class WeightsProvider:
         for name, tensor in weights.items():
             if not name.endswith(".weight"):
                 continue
-            full_key = f"{self._blocks_prefix}.{idx}.{name}"
-            prefix = full_key[: -len(".weight")]
-            for source in self._lora_sources:
-                delta = source.get_delta(prefix, device=self._target_device)
-                if delta is not None:
-                    tensor.add_(delta.to(dtype=tensor.dtype))
+            prefix = f"{self._blocks_prefix}.{idx}.{name}".removesuffix(".weight")
+            is_fp8 = tensor.dtype in FP8_DTYPES
+            agg_dtype = torch.bfloat16 if is_fp8 else tensor.dtype
+            products = (
+                ab
+                for ab in (s.get_ab(prefix, device=self._target_device, dtype=agg_dtype) for s in self._lora_sources)
+                if ab is not None
+            )
+            aggregated = aggregate_lora_products(products, agg_dtype)
+            if aggregated is None:
+                continue
+            if is_fp8:
+                tensor.copy_(fuse_cast_fp8_weight(aggregated, tensor, tensor.dtype))
+            else:
+                tensor.add_(aggregated)

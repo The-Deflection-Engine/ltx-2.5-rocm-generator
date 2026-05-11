@@ -307,7 +307,7 @@ def main() -> None:
         gemma_root=args.gemma_root,
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
-        distilled=args.distilled,
+        distilled=True,
         torch_compile=args.compile,
         offload_mode=args.offload_mode,
     )
