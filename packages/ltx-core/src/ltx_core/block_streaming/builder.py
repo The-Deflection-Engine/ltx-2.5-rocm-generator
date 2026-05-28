@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Generic
 
@@ -17,13 +16,14 @@ from ltx_core.block_streaming.provider import WeightsProvider
 from ltx_core.block_streaming.source import DiskWeightSource, PinnedWeightSource, WeightSource
 from ltx_core.block_streaming.utils import allocate_layout_views, derive_layout, make_block_key, resolve_attr
 from ltx_core.block_streaming.wrapper import BlockStreamingWrapper
-from ltx_core.loader.fuse_loras import aggregate_lora_products, fuse_lora_weights
+from ltx_core.loader.fuse_loras import FuseRule, bf16_fuse_rule, fuse_lora_weights
 from ltx_core.loader.helpers import create_meta_model, load_state_dict, read_model_config
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.primitives import (
     LoraPathStrengthAndSDOps,
     LoraStateDictWithStrength,
     ModelBuilderProtocol,
+    StateDict,
     StateDictLoader,
 )
 from ltx_core.loader.registry import DummyRegistry, Registry
@@ -50,14 +50,13 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         loras: LoRA adapters fused into weights at load time.
         model_loader: Strategy for reading checkpoint metadata.
         registry: Shared cache for loaded state dicts.
+        fuse_rule: Per-policy LoRA merge rule. Defaults to ``bf16_fuse_rule``;
+            use ``fp8_cast_fuse_rule`` for fp8_cast streaming so the pinned
+            buffers receive correctly-quantized weights.
         blocks_attr: Dotted path to the ``nn.ModuleList`` (e.g.
-            ``"velocity_model.transformer_blocks"``).
+            ``"transformer_blocks"``).
         blocks_prefix: State-dict key prefix for block weights
             (e.g. ``"transformer_blocks"``).
-        state_dict_prefix: Wrapper offset prepended to keys when loading into
-            the meta model (e.g. ``"velocity_model."`` when wrapped by ``X0Model``).
-        model_wrapper: Optional callable wrapping the model
-            (e.g. ``X0Model``).
     """
 
     model_class_configurator: type[ModelConfigurator[ModelType]]
@@ -67,12 +66,11 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
     loras: tuple[LoraPathStrengthAndSDOps, ...] = field(default_factory=tuple)
     model_loader: StateDictLoader = field(default_factory=SafetensorsModelStateDictLoader)
     registry: Registry = field(default_factory=DummyRegistry)
+    fuse_rule: FuseRule = bf16_fuse_rule
 
     # Streaming-specific
     blocks_attr: str = ""
     blocks_prefix: str = ""
-    state_dict_prefix: str = ""
-    model_wrapper: Callable[[ModelType], nn.Module] | None = None
 
     def with_sd_ops(self, sd_ops: SDOps | None) -> StreamingModelBuilder:
         return replace(self, model_sd_ops=sd_ops)
@@ -82,6 +80,9 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
 
     def with_loras(self, loras: tuple[LoraPathStrengthAndSDOps, ...]) -> StreamingModelBuilder:
         return replace(self, loras=loras)
+
+    def with_fuse_rule(self, fuse_rule: FuseRule) -> StreamingModelBuilder:
+        return replace(self, fuse_rule=fuse_rule)
 
     def model_config(self) -> dict:
         """Read model configuration from the checkpoint metadata."""
@@ -113,8 +114,6 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
 
         config = read_model_config(self.model_path, self.model_loader)
         meta_model: nn.Module = create_meta_model(self.model_class_configurator, config, self.module_ops)
-        if self.model_wrapper is not None:
-            meta_model = self.model_wrapper(meta_model)
         meta_model.eval()
 
         blocks = resolve_attr(meta_model, self.blocks_attr)
@@ -142,7 +141,15 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
             target_device,
             reuse_barrier=lambda event: copy_stream.wait_event(event),
         )
-        provider = WeightsProvider(gpu_pool, copy_stream, target_device, source, lora_sources, self.blocks_prefix)
+        provider = WeightsProvider(
+            gpu_pool,
+            copy_stream,
+            target_device,
+            source,
+            lora_sources,
+            self.blocks_prefix,
+            fuse_rule=self.fuse_rule,
+        )
         return BlockStreamingWrapper(
             model=meta_model,
             blocks=blocks,
@@ -190,7 +197,9 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         pinned_blocks = allocate_layout_views(blocks_layout, pin_memory=True)
 
         should_sync = False
-        for key, fused in fuse_lora_weights(model_sd, lora_sd_and_strengths, dtype=None, preserve_input_device=False):
+        for key, fused in fuse_lora_weights(
+            model_sd, lora_sd_and_strengths, fuse_rule=self.fuse_rule, preserve_input_device=False
+        ):
             if key in pinned_blocks:
                 pinned_blocks[key].copy_(fused, non_blocking=True)
                 model_sd.sd[key] = None
@@ -216,7 +225,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         }
 
         non_block_sd: dict[str, torch.Tensor] = {
-            self.state_dict_prefix + model_key: model_sd.sd[model_key].to(device=target_device, dtype=dtype)
+            model_key: model_sd.sd[model_key].to(device=target_device, dtype=dtype)
             for _sft_key, model_key in non_block_keys
         }
 
@@ -235,7 +244,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         non_block_keys: list[tuple[str, str]],
     ) -> tuple[WeightSource, list[LoraSource]]:
         """Create a DiskWeightSource backed by a DiskBlockReader for lazy loading.
-        Derives the shared pool layout from the meta model's block 0 — this
+        Derives the shared pool layout from the meta model's block 0 - this
         relies on module_ops (e.g. fp8_cast) leaving the meta param dtype in
         sync with the post-sd_ops checkpoint dtype.
         """
@@ -248,8 +257,8 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
             target_device,
             dtype,
             sd_ops=self.model_sd_ops,
-            key_prefix=self.state_dict_prefix,
             lora_sources=lora_sources,
+            fuse_rule=self.fuse_rule,
         )
 
         blocks = resolve_attr(meta_model, self.blocks_attr)
@@ -271,28 +280,6 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         source = DiskWeightSource(cpu_pool, block_reader)
         return source, lora_sources
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _fuse_lora_delta(
-        model_key: str,
-        tensor: torch.Tensor,
-        lora_sources: list[LoraSource],
-    ) -> torch.Tensor:
-        """Add all matching LoRA deltas to *tensor* in-place via ``addmm_``."""
-        if not lora_sources or not model_key.endswith(".weight"):
-            return tensor
-        prefix = model_key[: -len(".weight")]
-        products = (
-            ab
-            for ab in (s.get_ab(prefix, device=tensor.device, dtype=tensor.dtype) for s in lora_sources)
-            if ab is not None
-        )
-        aggregate_lora_products(products, out=tensor)
-        return tensor
-
     @staticmethod
     @torch.inference_mode()
     def _load_non_block_weights(
@@ -302,21 +289,36 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         device: torch.device,
         dtype: torch.dtype,
         sd_ops: SDOps | None = None,
-        key_prefix: str = "",
         lora_sources: list[LoraSource] | None = None,
+        fuse_rule: FuseRule = bf16_fuse_rule,
     ) -> None:
-        """Load non-block weights into *model* on *device*."""
-        state_dict: dict[str, torch.Tensor] = {}
-        sources = lora_sources or []
+        """Load non-block weights into *model* on *device*, applying ``sd_ops`` and fusing LoRAs.
+        Fusion goes through :func:`fuse_lora_weights` under *fuse_rule* so the
+        bf16 rounding pattern matches the non-streaming and block-streaming
+        paths, and any quantization-specific fuse rule the builder configures
+        is honored here as well.
+        """
+        non_block_sd: dict[str, torch.Tensor] = {}
         for sft_key, model_key in non_block_keys:
             tensor = reader.get_tensor(sft_key).to(device=device, dtype=dtype)
-            tensor = StreamingModelBuilder._fuse_lora_delta(model_key, tensor, sources)
             if sd_ops is not None:
                 for kv in sd_ops.apply_to_key_value(model_key, tensor):
-                    state_dict[key_prefix + kv.new_key] = kv.new_value
-                continue
-            state_dict[key_prefix + model_key] = tensor
-        model.load_state_dict(state_dict, strict=False, assign=True)
+                    non_block_sd[kv.new_key] = kv.new_value
+            else:
+                non_block_sd[model_key] = tensor
+
+        if lora_sources:
+            lora_sd_and_strengths = [src.as_state_dict_with_strength() for src in lora_sources]
+            non_block_state = StateDict(sd=non_block_sd, device=device, size=0, dtype={dtype})
+            for key, fused in fuse_lora_weights(
+                non_block_state,
+                lora_sd_and_strengths,
+                fuse_rule=fuse_rule,
+                preserve_input_device=True,
+            ):
+                non_block_sd[key] = fused
+
+        model.load_state_dict(non_block_sd, strict=False, assign=True)
 
 
 def _scan_checkpoint_keys(

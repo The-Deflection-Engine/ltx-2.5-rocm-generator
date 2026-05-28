@@ -125,39 +125,26 @@ Uses NVIDIA TensorRT-LLM's `cublas_scaled_mm` for efficient FP8 matrix multiplic
 **Usage with QuantizationPolicy:**
 
 ```python
-from ltx_core.quantization import QuantizationPolicy
+from ltx_core.quantization.fp8_scaled_mm import build_policy as build_fp8_scaled_mm_policy
 
-# Dynamic input quantization (no calibration needed)
-policy = QuantizationPolicy.fp8_scaled_mm()
-
-# Static input quantization with calibration file
-policy = QuantizationPolicy.fp8_scaled_mm(calibration_amax_path="/path/to/amax.json")
+# Discovers the layer set from the checkpoint's .weight_scale tensors
+policy = build_fp8_scaled_mm_policy("/path/to/checkpoint.safetensors")
 ```
 
-The policy provides `sd_ops` and `module_ops` that can be passed to the model builder:
+The policy carries `sd_ops`, `module_ops`, and `fuse_rule` that are passed to the model builder:
 
 ```python
+import torch
 from ltx_core.loader import SingleGPUModelBuilder
 
 builder = SingleGPUModelBuilder(
-    model=model,
-    device=device,
-    sd_ops=policy.sd_ops,
+    model_class_configurator=MyModelConfigurator,
+    model_path="/path/to/checkpoint.safetensors",
+    model_sd_ops=policy.sd_ops,
     module_ops=policy.module_ops,
+    fuse_rule=policy.fuse_rule,
 )
-builder.load(checkpoint_path)
-```
-
-**Calibration File Format** (for static input quantization):
-
-```json
-{
-  "amax_values": {
-    "transformer_blocks.0.attn.to_q.input_quantizer": 12.5,
-    "transformer_blocks.0.attn.to_k.input_quantizer": 8.3,
-    ...
-  }
-}
+model = builder.build(device=torch.device("cuda"))
 ```
 
 #### FP8 Cast
@@ -165,7 +152,9 @@ builder.load(checkpoint_path)
 A simpler approach that casts weights to FP8 for storage and upcasts during inference:
 
 ```python
-policy = QuantizationPolicy.fp8_cast()
+from ltx_core.quantization.fp8_cast import build_policy as build_fp8_cast_policy
+
+policy = build_fp8_cast_policy("/path/to/checkpoint.safetensors")
 ```
 
 For complete, production-ready pipeline implementations that combine these building blocks, see the [`ltx-pipelines`](../ltx-pipelines/) package.

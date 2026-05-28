@@ -59,6 +59,7 @@ from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, STAGE_2_DISTIL
 from ltx_pipelines.utils.denoisers import SimpleDenoiser
 from ltx_pipelines.utils.helpers import get_device, modality_from_latent_state
 from ltx_pipelines.utils.media_io import ResizeMode, align_resolution, load_video_conditioning_hdr
+from ltx_pipelines.utils.quantization_factory import QuantizationKind
 from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
 
 logger = logging.getLogger(__name__)
@@ -77,7 +78,7 @@ ALIGNMENT_DIVISOR = 64
 # to the pipeline constructor.
 TILED_VAE_ENCODE_PIXEL_THRESHOLD = 512 * 768
 
-_DEFAULT_QUANTIZATION = QuantizationPolicy.fp8_cast()
+_DEFAULT_QUANTIZATION = QuantizationKind.FP8_CAST
 
 # Default stage-2 configuration: one refinement phase with modest 2-way tiling
 # in every dimension and a short 2-step distilled sigma schedule.
@@ -205,7 +206,7 @@ class HDRICLoraPipeline:
         hdr_lora: str | Path,
         text_embeddings_path: str | Path,
         device: torch.device | None = None,
-        quantization: QuantizationPolicy = _DEFAULT_QUANTIZATION,
+        quantization: QuantizationPolicy | QuantizationKind | None = _DEFAULT_QUANTIZATION,
         registry: Registry | None = None,
         hdr_lora_config: HdrLoraConfig | None = None,
         tiled_vae_encode_pixel_threshold: int = TILED_VAE_ENCODE_PIXEL_THRESHOLD,
@@ -232,6 +233,8 @@ class HDRICLoraPipeline:
         """
         self.device = device or get_device()
         self._tiled_vae_encode_threshold = tiled_vae_encode_pixel_threshold
+        if isinstance(quantization, QuantizationKind):
+            quantization = quantization.to_policy(checkpoint_path=distilled_checkpoint_path)
         if offload_mode != OffloadMode.NONE and quantization is not None:
             logger.info("Offload mode enabled — disabling quantization (not supported with layer streaming).")
             quantization = None

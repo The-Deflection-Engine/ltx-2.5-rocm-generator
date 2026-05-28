@@ -6,6 +6,8 @@ removes the need for :class:`ModelLedger`.
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import logging
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -21,6 +23,8 @@ from ltx_core.components.noisers import Noiser
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.loader import SDOps
+from ltx_core.loader.attention_ops import set_attention_module_op
+from ltx_core.loader.fuse_loras import bf16_fuse_rule
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.primitives import BuilderProtocol, LoraPathStrengthAndSDOps, ModelBuilderProtocol
 from ltx_core.loader.registry import DummyRegistry, Registry
@@ -42,7 +46,15 @@ from ltx_core.model.transformer import (
     LTXModelConfigurator,
     X0Model,
 )
-from ltx_core.model.transformer.compiling import COMPILE_TRANSFORMER, modify_sd_ops_for_compilation
+from ltx_core.model.transformer.attention import (
+    AttentionCallable,
+    AttentionFunction,
+)
+from ltx_core.model.transformer.compiling import (
+    CompilationConfig,
+    build_compile_transformer_op,
+    modify_sd_ops_for_compilation,
+)
 from ltx_core.model.upsampler import LatentUpsamplerConfigurator, upsample_video
 from ltx_core.model.video_vae import (
     MEMORY_EFFICIENT_DECODE,
@@ -53,7 +65,7 @@ from ltx_core.model.video_vae import (
     VideoEncoder,
     VideoEncoderConfigurator,
 )
-from ltx_core.quantization import QuantizationPolicy
+from ltx_core.quantization import QuantizationPolicy, fp8_cast_fuse_rule
 from ltx_core.text_encoders.gemma import (
     EMBEDDINGS_PROCESSOR_KEY_OPS,
     GEMMA_LLM_KEY_OPS,
@@ -99,6 +111,28 @@ def _chain_quantization(
             mapping=(*sd_ops.mapping, *quantization.sd_ops.mapping),
         )
     return chained_sd_ops, (*module_ops, *quantization.module_ops)
+
+
+def _apply_compile_ops(
+    sd_ops: SDOps,
+    module_ops: tuple[ModuleOps, ...],
+    loras: tuple[LoraPathStrengthAndSDOps, ...],
+    number_of_layers: int,
+    compilation_config: CompilationConfig,
+) -> tuple[SDOps, tuple[ModuleOps, ...], tuple[LoraPathStrengthAndSDOps, ...]]:
+    """Rewrite sd_ops/module_ops/LoRAs for compiled blocks (params land under ``_orig_mod``)."""
+    sd_ops = modify_sd_ops_for_compilation(sd_ops, number_of_layers)
+    compile_op = build_compile_transformer_op(compilation_config)
+    module_ops = (*module_ops, compile_op)
+    loras = tuple(
+        LoraPathStrengthAndSDOps(
+            lora.path,
+            lora.strength,
+            modify_sd_ops_for_compilation(lora.sd_ops, number_of_layers),
+        )
+        for lora in loras
+    )
+    return sd_ops, module_ops, loras
 
 
 @contextmanager
@@ -170,79 +204,110 @@ class DiffusionStage:
         loras: tuple[LoraPathStrengthAndSDOps, ...] = (),
         quantization: QuantizationPolicy | None = None,
         registry: Registry | None = None,
-        torch_compile: bool = False,
+        compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
         transformer_builder: ModelBuilderProtocol[LTXModel] | DelegatingBuilder[LTXModel] | None = None,
     ) -> None:
+        self._checkpoint_path = checkpoint_path
         self._dtype = dtype
         self._device = device
         self._quantization = quantization
-        self._torch_compile = torch_compile
+        self._compilation_config = compilation_config
         self._offload_mode = offload_mode
+        configurator = (
+            quantization.model_configurator
+            if quantization is not None and quantization.model_configurator is not None
+            else LTXModelConfigurator
+        )
         if transformer_builder is not None:
             self._transformer_builder = transformer_builder
         else:
             self._transformer_builder = Builder(
                 model_path=checkpoint_path,
-                model_class_configurator=LTXModelConfigurator,
+                model_class_configurator=configurator,
                 model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
                 loras=tuple(loras),
                 registry=registry or DummyRegistry(),
             )
 
         if offload_mode != OffloadMode.NONE:
-            if torch_compile:
+            if compilation_config is not None:
                 raise ValueError("torch.compile is not supported with layer streaming")
+            # WeightsProvider currently only supports plain bf16 + fp8_cast LoRA fusion
+            # (no companion-key emission). Quantization policies that emit
+            # companion keys (e.g. ``.weight_scale``) cannot be streamed yet.
+            if quantization is not None and quantization.fuse_rule is not fp8_cast_fuse_rule:
+                raise ValueError(
+                    "Block streaming is not supported with this quantization policy "
+                    "(only bf16 and fp8_cast are currently supported)."
+                )
             streaming_sd_ops: SDOps = LTXV_MODEL_COMFY_RENAMING_MAP
             streaming_module_ops: tuple[ModuleOps, ...] = ()
             if quantization is not None:
-                if quantization.kind != QuantizationPolicy.Kind.FP8_CAST:
-                    raise ValueError(
-                        f"Layer streaming supports only QuantizationPolicy.fp8_cast(); "
-                        f"got kind={quantization.kind!r} which produces heterogeneous block layouts."
-                    )
                 streaming_sd_ops, streaming_module_ops = _chain_quantization(
                     streaming_sd_ops, streaming_module_ops, quantization
                 )
             self._streaming_builder = StreamingModelBuilder(
-                model_class_configurator=LTXModelConfigurator,
+                model_class_configurator=configurator,
                 model_path=checkpoint_path,
                 model_sd_ops=streaming_sd_ops,
                 module_ops=streaming_module_ops,
                 loras=tuple(loras),
                 registry=registry or DummyRegistry(),
-                blocks_attr="velocity_model.transformer_blocks",
+                fuse_rule=quantization.fuse_rule if quantization is not None else bf16_fuse_rule,
+                blocks_attr="transformer_blocks",
                 blocks_prefix="transformer_blocks",
-                state_dict_prefix="velocity_model.",
-                model_wrapper=lambda m: X0Model(m).eval(),
             )
+
+    def with_attention(self, attention: AttentionFunction | AttentionCallable | None) -> "DiffusionStage":
+        """Return a new ``DiffusionStage`` that pins the transformer build to ``attention``.
+        Functional: never mutates ``self``. The returned stage shares all other
+        configuration with the original; only the underlying builders' ``module_ops``
+        gain a ``set_attention_module_op(attention)`` entry so subsequent transformer
+        builds use that kernel. ``attention=None`` is a no-op (returns ``self``).
+        """
+        if attention is None:
+            return self
+        op = set_attention_module_op(attention)
+        new = copy.copy(self)
+        new._transformer_builder = self._transformer_builder.with_module_ops(
+            (*self._transformer_builder.module_ops, op),
+        )
+        if self._offload_mode != OffloadMode.NONE:
+            new._streaming_builder = dataclasses.replace(
+                self._streaming_builder,
+                module_ops=(*self._streaming_builder.module_ops, op),
+            )
+        return new
 
     def _build_transformer(self, *, device: torch.device | None = None, **kwargs: object) -> X0Model:
         target = device or self._device
         sd_ops = self._transformer_builder.model_sd_ops
         module_ops = self._transformer_builder.module_ops
         loras = self._transformer_builder.loras
-        if self._torch_compile:
-            module_ops = (*module_ops, COMPILE_TRANSFORMER)
+        if self._compilation_config is not None:
             number_of_layers = self._transformer_builder.model_config()["transformer"]["num_layers"]
-            sd_ops = modify_sd_ops_for_compilation(sd_ops, number_of_layers)
-            loras = tuple(
-                LoraPathStrengthAndSDOps(
-                    lora.path,
-                    lora.strength,
-                    modify_sd_ops_for_compilation(lora.sd_ops, number_of_layers),
-                )
-                for lora in loras
+            sd_ops, module_ops, loras = _apply_compile_ops(
+                sd_ops, module_ops, loras, number_of_layers, self._compilation_config
             )
         if self._quantization is not None:
             sd_ops, module_ops = _chain_quantization(sd_ops, module_ops, self._quantization)
 
         builder = self._transformer_builder.with_module_ops(module_ops).with_sd_ops(sd_ops).with_loras(loras)
+        if self._quantization is not None:
+            builder = builder.with_fuse_rule(self._quantization.fuse_rule)
         return X0Model(builder.build(device=target, **kwargs)).to(target).eval()
+
+    @contextmanager
+    def _streaming_transformer_ctx(self) -> Iterator[X0Model]:
+        with _streaming_model(
+            self._streaming_builder, self._offload_mode, self._device, self._dtype
+        ) as streaming_wrapper:
+            yield X0Model(streaming_wrapper).eval()
 
     def _transformer_ctx(self, **kwargs: object) -> AbstractContextManager:
         if self._offload_mode != OffloadMode.NONE:
-            return _streaming_model(self._streaming_builder, self._offload_mode, self._device, self._dtype)
+            return self._streaming_transformer_ctx()
         return gpu_model(self._build_transformer(**kwargs))
 
     def model_context(self, **kwargs: object) -> AbstractContextManager:
@@ -348,7 +413,17 @@ class DiffusionStage:
             v_shape = VideoLatentShape.from_pixel_shape(pixel_shape)
             video_tools = VideoLatentTools(VideoLatentPatchifier(patch_size=1), v_shape, fps)
 
+        mode = "streaming" if self._offload_mode != OffloadMode.NONE else "standard"
+        logger.info("Building transformer (%s) from %s", mode, self._checkpoint_path)
         with self._transformer_ctx(video_tools=video_tools) as transformer:
+            logger.info(
+                "Running denoising loop (%d steps, %dx%d %d frames @ %.1f fps)",
+                len(sigmas) - 1,
+                width,
+                height,
+                frames,
+                fps,
+            )
             return self.run(
                 transformer,
                 denoiser,
@@ -387,6 +462,8 @@ class PromptEncoder:
         offload_mode: OffloadMode = OffloadMode.NONE,
         text_encoder_builder: BuilderProtocol | None = None,
     ) -> None:
+        self._gemma_root = gemma_root
+        self._checkpoint_path = checkpoint_path
         self._dtype = dtype
         self._device = device
         self._offload_mode = offload_mode
@@ -432,7 +509,7 @@ class PromptEncoder:
 
     def _build_embeddings_processor(self) -> EmbeddingsProcessor:
         """Build the embeddings processor on the target device."""
-        return self._embeddings_processor_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
+        return self._embeddings_processor_builder.build(device=self._device, dtype=self._dtype).eval()
 
     def _text_encoder_ctx(self) -> AbstractContextManager:
         if self._offload_mode != OffloadMode.NONE:
@@ -448,6 +525,7 @@ class PromptEncoder:
         enhance_prompt_seed: int = 42,
     ) -> list[EmbeddingsProcessorOutput]:
         """Encode *prompts* through Gemma -> embeddings processor, freeing each model after use."""
+        logger.info("Building text encoder from %s", self._gemma_root)
         with self._text_encoder_ctx() as text_encoder:
             if enhance_first_prompt:
                 prompts = list(prompts)
@@ -455,9 +533,12 @@ class PromptEncoder:
                     text_encoder, prompts[0], enhance_prompt_image, seed=enhance_prompt_seed
                 )
             raw_outputs = [text_encoder.encode(p) for p in prompts]
+        logger.info("Text encoder done, building embeddings processor from %s", self._checkpoint_path)
 
         with gpu_model(self._build_embeddings_processor()) as embeddings_processor:
-            return [embeddings_processor.process_hidden_states(hs, mask) for hs, mask in raw_outputs]
+            result = [embeddings_processor.process_hidden_states(hs, mask) for hs, mask in raw_outputs]
+        logger.info("Prompt encoding complete")
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +568,7 @@ class ImageConditioner:
         )
 
     def _build_encoder(self) -> VideoEncoder:
-        return self._encoder_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
+        return self._encoder_builder.build(device=self._device, dtype=self._dtype).eval()
 
     def __call__(self, fn: Callable[[VideoEncoder], T]) -> T:
         """Build video encoder → call *fn(encoder)* → free encoder."""
@@ -511,6 +592,7 @@ class VideoUpsampler:
         device: torch.device,
         registry: Registry | None = None,
     ) -> None:
+        self._upsampler_path = upsampler_path
         self._dtype = dtype
         self._device = device
         self._encoder_builder = Builder(
@@ -527,13 +609,10 @@ class VideoUpsampler:
 
     def __call__(self, latent: torch.Tensor) -> torch.Tensor:
         """Upsample *latent* using video encoder + spatial upsampler, then free both."""
+        logger.info("Building video encoder + spatial upsampler from %s", self._upsampler_path)
         with (
-            gpu_model(
-                self._encoder_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
-            ) as encoder,
-            gpu_model(
-                self._upsampler_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
-            ) as upsampler,
+            gpu_model(self._encoder_builder.build(device=self._device, dtype=self._dtype).eval()) as encoder,
+            gpu_model(self._upsampler_builder.build(device=self._device, dtype=self._dtype).eval()) as upsampler,
         ):
             return upsample_video(latent=latent, video_encoder=encoder, upsampler=upsampler)
 
@@ -557,6 +636,7 @@ class VideoDecoder:
         memory_efficient: bool = True,
         decoder_builder: BuilderProtocol | None = None,
     ) -> None:
+        self._checkpoint_path = checkpoint_path
         self._dtype = dtype
         self._device = device
         if decoder_builder is not None:
@@ -577,7 +657,8 @@ class VideoDecoder:
         generator: torch.Generator | None = None,
     ) -> Iterator[torch.Tensor]:
         """Decode *latent* to pixel-space video chunks. Decoder freed after exhaustion."""
-        decoder = self._decoder_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
+        logger.info("Building video decoder from %s", self._checkpoint_path)
+        decoder = self._decoder_builder.build(device=self._device, dtype=self._dtype).eval()
         return _cleanup_iter(decoder.decode_video(latent, tiling_config, generator), decoder)
 
 
@@ -596,6 +677,7 @@ class AudioDecoder:
         device: torch.device,
         registry: Registry | None = None,
     ) -> None:
+        self._checkpoint_path = checkpoint_path
         self._dtype = dtype
         self._device = device
         self._decoder_builder = Builder(
@@ -613,13 +695,10 @@ class AudioDecoder:
 
     def __call__(self, latent: torch.Tensor) -> Audio:
         """Decode audio *latent* through VAE decoder + vocoder, then free both."""
+        logger.info("Building audio decoder + vocoder from %s", self._checkpoint_path)
         with (
-            gpu_model(
-                self._decoder_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
-            ) as decoder,
-            gpu_model(
-                self._vocoder_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
-            ) as vocoder,
+            gpu_model(self._decoder_builder.build(device=self._device, dtype=self._dtype).eval()) as decoder,
+            gpu_model(self._vocoder_builder.build(device=self._device, dtype=self._dtype).eval()) as vocoder,
         ):
             return vae_decode_audio(latent, decoder, vocoder)
 
@@ -653,7 +732,5 @@ class AudioConditioner:
 
     def __call__(self, fn: Callable[[torch.nn.Module], T]) -> T:
         """Build audio encoder → call *fn(encoder)* → free encoder."""
-        with gpu_model(
-            self._encoder_builder.build(device=self._device, dtype=self._dtype).to(self._device).eval()
-        ) as encoder:
+        with gpu_model(self._encoder_builder.build(device=self._device, dtype=self._dtype).eval()) as encoder:
             return fn(encoder)

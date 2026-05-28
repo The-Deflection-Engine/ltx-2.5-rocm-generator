@@ -5,8 +5,11 @@ from typing import Callable
 import torch
 from torch import nn
 
+from ltx_core.loader.fuse_loras import FuseRule, bf16_fuse_rule
 from ltx_core.loader.module_ops import ModuleOps
+from ltx_core.loader.primitives import StateDict
 from ltx_core.model.transformer import LTXModel
+from ltx_core.quantization.policy import QuantizationPolicy
 from ltx_core.quantization.trtllm_scaled_usable import trtllm_scaled_mm_usable
 
 
@@ -172,4 +175,43 @@ def get_fp8_swap_module_ops(checkpoint_path: str) -> tuple[ModuleOps, ...]:
             matcher=lambda model: isinstance(model, LTXModel),
             mutator=lambda model: _swap_linears_to_fp8(model, _should_swap),
         ),
+    )
+
+
+def _fp8_scaled_mm_fuse(
+    key: str,
+    weight: torch.Tensor,
+    deltas: torch.Tensor,
+    model_sd: StateDict,
+) -> dict[str, torch.Tensor]:
+    """Dequantize via ``weight.float() * weight_scale``, add the BF16 delta,
+    and re-quantize to FP8 with a fresh per-tensor scale.
+    Layers that were not swapped to scaled FP8 (e.g. small embedder linears
+    excluded from the auto-discovered swap set) stay BF16 and have no
+    ``.weight_scale`` companion -- for those, fall back to a plain bf16 fuse.
+    """
+    scale_key = key.replace(".weight", ".weight_scale")
+    if scale_key not in model_sd.sd:
+        return bf16_fuse_rule(key, weight, deltas, model_sd)
+    weight_scale = model_sd.sd[scale_key]
+    original_weight = weight.to(torch.float32) * weight_scale
+    new_weight = original_weight + deltas.to(torch.float32)
+    new_fp8_weight, new_weight_scale = quantize_weight_to_fp8_per_tensor(new_weight)
+    return {key: new_fp8_weight, scale_key: new_weight_scale}
+
+
+fp8_scaled_mm_fuse_rule = FuseRule(aggregation_dtype=torch.bfloat16, fuse_fn=_fp8_scaled_mm_fuse)
+
+
+def build_policy(checkpoint_path: str) -> QuantizationPolicy:
+    """FP8 scaled matmul for checkpoints pre-quantized with per-tensor scales.
+    The set of layers to swap to ``FP8Linear`` is discovered from the
+    checkpoint's ``.weight_scale`` tensors via suffix-matching against the
+    model's named modules. Requires a pre-quantized checkpoint; for BF16
+    checkpoints, use :func:`ltx_core.quantization.fp8_cast.build_policy`.
+    """
+    return QuantizationPolicy(
+        sd_ops=None,
+        module_ops=get_fp8_swap_module_ops(checkpoint_path),
+        fuse_rule=fp8_scaled_mm_fuse_rule,
     )

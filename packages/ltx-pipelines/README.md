@@ -369,7 +369,9 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m ltx_pipelines.ti2vid_
 When authoring custom scripts, pass a `QuantizationPolicy` to pipeline classes:
 
 ```python
-from ltx_core.quantization import QuantizationPolicy
+from ltx_core.quantization.fp8_cast import build_policy as build_fp8_cast_policy
+# Alternative:
+# from ltx_core.quantization.fp8_scaled_mm import build_policy as build_fp8_scaled_mm_policy
 
 pipeline = TI2VidTwoStagesPipeline(
     checkpoint_path=ltx_model_path,
@@ -377,7 +379,7 @@ pipeline = TI2VidTwoStagesPipeline(
     spatial_upsampler_path=upsampler_path,
     gemma_root=gemma_root_path,
     loras=[],
-    quantization=QuantizationPolicy.fp8_cast(),  # or QuantizationPolicy.fp8_scaled_mm()
+    quantization=build_fp8_cast_policy(ltx_model_path),
 )
 pipeline(...)
 ```
@@ -414,12 +416,13 @@ def denoising_loop(sigmas, video_state, audio_state, stepper):
         video_state=video_state,
         audio_state=audio_state,
         stepper=stepper,
-        denoise_fn=your_denoise_function,
+        transformer=transformer,
+        denoiser=denoiser,
         ge_gamma=2.0,  # Gradient estimation coefficient
     )
 ```
 
-This allows you to use **20-30 steps instead of 40** while maintaining quality. The gradient estimation function is available in [`pipeline_utils.py`](src/ltx_pipelines/utils/helpers.py).
+This allows you to use **20-30 steps instead of 40** while maintaining quality. The gradient estimation function is defined in [`samplers.py`](src/ltx_pipelines/utils/samplers.py).
 
 ---
 
@@ -435,15 +438,18 @@ This allows you to use **20-30 steps instead of 40** while maintaining quality. 
 ## 📖 Example: Image-to-Video
 
 ```python
-from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
-from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 from ltx_core.components.guiders import MultiModalGuiderParams
+from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
+from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
+from ltx_pipelines.utils.args import ImageConditioningInput
+from ltx_pipelines.utils.media_io import encode_video
 
 distilled_lora = [
     LoraPathStrengthAndSDOps(
         "/path/to/distilled_lora.safetensors",
         0.6,
-        LTXV_LORA_COMFY_RENAMING_MAP
+        LTXV_LORA_COMFY_RENAMING_MAP,
     ),
 ]
 
@@ -473,19 +479,31 @@ audio_guider_params = MultiModalGuiderParams(
     stg_blocks=[29],
 )
 
-# Generate video from image
-pipeline(
+# Generate video from image. The pipeline returns (video_iterator, audio);
+# the caller is responsible for encoding to file via encode_video().
+num_frames = 121
+frame_rate = 25.0
+tiling_config = TilingConfig.default()
+video, audio = pipeline(
     prompt="A serene landscape with mountains in the background",
-    output_path="output.mp4",
+    negative_prompt="worst quality, low quality, blurry, distorted",
     seed=42,
     height=512,
     width=768,
-    num_frames=121,
-    frame_rate=25.0,
+    num_frames=num_frames,
+    frame_rate=frame_rate,
     num_inference_steps=40,
     video_guider_params=video_guider_params,
     audio_guider_params=audio_guider_params,
-    images=[ImageConditioningInput("input_image.jpg", 0, 1.0, 33)],  # Image at frame 0, strength 1.0, CRF 33
+    images=[ImageConditioningInput("input_image.jpg", 0, 1.0, 33)],  # path, frame_idx=0, strength=1.0, crf=33
+    tiling_config=tiling_config,
+)
+encode_video(
+    video=video,
+    fps=frame_rate,
+    audio=audio,
+    output_path="output.mp4",
+    video_chunks_number=get_video_chunks_number(num_frames, tiling_config),
 )
 ```
 

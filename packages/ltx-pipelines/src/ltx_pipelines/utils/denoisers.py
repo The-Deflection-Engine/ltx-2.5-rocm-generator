@@ -138,6 +138,8 @@ def _guided_denoise(  # noqa: PLR0913,PLR0915
     ptb_configs = [ptb for _, _, _, ptb in passes]
     n = len(passes)
 
+    orig_b = (video_state or audio_state).latent.shape[0]
+
     def _batched_sigma(state: LatentState) -> torch.Tensor:
         """Expand scalar sigma to (n * B,) matching the repeated state."""
         return sigma.expand(state.latent.shape[0] * n)
@@ -162,8 +164,16 @@ def _guided_denoise(  # noqa: PLR0913,PLR0915
             enabled=not a_skip,
         )
 
+    # Replicate each pass's PerturbationConfig to all `orig_b` samples it
+    # carries, so `BatchedPerturbationConfig.mask_like` returns a per-sample
+    # mask (length n*orig_b) instead of a per-pass mask (length n). Without
+    # this expansion the mask is broadcast against a (n*orig_b, T, D) tensor
+    # and the multiplication fails with a batch-dim mismatch whenever
+    # `orig_b > 1` (e.g. multi-prompt benchmark panels).
+    batched_ptb_configs = [ptb for ptb in ptb_configs for _ in range(orig_b)]
+
     all_v, all_a = transformer(
-        video=batched_video, audio=batched_audio, perturbations=BatchedPerturbationConfig(ptb_configs)
+        video=batched_video, audio=batched_audio, perturbations=BatchedPerturbationConfig(batched_ptb_configs)
     )
 
     # Split results back and combine via guiders.

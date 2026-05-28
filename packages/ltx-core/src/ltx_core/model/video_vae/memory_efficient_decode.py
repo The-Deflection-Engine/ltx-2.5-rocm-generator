@@ -56,6 +56,25 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
+def _memory_format_of(t: torch.Tensor, prefer_channels_last_3d: bool = False) -> torch.memory_format:
+    """Pick the memory format for a workspace allocation.
+    When ``prefer_channels_last_3d`` is True and ``t`` is 5D, return
+    ``channels_last_3d`` regardless of ``t``'s current strides -- the
+    workspace's ``.copy_(t)`` will transcribe the data into the new layout.
+    This is needed because intermediate tensors inside the decoder (after
+    ``rearrange`` + slice + residual add in ``_upsample_forward_efficient``)
+    are not NHWC-contiguous, so an auto-detect helper would silently fall
+    back to NCHW for every workspace after the first upsample.
+    Otherwise fall back to inspecting ``t``: ``channels_last_3d`` if ``t``
+    already uses it, else contiguous.
+    """
+    if prefer_channels_last_3d and t.dim() == 5:
+        return torch.channels_last_3d
+    if t.dim() == 5 and t.is_contiguous(memory_format=torch.channels_last_3d):
+        return torch.channels_last_3d
+    return torch.contiguous_format
+
+
 def _find_temporal_split_size(num_frames: int) -> int:
     """Find chunk size for in-place temporal convolution.
     The chunk size ensures the last chunk has at least 3 frames
@@ -132,6 +151,7 @@ def inplace_conv3d_temporal_chunked(workspace: torch.Tensor, conv: nn.Conv3d) ->
         workspace.shape[4],
         device=workspace.device,
         dtype=workspace.dtype,
+        memory_format=_memory_format_of(workspace),
     )
     o_buf = torch.empty_like(x_buf)
 
@@ -190,6 +210,7 @@ def _causal_pad(x: torch.Tensor, pad_size: int) -> torch.Tensor:
         x.shape[4],
         device=x.device,
         dtype=x.dtype,
+        memory_format=_memory_format_of(x),
     )
     padded[:, :, pad_size:].copy_(x)
     for i in range(pad_size):
@@ -325,6 +346,7 @@ def _midblock_forward_efficient(
     causal: bool,
     timestep: torch.Tensor | None,
     generator: torch.Generator | None,
+    prefer_channels_last_3d: bool = False,
 ) -> torch.Tensor:
     """Memory-efficient ``UNetMidBlock3D`` forward.
     Allocates a single workspace buffer that is reused across all
@@ -351,6 +373,7 @@ def _midblock_forward_efficient(
         hidden_states.shape[4],
         device=hidden_states.device,
         dtype=hidden_states.dtype,
+        memory_format=_memory_format_of(hidden_states, prefer_channels_last_3d),
     )
 
     for resnet in block.res_blocks:
@@ -366,6 +389,7 @@ def _upsample_forward_efficient(
     block: DepthToSpaceUpsample,
     x: torch.Tensor,
     causal: bool,
+    prefer_channels_last_3d: bool = False,
 ) -> torch.Tensor:
     """Memory-efficient ``DepthToSpaceUpsample`` forward.
     For non-causal mode the input is copied into a workspace and the
@@ -393,6 +417,7 @@ def _upsample_forward_efficient(
     if causal:
         x = _causal_pad_free_and_conv(x, block.conv)
     else:
+        mem_fmt = _memory_format_of(x, prefer_channels_last_3d)
         workspace = torch.empty(
             x.shape[0],
             max(in_channels, out_channels),
@@ -401,11 +426,12 @@ def _upsample_forward_efficient(
             x.shape[4],
             device=x.device,
             dtype=x.dtype,
+            memory_format=mem_fmt,
         )
         workspace[:, :in_channels, 1:-1].copy_(x)
         del x
         inplace_conv3d_temporal_chunked(workspace, conv)
-        x = workspace[:, :out_channels, 1:-1].contiguous()
+        x = workspace[:, :out_channels, 1:-1].contiguous(memory_format=mem_fmt)
         del workspace
 
     x = rearrange(
@@ -418,7 +444,7 @@ def _upsample_forward_efficient(
     if block.stride[0] == 2:
         x = x[:, :, 1:, :, :]
     if block.residual:
-        x = x + x_in
+        x.add_(x_in)
         del x_in
     return x
 
@@ -434,12 +460,14 @@ def _final_norm_and_conv_out(
     causal: bool,
     scaled_timestep: torch.Tensor | None,
     batch_size: int,
+    prefer_channels_last_3d: bool = False,
 ) -> torch.Tensor:
     """Workspace-based final norm + [ada] + SiLU + conv_out + unpatchify."""
     conv_out_mod: CausalConv3d = decoder.conv_out  # type: ignore[assignment]
     conv_out = conv_out_mod.conv
     feature_channels = sample.shape[1]
 
+    mem_fmt = _memory_format_of(sample, prefer_channels_last_3d)
     workspace = torch.empty(
         sample.shape[0],
         max(feature_channels, conv_out.out_channels),
@@ -448,6 +476,7 @@ def _final_norm_and_conv_out(
         sample.shape[4],
         device=sample.device,
         dtype=sample.dtype,
+        memory_format=mem_fmt,
     )
     workspace[:, :feature_channels, 1:-1].copy_(sample)
     del sample
@@ -485,7 +514,7 @@ def _final_norm_and_conv_out(
         del padded
     else:
         inplace_conv3d_temporal_chunked(workspace, conv_out)
-        result = workspace[:, : conv_out.out_channels, 1:-1].contiguous()
+        result = workspace[:, : conv_out.out_channels, 1:-1].contiguous(memory_format=mem_fmt)
         del workspace, interior
 
     return unpatchify(result, patch_size_hw=decoder.patch_size, patch_size_t=1)
@@ -507,6 +536,9 @@ def _memory_efficient_forward(
     ``UNetMidBlock3D`` and ``DepthToSpaceUpsample`` blocks use efficient
     paths; standalone ``ResnetBlock3D`` blocks fall back to the standard
     forward.  The final norm + ada + SiLU + conv_out is also workspace-based.
+    All workspaces are allocated ``channels_last_3d`` so cuDNN's NHWC 3D
+    conv kernels run end-to-end. The caller (:func:`enable_memory_efficient_decode`)
+    is responsible for converting the input sample and decoder weights to NHWC.
     """
     causal = decoder.causal
     batch_size = sample.shape[0]
@@ -537,6 +569,11 @@ def _memory_efficient_forward(
             raise ValueError("'timestep' required when timestep_conditioning=True")
         scaled_timestep = timestep * decoder.timestep_scale_multiplier.to(sample)
 
+    # Workspaces are unconditionally NHWC: rearrange + slice + residual-add
+    # inside _upsample_forward_efficient produces NCHW-default output, so
+    # per-tensor inspection would silently fall back to NCHW for every
+    # workspace after the first upsample.
+
     # --- Up blocks (dispatch to efficient path per block type) ---
     for up_block in decoder.up_blocks:
         if isinstance(up_block, UNetMidBlock3D):
@@ -546,15 +583,16 @@ def _memory_efficient_forward(
                 causal=causal,
                 timestep=scaled_timestep if decoder.timestep_conditioning else None,
                 generator=generator,
+                prefer_channels_last_3d=True,
             )
         elif isinstance(up_block, DepthToSpaceUpsample):
-            sample = _upsample_forward_efficient(up_block, sample, causal=causal)
+            sample = _upsample_forward_efficient(up_block, sample, causal=causal, prefer_channels_last_3d=True)
         elif isinstance(up_block, ResnetBlock3D):
             sample = up_block(sample, causal=causal, generator=generator)
         else:
             sample = up_block(sample, causal=causal)
 
-    return _final_norm_and_conv_out(decoder, sample, causal, scaled_timestep, batch_size)
+    return _final_norm_and_conv_out(decoder, sample, causal, scaled_timestep, batch_size, prefer_channels_last_3d=True)
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +602,10 @@ def _memory_efficient_forward(
 
 def enable_memory_efficient_decode(decoder: nn.Module) -> nn.Module:
     """Patch a ``VideoDecoder`` to use the memory-efficient forward path.
+    The mem-efficient path runs the decoder in ``channels_last_3d`` memory
+    format: weights and inputs are converted on first call so cuDNN's NHWC
+    3D conv kernels are used (~2x faster, avoids the large vol2col scratch
+    buffer of the NCHW path).
     The original ``forward`` is saved as ``decoder._original_forward`` so
     that it can be restored later with :func:`disable_memory_efficient_decode`.
     """
@@ -577,12 +619,20 @@ def enable_memory_efficient_decode(decoder: nn.Module) -> nn.Module:
         return decoder
 
     original_forward = decoder.forward
+    weights_converted = False
 
     def efficient_forward(
         sample: torch.Tensor,
         timestep: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
+        nonlocal weights_converted
+        if sample.dim() == 5:
+            if not weights_converted:
+                # Lazy: weights are real by first-call time (meta -> loader -> here).
+                decoder.to(memory_format=torch.channels_last_3d)
+                weights_converted = True
+            sample = sample.to(memory_format=torch.channels_last_3d)
         return _memory_efficient_forward(decoder, sample, timestep, generator)
 
     decoder._original_forward = original_forward  # type: ignore[attr-defined]
