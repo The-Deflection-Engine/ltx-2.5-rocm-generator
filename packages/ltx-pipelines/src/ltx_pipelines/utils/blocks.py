@@ -78,7 +78,6 @@ from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcesso
 from ltx_core.tools import AudioLatentTools, LatentTools, VideoLatentTools
 from ltx_core.types import Audio, AudioLatentShape, LatentState, VideoLatentShape, VideoPixelShape
 from ltx_core.utils import find_matching_file
-from ltx_pipelines.multigpu.delegating_builder import DelegatingBuilder
 from ltx_pipelines.utils.gpu_model import gpu_model
 from ltx_pipelines.utils.helpers import (
     cleanup_memory,
@@ -206,7 +205,7 @@ class DiffusionStage:
         registry: Registry | None = None,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
-        transformer_builder: ModelBuilderProtocol[LTXModel] | DelegatingBuilder[LTXModel] | None = None,
+        transformer_builder: ModelBuilderProtocol[LTXModel] | None = None,
     ) -> None:
         self._checkpoint_path = checkpoint_path
         self._dtype = dtype
