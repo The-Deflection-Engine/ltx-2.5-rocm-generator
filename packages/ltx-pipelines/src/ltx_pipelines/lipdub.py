@@ -13,6 +13,7 @@ from ltx_core.conditioning import AudioConditionByReferenceLatent
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
 from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
+from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import TilingConfig, VideoEncoder, get_video_chunks_number
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import Audio, AudioLatentShape, SpatioTemporalScaleFactors, VideoPixelShape
@@ -59,7 +60,7 @@ class LipDubPipeline:
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
         registry: Registry | None = None,
-        torch_compile: bool = False,
+        compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
     ) -> None:
         self.device = device or get_device()
@@ -89,7 +90,7 @@ class LipDubPipeline:
             loras=loras,
             quantization=quantization,
             registry=registry,
-            torch_compile=torch_compile,
+            compilation_config=compilation_config,
             offload_mode=offload_mode,
         )
         self.upsampler = VideoUpsampler(
@@ -289,7 +290,7 @@ def patchify_lipdub_audio_reference_latent(
 
 @torch.inference_mode()
 def main() -> None:
-    logging.getLogger().setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO)
     checkpoint_path = detect_checkpoint_path(distilled=True)
     params = detect_params(checkpoint_path)
     parser = lipdub_arg_parser(params=params)
@@ -304,7 +305,7 @@ def main() -> None:
         gemma_root=args.gemma_root,
         ic_lora=args.lora[0],
         quantization=args.quantization,
-        torch_compile=args.compile,
+        compilation_config=args.compile,
         offload_mode=args.offload_mode,
     )
     tiling_config = TilingConfig.default()

@@ -10,6 +10,7 @@ from ltx_core.loader.sd_ops import SDOps
 from ltx_core.model.model_protocol import ModelType
 
 if TYPE_CHECKING:
+    from ltx_core.loader.fuse_loras import FuseRule
     from ltx_core.loader.registry import Registry
 
 
@@ -108,6 +109,10 @@ class ModelBuilderProtocol(BuilderProtocol[ModelType], Protocol[ModelType]):
 
     def with_lora_load_device(self, device: torch.device) -> "ModelBuilderProtocol[ModelType]":
         """Return a copy of this builder that loads LoRA weights onto the given device."""
+        ...
+
+    def with_fuse_rule(self, fuse_rule: "FuseRule") -> "ModelBuilderProtocol[ModelType]":
+        """Return a copy of this builder with the given LoRA fuse rule (e.g. from a quantization policy)."""
         ...
 
     def build(

@@ -7,6 +7,7 @@ from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.conditioning import ConditioningItem
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
+from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import TilingConfig, VideoEncoder, get_video_chunks_number
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import Audio, VideoPixelShape
@@ -60,7 +61,7 @@ class ICLoraPipeline:
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
         registry: Registry | None = None,
-        torch_compile: bool = False,
+        compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
     ):
         self.device = device or get_device()
@@ -82,7 +83,7 @@ class ICLoraPipeline:
             loras=tuple(loras),
             quantization=quantization,
             registry=registry,
-            torch_compile=torch_compile,
+            compilation_config=compilation_config,
             offload_mode=offload_mode,
         )
         self.stage_2 = DiffusionStage(
@@ -92,7 +93,7 @@ class ICLoraPipeline:
             loras=(),
             quantization=quantization,
             registry=registry,
-            torch_compile=torch_compile,
+            compilation_config=compilation_config,
             offload_mode=offload_mode,
         )
         self.upsampler = VideoUpsampler(
@@ -330,7 +331,7 @@ class ICLoraPipeline:
 
 @torch.inference_mode()
 def main() -> None:
-    logging.getLogger().setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO)
     checkpoint_path = detect_checkpoint_path(distilled=True)
     params = detect_params(checkpoint_path)
     parser = default_2_stage_distilled_arg_parser(params=params)
@@ -386,7 +387,7 @@ def main() -> None:
         gemma_root=args.gemma_root,
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
-        torch_compile=args.compile,
+        compilation_config=args.compile,
         offload_mode=args.offload_mode,
     )
     tiling_config = TilingConfig.default()

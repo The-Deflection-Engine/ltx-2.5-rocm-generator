@@ -9,6 +9,7 @@ import torch
 
 from ltx_core.block_streaming.utils import allocate_layout_views, make_block_key
 from ltx_core.loader.fuse_loras import LoraProduct
+from ltx_core.loader.primitives import LoraStateDictWithStrength, StateDict
 from ltx_core.loader.sd_ops import SDOps
 
 _SAFETENSORS_DTYPE_TO_TORCH: dict[str, torch.dtype] = {
@@ -124,6 +125,22 @@ class LoraSource:
                 a_view.copy_(handle.get_tensor(a_keys[prefix]))
                 b_view.copy_(handle.get_tensor(b_keys[prefix]))
                 self._pinned_ab[prefix] = (a_view, b_view)
+
+    def as_state_dict_with_strength(self) -> LoraStateDictWithStrength:
+        """Return a :class:`LoraStateDictWithStrength` view of the pinned A/B factors.
+        Lets :func:`fuse_lora_weights` consume disk-streaming LoRAs without
+        re-reading the safetensors file or re-applying ``sd_ops``.
+        """
+        sd: dict[str, torch.Tensor] = {}
+        for prefix, (a, b) in self._pinned_ab.items():
+            sd[f"{prefix}.lora_A.weight"] = a
+            sd[f"{prefix}.lora_B.weight"] = b
+        size = sum(t.numel() * t.element_size() for t in sd.values())
+        dtypes = {t.dtype for t in sd.values()}
+        return LoraStateDictWithStrength(
+            StateDict(sd=sd, device=torch.device("cpu"), size=size, dtype=dtypes),
+            self.strength,
+        )
 
     def get_ab(
         self,
