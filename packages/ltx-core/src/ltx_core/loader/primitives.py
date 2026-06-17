@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypeVar
 
 import torch
 
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.sd_ops import SDOps
-from ltx_core.model.model_protocol import ModelType
 
 if TYPE_CHECKING:
+    from typing_extensions import Self
+
     from ltx_core.loader.fuse_loras import FuseRule
     from ltx_core.loader.registry import Registry
+
+BuiltType = TypeVar("BuiltType", covariant=True)  # noqa: PLC0105
 
 
 # Per-key shape and dtype description for a flat collection of tensors.
@@ -50,74 +53,75 @@ class StateDictLoader(Protocol):
         """
         Load metadata from path
         """
+        ...
 
     def load(self, path: str | list[str], sd_ops: SDOps | None = None, device: torch.device | None = None) -> StateDict:
         """
         Load state dict from path or paths (for sharded model storage) and apply sd_ops
         """
+        ...
 
 
-class BuilderProtocol(Protocol[ModelType]):
+class BuilderProtocol(Protocol[BuiltType]):
     """Protocol for model builders that produce a model via ``build()``."""
 
     def build(
-        self, device: torch.device | None = None, dtype: torch.dtype | None = None, **kwargs: object
-    ) -> ModelType: ...
+        self,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+        **kwargs: Any,  # noqa: ANN401
+    ) -> BuiltType: ...
 
+    @property
+    def registry(self) -> "Registry": ...
 
-class ModelBuilderProtocol(BuilderProtocol[ModelType], Protocol[ModelType]):
-    """
-    Protocol for building PyTorch models from configuration dictionaries.
-    Implementations must provide:
-    - meta_model: Create a model from configuration dictionary and apply module operations
-    - build: Create and initialize a model from state dictionary and apply dtype transformations
-    """
-
-    model_sd_ops: SDOps | None
-    module_ops: tuple[ModuleOps, ...]
-    loras: tuple["LoraPathStrengthAndSDOps", ...]
-    registry: "Registry"
-
-    def meta_model(self, config: dict, module_ops: list[ModuleOps] | None = None) -> ModelType:
-        """
-        Create a model on the meta device from a configuration dictionary.
-        This decouples model creation from weight loading, allowing the model
-        architecture to be instantiated without allocating memory for parameters.
-        Args:
-            config: Model configuration dictionary.
-            module_ops: Optional list of module operations to apply (e.g., quantization).
-        Returns:
-            Model instance on meta device (no actual memory allocated for parameters).
-        """
-        ...
-
-    def with_sd_ops(self, sd_ops: SDOps | None) -> "ModelBuilderProtocol[ModelType]":
-        """Return a copy of this builder with the given state-dict key remapping ops."""
-        ...
-
-    def with_module_ops(self, module_ops: tuple[ModuleOps, ...]) -> "ModelBuilderProtocol[ModelType]":
-        """Return a copy of this builder with the given module operations (e.g. quantization)."""
-        ...
-
-    def with_loras(self, loras: tuple["LoraPathStrengthAndSDOps", ...]) -> "ModelBuilderProtocol[ModelType]":
-        """Return a copy of this builder with the given LoRAs to fuse at build time."""
-        ...
-
-    def with_registry(self, registry: "Registry") -> "ModelBuilderProtocol[ModelType]":
+    def with_registry(self, registry: "Registry") -> "Self":
         """Return a copy of this builder using the given weight registry for allocation."""
         ...
 
-    def with_lora_load_device(self, device: torch.device) -> "ModelBuilderProtocol[ModelType]":
+
+class ModelBuilderProtocol(BuilderProtocol[BuiltType], Protocol[BuiltType]):
+    """
+    Protocol for building PyTorch models from configuration dictionaries.
+    Implementations must provide:
+    - build: Create and initialize a model from state dictionary and apply dtype transformations
+    """
+
+    @property
+    def model_sd_ops(self) -> SDOps | None: ...
+
+    @property
+    def module_ops(self) -> tuple[ModuleOps, ...]: ...
+
+    @property
+    def loras(self) -> tuple["LoraPathStrengthAndSDOps", ...]: ...
+
+    def with_sd_ops(self, sd_ops: SDOps | None) -> "Self":
+        """Return a copy of this builder with the given state-dict key remapping ops."""
+        ...
+
+    def with_module_ops(self, module_ops: tuple[ModuleOps, ...]) -> "Self":
+        """Return a copy of this builder with the given module operations (e.g. quantization)."""
+        ...
+
+    def with_loras(self, loras: tuple["LoraPathStrengthAndSDOps", ...]) -> "Self":
+        """Return a copy of this builder with the given LoRAs to fuse at build time."""
+        ...
+
+    def with_lora_load_device(self, device: torch.device) -> "Self":
         """Return a copy of this builder that loads LoRA weights onto the given device."""
         ...
 
-    def with_fuse_rule(self, fuse_rule: "FuseRule") -> "ModelBuilderProtocol[ModelType]":
+    def with_fuse_rule(self, fuse_rule: "FuseRule") -> "Self":
         """Return a copy of this builder with the given LoRA fuse rule (e.g. from a quantization policy)."""
         ...
 
     def build(
-        self, device: torch.device | None = None, dtype: torch.dtype | None = None, **kwargs: object
-    ) -> ModelType:
+        self,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+        **kwargs: Any,  # noqa: ANN401
+    ) -> BuiltType:
         """
         Build the model
         Args:
@@ -140,8 +144,7 @@ class LoRAAdaptableProtocol(Protocol):
     - lora: Add a LoRA to the model
     """
 
-    def lora(self, lora_path: str, strength: float) -> "LoRAAdaptableProtocol":
-        pass
+    def lora(self, lora_path: str, strength: float, sd_ops: SDOps) -> "LoRAAdaptableProtocol": ...
 
 
 class LoraPathStrengthAndSDOps(NamedTuple):

@@ -1,6 +1,8 @@
+from __future__ import annotations
+
+import copy
 import logging
-from dataclasses import dataclass, field, replace
-from typing import Generic
+from typing import TYPE_CHECKING, Final, Generic
 
 import torch
 from torch import nn
@@ -20,6 +22,9 @@ from ltx_core.loader.registry import DummyRegistry, Registry
 from ltx_core.loader.sd_ops import SDOps
 from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
 from ltx_core.model.model_protocol import ModelConfigurator, ModelType
+
+if TYPE_CHECKING:
+    from typing_extensions import Self
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -78,10 +83,12 @@ def _load_model_weights(
     meta_model.load_state_dict(fused_sd, strict=False, assign=True)
 
 
-@dataclass(frozen=True)
 class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType], LoRAAdaptableProtocol):
     """
     Builder for PyTorch models residing on a single GPU.
+    The builder is immutable: ``with_*``/``lora`` return modified copies. The
+    ``ModelBuilderProtocol`` surface is exposed via read-only properties backed
+    by private attributes.
     Attributes:
         model_class_configurator: Class responsible for constructing the model from a config dict.
         model_path: Path (or tuple of shard paths) to the model's `.safetensors` checkpoint(s).
@@ -98,54 +105,106 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         fuse_rule: Per-policy LoRA merge rule. Defaults to ``bf16_fuse_rule``;
     """
 
-    model_class_configurator: type[ModelConfigurator[ModelType]]
-    model_path: str | tuple[str, ...]
-    model_sd_ops: SDOps | None = None
-    module_ops: tuple[ModuleOps, ...] = field(default_factory=tuple)
-    loras: tuple[LoraPathStrengthAndSDOps, ...] = field(default_factory=tuple)
-    model_loader: StateDictLoader = field(default_factory=SafetensorsModelStateDictLoader)
-    registry: Registry = field(default_factory=DummyRegistry)
-    lora_load_device: torch.device = field(default_factory=lambda: torch.device("cpu"))
-    fuse_rule: FuseRule = bf16_fuse_rule
+    def __init__(
+        self,
+        model_class_configurator: type[ModelConfigurator[ModelType]],
+        model_path: str | tuple[str, ...],
+        model_sd_ops: SDOps | None = None,
+        module_ops: tuple[ModuleOps, ...] = (),
+        loras: tuple[LoraPathStrengthAndSDOps, ...] = (),
+        model_loader: StateDictLoader | None = None,
+        registry: Registry | None = None,
+        lora_load_device: torch.device | None = None,
+        fuse_rule: FuseRule = bf16_fuse_rule,
+    ) -> None:
+        # Read-only: typed with the covariant ModelType, so it must not be a mutable attribute.
+        self._model_class_configurator: Final = model_class_configurator
+        self._model_path = model_path
+        self._model_sd_ops = model_sd_ops
+        self._module_ops = module_ops
+        self._loras = loras
+        self._model_loader = model_loader if model_loader is not None else SafetensorsModelStateDictLoader()
+        self._registry = registry if registry is not None else DummyRegistry()
+        self._lora_load_device = lora_load_device if lora_load_device is not None else torch.device("cpu")
+        self._fuse_rule = fuse_rule
 
-    def lora(self, lora_path: str, strength: float, sd_ops: SDOps) -> "SingleGPUModelBuilder":
-        return replace(self, loras=(*self.loras, LoraPathStrengthAndSDOps(lora_path, strength, sd_ops)))
+    @property
+    def model_sd_ops(self) -> SDOps | None:
+        return self._model_sd_ops
 
-    def with_sd_ops(self, sd_ops: SDOps | None) -> "SingleGPUModelBuilder":
-        return replace(self, model_sd_ops=sd_ops)
+    @property
+    def module_ops(self) -> tuple[ModuleOps, ...]:
+        return self._module_ops
 
-    def with_module_ops(self, module_ops: tuple[ModuleOps, ...]) -> "SingleGPUModelBuilder":
-        return replace(self, module_ops=module_ops)
+    @property
+    def loras(self) -> tuple[LoraPathStrengthAndSDOps, ...]:
+        return self._loras
 
-    def with_loras(self, loras: tuple[LoraPathStrengthAndSDOps, ...]) -> "SingleGPUModelBuilder":
-        return replace(self, loras=loras)
+    @property
+    def registry(self) -> Registry:
+        return self._registry
 
-    def with_registry(self, registry: Registry) -> "SingleGPUModelBuilder":
-        return replace(self, registry=registry)
+    @property
+    def model_path(self) -> str | tuple[str, ...]:
+        return self._model_path
 
-    def with_lora_load_device(self, device: torch.device) -> "SingleGPUModelBuilder":
-        return replace(self, lora_load_device=device)
+    @property
+    def model_loader(self) -> StateDictLoader:
+        return self._model_loader
 
-    def with_fuse_rule(self, fuse_rule: FuseRule) -> "SingleGPUModelBuilder":
-        return replace(self, fuse_rule=fuse_rule)
+    @property
+    def lora_load_device(self) -> torch.device:
+        return self._lora_load_device
+
+    @property
+    def fuse_rule(self) -> FuseRule:
+        return self._fuse_rule
+
+    def lora(self, lora_path: str, strength: float, sd_ops: SDOps) -> Self:
+        clone = copy.copy(self)
+        clone._loras = (*self._loras, LoraPathStrengthAndSDOps(lora_path, strength, sd_ops))
+        return clone
+
+    def with_sd_ops(self, sd_ops: SDOps | None) -> Self:
+        clone = copy.copy(self)
+        clone._model_sd_ops = sd_ops
+        return clone
+
+    def with_module_ops(self, module_ops: tuple[ModuleOps, ...]) -> Self:
+        clone = copy.copy(self)
+        clone._module_ops = module_ops
+        return clone
+
+    def with_loras(self, loras: tuple[LoraPathStrengthAndSDOps, ...]) -> Self:
+        clone = copy.copy(self)
+        clone._loras = loras
+        return clone
+
+    def with_registry(self, registry: Registry) -> Self:
+        clone = copy.copy(self)
+        clone._registry = registry
+        return clone
+
+    def with_lora_load_device(self, device: torch.device) -> Self:
+        clone = copy.copy(self)
+        clone._lora_load_device = device
+        return clone
+
+    def with_fuse_rule(self, fuse_rule: FuseRule) -> Self:
+        clone = copy.copy(self)
+        clone._fuse_rule = fuse_rule
+        return clone
 
     def model_config(self) -> dict:
-        return read_model_config(self.model_path, self.model_loader)
+        return read_model_config(self._model_path, self._model_loader)
 
     def meta_model(self, config: dict, module_ops: tuple[ModuleOps, ...]) -> ModelType:
-        return create_meta_model(self.model_class_configurator, config, module_ops)
+        return create_meta_model(self._model_class_configurator, config, module_ops)
 
     def load_sd(
         self, paths: list[str], registry: Registry, device: torch.device | None, sd_ops: SDOps | None = None
     ) -> StateDict:
-        return load_state_dict(paths, self.model_loader, registry, device, sd_ops)
-
-    def _return_model(self, meta_model: ModelType, device: torch.device) -> ModelType:
-        uninitialized = _check_uninitialized(meta_model)
-        if uninitialized:
-            logger.warning(f"Uninitialized parameters or buffers: {uninitialized}")
-            return meta_model
-        return meta_model.to(device)
+        return load_state_dict(paths, self._model_loader, registry, device, sd_ops)
 
     def build(
         self,
@@ -155,18 +214,23 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
     ) -> ModelType:
         device = torch.device("cuda") if device is None else device
         config = self.model_config()
-        meta_model = self.meta_model(config, self.module_ops)
+        meta_model = self.meta_model(config, self._module_ops)
 
         _load_model_weights(
             meta_model=meta_model,
-            model_path=self.model_path,
-            loras=self.loras,
-            loader=self.model_loader,
-            registry=self.registry,
+            model_path=self._model_path,
+            loras=self._loras,
+            loader=self._model_loader,
+            registry=self._registry,
             device=device,
             dtype=dtype,
-            model_sd_ops=self.model_sd_ops,
-            lora_load_device=self.lora_load_device,
-            fuse_rule=self.fuse_rule,
+            model_sd_ops=self._model_sd_ops,
+            lora_load_device=self._lora_load_device,
+            fuse_rule=self._fuse_rule,
         )
-        return self._return_model(meta_model, device)
+
+        uninitialized = _check_uninitialized(meta_model)
+        if uninitialized:
+            logger.warning(f"Uninitialized parameters or buffers: {uninitialized}")
+            return meta_model
+        return meta_model.to(device)

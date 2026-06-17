@@ -1,5 +1,4 @@
 import functools
-import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
@@ -14,8 +13,6 @@ from ltx_core.model.transformer.ops import (
     PytorchPreAttention,
 )
 from ltx_core.model.transformer.rope import LTXRopeType
-
-logger = logging.getLogger(__name__)
 
 
 def _torch_default_sdpa_priority() -> list[SDPBackend]:
@@ -76,9 +73,9 @@ class PytorchAttention(AttentionCallable):
 
     @property
     def label(self) -> str:
-        """Human-readable identifier (used in the AUTOMATIC selection log).
-        Encodes the SDPA priority list so a single-backend pin reads differently
-        from the full-priority dispatcher walk."""
+        """Human-readable identifier for this backend. Encodes the SDPA priority
+        list so a single-backend pin reads differently from the full-priority
+        dispatcher walk."""
         return f"SDPA[{'>'.join(b.name for b in self._priority)}]"
 
     def __call__(
@@ -199,10 +196,9 @@ class FlashAttention4(AttentionCallable):
 
 # --- Automatic selection -----------------------------------------------------
 # AUTOMATIC inspects installed extras and the GPU arch and returns the fastest
-# usable callable for each path. The selection runs once per process (cached)
-# and logs the resulting label once. The unmasked and masked picks are
-# independent: each calls its own helper and may end up on different backends
-# (e.g. FA3 unmasked + xFormers masked on H100).
+# usable callable for each path. The selection runs once per process (cached).
+# The unmasked and masked picks are independent: each calls its own helper and
+# may end up on different backends (e.g. FA3 unmasked + xFormers masked on H100).
 
 
 def _sdpa_can_use(backend: SDPBackend, *, with_mask: bool) -> bool:
@@ -289,20 +285,23 @@ def _select_masked_attention() -> MaskedAttentionCallable:
 
 @functools.cache
 def automatic_attention() -> AttentionCallable:
-    """Cached AUTOMATIC pick for the unmasked path. Logs the chosen label once
-    per process."""
-    fn = _select_primary_attention()
-    logger.info("Automatic attention selected: %s", fn.label)
-    return fn
+    """Cached AUTOMATIC pick for the unmasked path.
+    Cached so every ``AttentionOps`` in the process shares one instance."""
+    return _select_primary_attention()
 
 
 @functools.cache
 def automatic_masked_attention() -> MaskedAttentionCallable:
-    """Cached AUTOMATIC pick for the masked path. Logs the chosen label once
-    per process."""
-    fn = _select_masked_attention()
-    logger.info("Automatic masked attention selected: %s", fn.label)
-    return fn
+    """Cached AUTOMATIC pick for the masked path. See :func:`automatic_attention`."""
+    return _select_masked_attention()
+
+
+def attention_label(fn: AttentionCallable | MaskedAttentionCallable) -> str:
+    """Best-effort human-readable backend name.
+    Built-in callables expose ``.label`` (encoding the SDPA priority list for the
+    Pytorch backends); fall back to the class name for custom or wrapped callables
+    (e.g. the multi-GPU All2All wrappers) that don't define one."""
+    return getattr(fn, "label", type(fn).__name__)
 
 
 def _resolve_sdpa_variant(backend: SDPBackend, name: str, *, with_mask: bool) -> PytorchAttention:
@@ -342,8 +341,7 @@ class AttentionFunction(Enum):
         isn't usable on this machine -- missing package or SDPA backend rejected
         on this hardware (e.g. cuDNN under ``torch.use_deterministic_algorithms``).
         Opting in means "this kernel or fail loudly". ``AUTOMATIC`` returns the
-        cached :func:`automatic_attention` instance so the once-per-process log
-        fires only on the first resolution.
+        cached :func:`automatic_attention` instance so every build shares one callable.
         """
         match self:
             case AttentionFunction.AUTOMATIC:

@@ -45,6 +45,18 @@ class TextToVideoConfig(TrainingStrategyConfigBase):
         description="Directory name for audio latents when with_audio is True",
     )
 
+    def get_data_sources(self) -> dict[str, str]:
+        """Text-to-video training requires latents and text conditions.
+        When ``with_audio`` is True, also requires audio latents.
+        """
+        sources = {
+            "latents": "latents",
+            "conditions": "conditions",
+        }
+        if self.with_audio:
+            sources[self.audio_latents_dir] = "audio_latents"
+        return sources
+
 
 class TextToVideoStrategy(TrainingStrategy):
     """Text-to-video training strategy.
@@ -63,26 +75,6 @@ class TextToVideoStrategy(TrainingStrategy):
             config: Text-to-video configuration
         """
         super().__init__(config)
-
-    @property
-    def requires_audio(self) -> bool:
-        """Whether this training strategy requires audio components."""
-        return self.config.with_audio
-
-    def get_data_sources(self) -> list[str] | dict[str, str]:
-        """
-        Text-to-video training requires latents and text conditions.
-        When with_audio is True, also requires audio latents.
-        """
-        sources = {
-            "latents": "latents",
-            "conditions": "conditions",
-        }
-
-        if self.config.with_audio:
-            sources[self.config.audio_latents_dir] = "audio_latents"
-
-        return sources
 
     def prepare_training_inputs(
         self,
@@ -119,7 +111,6 @@ class TextToVideoStrategy(TrainingStrategy):
         batch_size = video_latents.shape[0]
         video_seq_len = video_latents.shape[1]
         device = video_latents.device
-        dtype = video_latents.dtype
 
         # Create conditioning mask (first frame conditioning)
         video_conditioning_mask = self._create_first_frame_conditioning_mask(
@@ -157,7 +148,6 @@ class TextToVideoStrategy(TrainingStrategy):
             batch_size=batch_size,
             fps=fps,
             device=device,
-            dtype=dtype,
         )
 
         # Create video Modality
@@ -187,7 +177,6 @@ class TextToVideoStrategy(TrainingStrategy):
                 prompt_attention_mask=prompt_attention_mask,
                 batch_size=batch_size,
                 device=device,
-                dtype=dtype,
             )
 
         return ModelInputs(
@@ -207,7 +196,6 @@ class TextToVideoStrategy(TrainingStrategy):
         prompt_attention_mask: Tensor,
         batch_size: int,
         device: torch.device,
-        dtype: torch.dtype,
     ) -> tuple[Modality, Tensor, Tensor]:
         """Prepare audio inputs for joint audio-video training.
         Args:
@@ -217,7 +205,6 @@ class TextToVideoStrategy(TrainingStrategy):
             prompt_attention_mask: Attention mask for context
             batch_size: Batch size
             device: Target device
-            dtype: Target dtype
         Returns:
             Tuple of (audio_modality, audio_targets, audio_loss_mask)
         """
@@ -248,7 +235,6 @@ class TextToVideoStrategy(TrainingStrategy):
             num_time_steps=audio_seq_len,
             batch_size=batch_size,
             device=device,
-            dtype=dtype,
         )
 
         # Create audio Modality

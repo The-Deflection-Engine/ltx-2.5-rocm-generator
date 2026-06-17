@@ -2,7 +2,7 @@
 Compute reference videos for IC-LoRA training.
 This script provides a command-line interface for generating reference videos to be used for IC-LoRA training.
 Note that it reads and writes to the same file (the output of caption_videos.py),
-where it adds the "reference_path" field to the JSON.
+where it adds the "reference_video" field to the JSON.
 Basic usage:
     # Compute reference videos for all videos in a directory
     compute_reference.py videos_dir/ --output videos_dir/captions.json
@@ -11,7 +11,7 @@ Basic usage:
 # Standard library imports
 import json
 from pathlib import Path
-from typing import Dict
+from typing import Any
 
 # Third-party imports
 import cv2
@@ -36,6 +36,10 @@ from ltx_trainer.video_utils import read_video, save_video
 # Initialize console and disable progress bars
 console = Console()
 disable_progress_bar()
+
+VIDEO_COLUMNS = ("video", "media_path")
+REFERENCE_VIDEO_COLUMN = "reference_video"
+LEGACY_REFERENCE_COLUMN = "reference_path"
 
 
 def compute_reference(
@@ -79,15 +83,15 @@ def compute_reference(
 
 def _get_meta_data(
     output_path: Path,
-) -> Dict[str, str]:
+) -> list[dict[str, Any]]:
     """Get set of existing reference video paths without loading the actual files.
     Args:
         output_path: Path to the reference video paths file
     Returns:
-        Dictionary mapping media paths to reference video paths
+        Dataset rows with media paths and captions
     """
     if not output_path.exists():
-        return {}
+        return []
 
     console.print(f"[bold blue]Reading meta data from [cyan]{output_path}[/]...[/]")
 
@@ -98,11 +102,18 @@ def _get_meta_data(
 
     except Exception as e:
         console.print(f"[bold yellow]Warning: Could not check meta data: {e}[/]")
-        return {}
+        return []
+
+
+def _get_media_path(item: dict[str, Any]) -> str:
+    for column in VIDEO_COLUMNS:
+        if column in item:
+            return item[column]
+    raise KeyError(f"Dataset row must contain one of {VIDEO_COLUMNS}")
 
 
 def _save_dataset_json(
-    reference_paths: Dict[str, str],
+    reference_paths: dict[str, str],
     output_path: Path,
 ) -> None:
     """Save dataset json with reference video paths.
@@ -115,17 +126,17 @@ def _save_dataset_json(
         json_data = json.load(f)
         new_json_data = json_data.copy()
         for i, item in enumerate(json_data):
-            media_path = item["media_path"]
+            media_path = _get_media_path(item)
             reference_path = reference_paths[media_path]
-            new_json_data[i]["reference_path"] = reference_path
+            new_json_data[i].pop(LEGACY_REFERENCE_COLUMN, None)
+            new_json_data[i][REFERENCE_VIDEO_COLUMN] = reference_path
 
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(new_json_data, f, indent=2, ensure_ascii=False)
 
     console.print(f"[bold green]✓[/] Reference video paths saved to [cyan]{output_path}[/]")
-    console.print("[bold yellow]Note:[/] Use these files with ImageOrVideoDataset by setting:")
-    console.print("  reference_column='[cyan]reference_path[/]'")
-    console.print("  video_column='[cyan]media_path[/]'")
+    console.print("[bold yellow]Note:[/] Reference videos were written to the '[cyan]reference_video[/]' column.")
+    console.print("  [cyan]process_dataset.py[/] detects this column automatically for IC-LoRA preprocessing.")
 
 
 def process_media(
@@ -158,7 +169,7 @@ def process_media(
     def media_path_to_reference_path(media_file: Path) -> Path:
         return media_file.parent / (media_file.stem + "_reference" + media_file.suffix)
 
-    media_files = [base_dir / Path(sample["media_path"]) for sample in meta_data]
+    media_files = [base_dir / Path(_get_media_path(sample)) for sample in meta_data]
     for media_file in media_files:
         reference_path = media_path_to_reference_path(media_file)
         media_to_process.append(media_file)
@@ -178,18 +189,23 @@ def process_media(
     )
 
     # Process media files
-    media_paths = [item["media_path"] for item in meta_data]
+    media_paths = [_get_media_path(item) for item in meta_data]
     reference_paths = {rel_path: str(media_path_to_reference_path(Path(rel_path))) for rel_path in media_paths}
 
     with progress:
         task = progress.add_task("Computing condition on videos", total=len(media_to_process))
 
-        for media_file in media_to_process:
+        for media_file, rel_path in zip(media_to_process, media_paths, strict=True):
             progress.update(task, description=f"Processing [bold blue]{media_file.name}[/]")
 
-            rel_path = str(media_file.resolve().relative_to(base_dir))
+            # Key by the original media-path string (matches the dict seeded above). Avoid
+            # resolve()/relative_to here — they crash on symlinked or absolute media paths.
             reference_path = media_path_to_reference_path(media_file)
-            reference_paths[rel_path] = str(reference_path.relative_to(base_dir))
+            try:
+                ref_stored = str(reference_path.relative_to(base_dir))
+            except ValueError:
+                ref_stored = str(reference_path)  # absolute/out-of-tree: keep it next to the source
+            reference_paths[rel_path] = ref_stored
 
             if not reference_path.resolve().exists() or override:
                 try:

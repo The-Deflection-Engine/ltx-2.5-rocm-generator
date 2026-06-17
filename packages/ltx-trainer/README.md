@@ -1,8 +1,10 @@
 # LTX-2 Trainer
 
 This package provides tools and scripts for training and fine-tuning
-Lightricks' **LTX-2** audio-video generation model. It enables LoRA training, full
-fine-tuning, and training of video-to-video transformations (IC-LoRA) on custom datasets.
+Lightricks' **LTX-2** audio-video generation model. It supports LoRA training, full
+fine-tuning, and a flexible conditioning framework covering text-to-video, text-to-audio, image-to-video,
+video extension, audio extension, video inpainting, audio inpainting, video outpainting, IC-LoRA for video, audio, and joint
+audio-video references, audio-to-video, and video-to-audio.
 
 ---
 
@@ -17,8 +19,15 @@ All detailed guides and technical documentation are in the [docs](./docs/) direc
 - [🚀 Training Guide](docs/training-guide.md)
 - [🧪 Inference Guide](../ltx-pipelines/README.md)
 - [🔧 Utility Scripts](docs/utility-scripts.md)
+- [🧩 Custom Training Strategies](docs/custom-training-strategies.md)
 - [📚 LTX-Core Documentation](../ltx-core/README.md)
 - [🛡️ Troubleshooting Guide](docs/troubleshooting.md)
+
+### 🤖 Agent-Assisted Training
+
+Use the [`train-model`](../../.claude/skills/train-model/SKILL.md) repository skill for an end-to-end guided run:
+it probes your data and hardware, chooses the matching training mode, prepares/preprocesses the dataset, launches
+training, and monitors the job while using the docs above as the source of truth.
 
 ---
 
@@ -28,7 +37,7 @@ All detailed guides and technical documentation are in the [docs](./docs/) direc
 - **Gemma Text Encoder** - Local Gemma model directory (required for LTX-2)
 - **Linux with CUDA** - CUDA 13+ recommended for optimal performance
 - **Nvidia GPU with 80GB+ VRAM** - Recommended for the standard config. For GPUs with 32GB VRAM (e.g., RTX 5090),
-  use the [low VRAM config](configs/ltx2_av_lora_low_vram.yaml) which enables INT8 quantization and other
+  use the [low VRAM config](configs/t2v_lora_low_vram.yaml) which enables INT8 quantization and other
   memory optimizations
 
 ---

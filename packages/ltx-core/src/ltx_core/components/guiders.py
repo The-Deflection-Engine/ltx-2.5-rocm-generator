@@ -253,6 +253,11 @@ class MultiModalGuider:
         and as scale * (cond - uncond) for stg, steering the denoising process away from the unconditioned
         prediction.
         """
+        dtype = cond.dtype
+        cond = cond.float()
+        uncond_text = uncond_text.float() if isinstance(uncond_text, torch.Tensor) else uncond_text
+        uncond_perturbed = uncond_perturbed.float() if isinstance(uncond_perturbed, torch.Tensor) else uncond_perturbed
+        uncond_modality = uncond_modality.float() if isinstance(uncond_modality, torch.Tensor) else uncond_modality
         pred = (
             cond
             + (self.params.cfg_scale - 1) * (cond - uncond_text)
@@ -265,7 +270,7 @@ class MultiModalGuider:
             factor = self.params.rescale_scale * factor + (1 - self.params.rescale_scale)
             pred = pred * factor
 
-        return pred
+        return pred.to(dtype)
 
     def do_unconditional_generation(self) -> bool:
         """Returns True if the guider is doing unconditional generation."""

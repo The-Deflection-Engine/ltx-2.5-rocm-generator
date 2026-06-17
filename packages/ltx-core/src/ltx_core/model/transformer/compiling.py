@@ -11,7 +11,7 @@ from ltx_core.model.transformer.transformer_args import BlockPerturbationsProces
 
 # Defaults applied inside the patched forward. Overriding via CompilationConfig
 # replaces these wholesale; it does not merge.
-_DEFAULT_INDUCTOR_CONFIG: dict[str, Any] = {"unsafe_skip_cache_dynamic_shape_guards": True}
+_DEFAULT_INDUCTOR_CONFIG: dict[str, Any] = {}
 _DEFAULT_DYNAMO_CONFIG: dict[str, Any] = {"inline_inbuilt_nn_modules": True, "cache_size_limit": 256}
 
 

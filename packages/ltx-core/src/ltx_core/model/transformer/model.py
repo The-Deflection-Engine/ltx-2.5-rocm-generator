@@ -1,9 +1,12 @@
+import logging
 from enum import Enum
 
 import torch
 
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
+from ltx_core.model.model_protocol import LTXModelProtocol
 from ltx_core.model.transformer.adaln import AdaLayerNormSingle, adaln_embedding_coefficient
+from ltx_core.model.transformer.attention import attention_label
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.transformer import (
@@ -19,6 +22,8 @@ from ltx_core.model.transformer.transformer_args import (
     TransformerArgsPreprocessor,
 )
 from ltx_core.utils import to_denoised
+
+logger = logging.getLogger(__name__)
 
 
 class LTXModelType(Enum):
@@ -70,6 +75,15 @@ class LTXModel(torch.nn.Module):
         cross_attention_adaln: bool = False,
     ):
         super().__init__()
+        # Log the attention backends this transformer is built with. Reading the resolved
+        # ``label`` off the ops reports whatever was selected -- AUTOMATIC, an explicit pin
+        # (PYTORCH/XFORMERS/FA3/FA4/SDPA_*), or a directly supplied callable -- so this is the
+        # single source of truth for which kernel a build uses. Fires once per build.
+        logger.info(
+            "Building transformer with attention backends -- self: %s, masked: %s",
+            attention_label(ops.attention_ops.attention_function),
+            attention_label(ops.attention_ops.masked_attention_function),
+        )
         self._enable_gradient_checkpointing = False
         self.cross_attention_adaln = cross_attention_adaln
         self.use_middle_indices_grid = use_middle_indices_grid
@@ -411,7 +425,7 @@ class LTXModel(torch.nn.Module):
 
     def forward(
         self, video: Modality | None, audio: Modality | None, perturbations: BatchedPerturbationConfig
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """
         Forward pass for LTX models.
         Returns:
@@ -459,7 +473,7 @@ class LegacyX0Model(torch.nn.Module):
     Returns fully denoised output based on the velocities produced by the base model.
     """
 
-    def __init__(self, velocity_model: LTXModel):
+    def __init__(self, velocity_model: LTXModelProtocol):
         super().__init__()
         self.velocity_model = velocity_model
 
@@ -488,7 +502,7 @@ class X0Model(torch.nn.Module):
     Applies scaled denoising to the video and audio according to the timesteps = sigma * denoising_mask.
     """
 
-    def __init__(self, velocity_model: LTXModel):
+    def __init__(self, velocity_model: LTXModelProtocol):
         super().__init__()
         self.velocity_model = velocity_model
 

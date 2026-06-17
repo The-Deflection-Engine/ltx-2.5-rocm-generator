@@ -58,6 +58,7 @@ Available pipeline modules:
 - `ltx_pipelines.ti2vid_two_stages` - Two-stage text/image-to-video (recommended).
 - `ltx_pipelines.ti2vid_two_stages_hq` - Two-stage text/image-to-video (different sampler, better quality).
 - `ltx_pipelines.ti2vid_one_stage` - Single-stage text/image-to-video.
+- `ltx_pipelines.t2a_one_stage` - Single-stage text-to-audio (audio-only output).
 - `ltx_pipelines.distilled` - Fast text/image-to-video pipeline using only the distilled model.
 - `ltx_pipelines.ic_lora` - Video-to-video with IC-LoRA.
 - `ltx_pipelines.keyframe_interpolation` - Keyframe interpolation.
@@ -254,6 +255,20 @@ Uses IC-LoRA on a **distilled** checkpoint with a **single** lip-dub IC-LoRA app
 
 ---
 
+### 11. T2AOneStagePipeline
+
+**Best for:** Text-to-audio — generating speech/audio only (no video) from a text prompt, e.g. driving an audio-style LoRA such as an accent LoRA.
+
+**Source**: [`src/ltx_pipelines/t2a_one_stage.py`](src/ltx_pipelines/t2a_one_stage.py)
+
+Single-stage, **audio-only** generation: the video branch is absent (`video=None`), so only the audio modality is denoised and decoded through the audio VAE + vocoder, producing a wave file. Audio duration is derived from `--num-frames` / `--frame-rate` (the same `8k+1` frame convention as video). Audio guidance (CFG/STG) is optional — the `--audio-*` flags default to the model's values; the video→audio cross-modal guidance is disabled since there is no video modality.
+
+**Extra CLI arguments (all optional, with sensible defaults):** `--num-frames`, `--frame-rate`, `--negative-prompt`, `--audio-cfg-guidance-scale`, `--audio-stg-guidance-scale`, `--audio-stg-blocks`, `--audio-rescale-scale`, `--audio-skip-step`. No `--height/--width/--image` (audio has no spatial dimensions).
+
+**Use when:** You need speech/audio from text alone, or to evaluate an audio-only LoRA (accent, voice style) without generating video.
+
+---
+
 ## 🎨 Conditioning Types
 
 Pipelines use different conditioning methods from [`ltx-core`](../ltx-core/) for controlling generation. See the [ltx-core conditioning documentation](../ltx-core/README.md#conditioning--control) for details.
@@ -398,6 +413,69 @@ By default, pipelines clean GPU memory (especially transformer weights) between 
 # In pipeline implementations, memory cleanup happens automatically
 # between stages. For custom pipelines, you can skip:
 # utils.cleanup_memory()  # Comment out if you have enough VRAM
+```
+
+### Compilation (`torch.compile`)
+
+Compiling the transformer blocks with `torch.compile` speeds up inference. It is **opt-in and off by default**. The blocks are compiled shape-polymorphically (the sequence dimension is marked dynamic), so one compiled artifact serves any token count without recompiling.
+
+**CLI** — the `--compile` flag maps directly to `CompilationConfig`:
+
+| Form | Result |
+| ---- | ------ |
+| *(flag absent)* | eager, no compilation |
+| `--compile` | compile with defaults |
+| `--compile KEY=VALUE ...` | compile, overriding individual fields |
+
+```bash
+# Defaults
+python -m ltx_pipelines.ti2vid_two_stages --compile --checkpoint-path=...
+
+# reduce-overhead captures CUDA graphs -- the main latency lever for the denoising loop.
+# Off by default because graph capture reserves static memory pools (extra VRAM), so it
+# trades memory for speed; enable it when you have headroom.
+python -m ltx_pipelines.ti2vid_two_stages --compile mode=reduce-overhead --checkpoint-path=...
+
+# Several overrides at once
+python -m ltx_pipelines.ti2vid_two_stages \
+    --compile mode=max-autotune fullgraph=true dynamic=true --checkpoint-path=...
+```
+
+| Field | Values | Default | Notes |
+| ----- | ------ | ------- | ----- |
+| `mode` | `none`, `reduce-overhead`, `max-autotune`, … | `none` | `reduce-overhead`/`max-autotune` enable CUDA graphs |
+| `backend` | `inductor`, `eager`, … | `inductor` | |
+| `fullgraph` | `true`/`false` | `false` | |
+| `dynamic` | `auto`/`true`/`false` | `auto` | the seq dim is marked dynamic regardless |
+| `inductor_config` | JSON object or path to a `.json` | `{}` | `torch._inductor.config` overrides |
+| `dynamo_config` | JSON object or path to a `.json` | `{"inline_inbuilt_nn_modules": true, "cache_size_limit": 256}` | `torch._dynamo.config` overrides |
+
+**Controlling inductor / dynamo configs.** `inductor_config` and `dynamo_config` take either an inline JSON object or a path to a `.json` file, applied via `torch._inductor.config.patch(...)` / `torch._dynamo.config.patch(...)` around the compiled forward. They **replace the defaults wholesale — they do not merge**, so when overriding `dynamo_config` re-include any defaults you want to keep:
+
+```bash
+python -m ltx_pipelines.ti2vid_two_stages \
+    --compile 'inductor_config={"max_autotune": true}' \
+              'dynamo_config={"inline_inbuilt_nn_modules": true, "cache_size_limit": 256, "recompile_limit": 32}' \
+    --checkpoint-path=...
+```
+
+**Programmatically**, pass a `CompilationConfig` to the pipeline:
+
+```python
+from ltx_core.model.transformer.compiling import CompilationConfig
+
+pipeline = TI2VidTwoStagesPipeline(
+    ...,
+    compilation_config=CompilationConfig(mode="reduce-overhead"),
+)
+```
+
+**Faster cache loads: `unsafe_skip_cache_dynamic_shape_guards` (unsafe, opt-in).** Inductor's FX-graph cache re-checks the dynamic-shape guards stored with each entry on every lookup. Setting this flag skips that re-check (every entry is treated as a guard hit), which speeds up warm and cross-process cache loads. It is **not enabled by default** because it is a correctness hazard: a kernel first compiled at a small sequence length keeps int32 address arithmetic, and reusing it at a larger sequence length (roughly **>58k tokens/rank**) overflows int32 and reads out of bounds — surfacing as a CUDA illegal memory access or silently corrupted output. Only enable it when your token counts stay within the range the cached kernels were compiled for:
+
+```bash
+python -m ltx_pipelines.ti2vid_two_stages \
+    --compile 'inductor_config={"unsafe_skip_cache_dynamic_shape_guards": true}' \
+    --checkpoint-path=...
 ```
 
 ### Denoising Loop Optimization

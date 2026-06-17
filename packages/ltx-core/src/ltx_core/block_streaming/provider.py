@@ -3,37 +3,28 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from typing import NamedTuple
 
 import torch
 
 from ltx_core.block_streaming.disk import LoraSource
-from ltx_core.block_streaming.pool import WeightPool
+from ltx_core.block_streaming.pool import BufferPool
 from ltx_core.block_streaming.source import WeightSource
+from ltx_core.block_streaming.utils import carve_buffer, layout_nbytes
 from ltx_core.loader.fuse_loras import FuseRule, aggregate_lora_products, bf16_fuse_rule
 from ltx_core.loader.primitives import StateDict
 
 _EMPTY_STATE_DICT = StateDict(sd={}, device=torch.device("cpu"), size=0, dtype=set())
 
 
-def _contiguous_byte_view(weights: dict[str, torch.Tensor]) -> torch.Tensor | None:
-    """Return a ``uint8`` view spanning every tensor in *weights*, or ``None`` if
-    they don't share one contiguous storage region."""
-    tensors = list(weights.values())
-    if not tensors:
-        return None
-    storage = tensors[0].untyped_storage()
-    storage_ptr = storage.data_ptr()
-    start = end = tensors[0].storage_offset() * tensors[0].element_size()
-    for t in tensors:
-        if t.untyped_storage().data_ptr() != storage_ptr or not t.is_contiguous():
-            return None
-        offset = t.storage_offset() * t.element_size()
-        nbytes = t.numel() * t.element_size()
-        start = min(start, offset)
-        end = max(end, offset + nbytes)
-    view = torch.empty(0, dtype=torch.uint8, device=tensors[0].device)
-    view.set_(storage, start, (end - start,), (1,))
-    return view
+class CachedBlock(NamedTuple):
+    """A cached GPU block: the raw pool slot plus the carved per-key views.
+    The raw slot is what is returned to the pool on eviction; the views are
+    what callers consume.
+    """
+
+    raw: torch.Tensor
+    views: dict[str, torch.Tensor]
 
 
 class WeightsProvider:
@@ -51,7 +42,7 @@ class WeightsProvider:
 
     def __init__(
         self,
-        pool: WeightPool,
+        pool: BufferPool,
         copy_stream: torch.cuda.Stream,
         target_device: torch.device,
         source: WeightSource,
@@ -61,7 +52,7 @@ class WeightsProvider:
     ) -> None:
         self._copy_stream = copy_stream
         self._pool = pool
-        self._cache: OrderedDict[int, dict[str, torch.Tensor]] = OrderedDict()
+        self._cache: OrderedDict[int, CachedBlock] = OrderedDict()
         self._events: dict[int, torch.cuda.Event] = {}
         self._target_device = target_device
         self._source = source
@@ -72,40 +63,45 @@ class WeightsProvider:
     def get(self, idx: int) -> dict[str, torch.Tensor]:
         """Return GPU weights for block *idx*. Does H2D copy on miss."""
         if idx in self._cache:
-            return self._cache[idx]
+            return self._cache[idx].views
 
         # Evict oldest GPU buffer if at capacity.
         if len(self._cache) >= self._pool.capacity:
-            evicted_idx, evicted_weights = self._cache.popitem(last=False)
-            self._pool.release(evicted_weights, event=self._events.pop(evicted_idx, None))
+            evicted_idx, evicted = self._cache.popitem(last=False)
+            self._pool.release(evicted.raw, event=self._events.pop(evicted_idx, None))
 
-        gpu_weights = self._pool.acquire()
-        cpu_weights = self._source.get(idx)
+        layout = self._source.block_layout(idx)
+        raw = self._pool.acquire()
+        gpu_weights = carve_buffer(raw, layout)
+        cpu_buffer = self._source.get(idx)
 
-        h2d_event = self._copy_to_gpu(idx, gpu_weights, cpu_weights)
+        h2d_event = self._copy_to_gpu(idx, raw, gpu_weights, cpu_buffer, layout_nbytes(layout))
         self._source.release(idx, event=h2d_event)
 
-        self._cache[idx] = gpu_weights
+        self._cache[idx] = CachedBlock(raw, gpu_weights)
         return gpu_weights
 
     def _copy_to_gpu(
         self,
         idx: int,
+        raw: torch.Tensor,
         gpu_weights: dict[str, torch.Tensor],
-        cpu_weights: dict[str, torch.Tensor],
+        cpu_buffer: torch.Tensor,
+        nbytes: int,
     ) -> torch.cuda.Event:
         """Enqueue H2D copy + LoRA fusion on the copy stream and wait on compute.
-        The wait is intentionally inside this method so callers -- and
-        instrumentation regions wrapping it -- observe the full transfer time.
+        *cpu_buffer* is one contiguous source buffer carved by the same layout as
+        *raw*, so a single byte copy of its leading *nbytes* reproduces every view
+        in *gpu_weights*. The wait is intentionally inside this method so callers --
+        and instrumentation regions wrapping it -- observe the full transfer time.
         """
+        if not cpu_buffer.is_contiguous() or cpu_buffer.dtype != torch.uint8 or cpu_buffer.numel() < nbytes:
+            raise ValueError(
+                f"source buffer for block {idx} must be a contiguous uint8 buffer of >= {nbytes} bytes, "
+                f"got {cpu_buffer.dim()}-D {cpu_buffer.dtype} with {cpu_buffer.numel()} elements"
+            )
         with torch.cuda.stream(self._copy_stream):
-            gpu_view = _contiguous_byte_view(gpu_weights)
-            cpu_view = _contiguous_byte_view(cpu_weights)
-            if gpu_view is not None and cpu_view is not None and gpu_view.numel() == cpu_view.numel():
-                gpu_view.copy_(cpu_view, non_blocking=True)
-            else:
-                for name, gpu_tensor in gpu_weights.items():
-                    gpu_tensor.copy_(cpu_weights[name], non_blocking=True)
+            raw[:nbytes].copy_(cpu_buffer[:nbytes], non_blocking=True)
             if self._lora_sources:
                 self._fuse_block_loras(idx, gpu_weights)
             h2d_event = torch.cuda.Event()

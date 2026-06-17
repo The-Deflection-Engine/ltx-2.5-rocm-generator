@@ -1,21 +1,24 @@
 # =============================================================================
-# LTX-2 Audio-Video LoRA Training Configuration
+# LTX-2 Video-to-Video (IC-LoRA) Training Configuration
 # =============================================================================
 #
-# This configuration is for training LoRA adapters on the LTX-2 model for
-# text-to-video generation. It supports both video-only and joint audio-video
-# training modes.
+# This configuration is for training In-Context LoRA (IC-LoRA) adapters that
+# enable video-to-video transformations. IC-LoRA learns to apply visual
+# transformations (e.g., depth-to-video, pose control, style transfer, etc.)
+# by conditioning on reference videos.
 #
-# Use this configuration when you want to:
-#   - Fine-tune LTX-2 on your own video dataset
-#   - Train with or without audio generation
-#   - Create custom video generation styles or audiovisual concepts
+# Key differences from text-to-video LoRA:
+#   - Uses reference videos as conditioning input alongside text prompts
+#   - Requires preprocessed reference latents in addition to target latents
+#   - Validation requires reference videos to demonstrate the transformation
 #
-# Dataset structure for text-to-video training:
+# Dataset structure for IC-LoRA training:
 #   preprocessed_data_root/
-#   ├── latents/        # Video latents (VAE-encoded videos)
-#   ├── conditions/     # Text embeddings for each video
-#   └── audio_latents/  # Audio latents (only if with_audio: true)
+#   ├── latents/           # Target video latents (what the model learns to generate)
+#   ├── conditions/        # Text embeddings for each video
+#   └── reference_latents/ # Reference video latents (conditioning input)
+#
+# Dataset metadata columns: video, reference_video, caption
 #
 # =============================================================================
 
@@ -33,7 +36,7 @@ model:
   text_encoder_path: "path/to/gemma-text-encoder"
 
   # Training mode: "lora" for efficient adapter training, "full" for full fine-tuning
-  # LoRA is recommended for most use cases (faster, less memory, prevents overfitting)
+  # IC-LoRA reference conditioning is intended for LoRA adapter training.
   training_mode: "lora"
 
   # Optional: Path to resume training from a checkpoint
@@ -46,7 +49,7 @@ model:
 # Controls the Low-Rank Adaptation parameters for efficient fine-tuning.
 lora:
   # Rank of the LoRA matrices (higher = more capacity but more parameters)
-  # Typical values: 8, 16, 32, 64. Start with 32 for general fine-tuning.
+  # Typical values: 8, 16, 32, 64. Start with 16-32 for IC-LoRA.
   rank: 32
 
   # Alpha scaling factor (usually set equal to rank)
@@ -65,52 +68,70 @@ lora:
   #   - attn2.to_k, attn2.to_q, attn2.to_v, attn2.to_out.0  (video cross-attention to text)
   #   - ff.net.0.proj, ff.net.2                             (video feed-forward)
   #
-  # AUDIO MODULES:
+  # AUDIO MODULES (not used for video-only IC-LoRA):
   #   - audio_attn1.to_k, audio_attn1.to_q, audio_attn1.to_v, audio_attn1.to_out.0  (audio self-attention)
   #   - audio_attn2.to_k, audio_attn2.to_q, audio_attn2.to_v, audio_attn2.to_out.0  (audio cross-attention to text)
   #   - audio_ff.net.0.proj, audio_ff.net.2                                         (audio feed-forward)
   #
-  # AUDIO-VIDEO CROSS-ATTENTION MODULES (for cross-modal interaction):
+  # AUDIO-VIDEO CROSS-ATTENTION MODULES (for cross-modal interaction, not used for video-only IC-LoRA):
   #   - audio_to_video_attn.to_k, audio_to_video_attn.to_q, audio_to_video_attn.to_v, audio_to_video_attn.to_out.0
   #       (Q from video, K/V from audio - allows video to attend to audio features)
   #   - video_to_audio_attn.to_k, video_to_audio_attn.to_q, video_to_audio_attn.to_v, video_to_audio_attn.to_out.0
   #       (Q from audio, K/V from video - allows audio to attend to video features)
   #
-  # Using short patterns like "to_k" matches ALL attention modules (video, audio, and cross-modal).
-  # For audio-video training, this is the recommended approach.
+  # For IC-LoRA (video-only), we explicitly target video modules.
+  # Including FFN layers often improves transformation quality.
   target_modules:
-    # Attention layers (matches both video and audio branches)
-    - "to_k"
-    - "to_q"
-    - "to_v"
-    - "to_out.0"
-    # Uncomment below to also train feed-forward layers (can increase the LoRA's capacity):
-    # - "ff.net.0.proj"
-    # - "ff.net.2"
-    # - "audio_ff.net.0.proj"
-    # - "audio_ff.net.2"
+    # Video self-attention
+    - "attn1.to_k"
+    - "attn1.to_q"
+    - "attn1.to_v"
+    - "attn1.to_out.0"
+    # Video cross-attention
+    - "attn2.to_k"
+    - "attn2.to_q"
+    - "attn2.to_v"
+    - "attn2.to_out.0"
+    # Video feed-forward (often improves transformation quality)
+    - "ff.net.0.proj"
+    - "ff.net.2"
 
 # -----------------------------------------------------------------------------
 # Training Strategy Configuration
 # -----------------------------------------------------------------------------
-# Defines the text-to-video training approach.
+# Defines the video-to-video (IC-LoRA) training approach using the unified
+# flexible strategy. Reference conditioning concatenates pre-encoded reference
+# video latents to the target sequence. Reference tokens participate in
+# bidirectional self-attention but receive no noise and are excluded from loss.
 training_strategy:
-  # Strategy name: "text_to_video" for standard text-to-video training
-  name: "text_to_video"
+  # Strategy name: "flexible" for the unified conditioning framework
+  # Supports all training modes (T2V, I2V, V2V, A2V, V2A, etc.) through
+  # modality-specific configuration blocks.
+  name: "flexible"
 
-  # Probability of conditioning on the first frame during training
-  # Higher values train the model to perform better in image-to-video (I2V) mode,
-  # where a clean first frame is provided and the model generates the rest of the video
-  # Increase this value to train the model to perform better in image-to-video (I2V) mode
-  first_frame_conditioning_p: 0.5
+  # Video modality configuration
+  video:
+    # Whether the model generates video (true) or uses it as frozen conditioning (false)
+    is_generated: true
+    # Directory name (within preprocessed_data_root) containing target video latents
+    latents_dir: "latents"
 
-  # Enable joint audio-video training
-  # Set to true if your dataset includes audio and you want to train the audio branch
-  with_audio: true
+    # Conditions applied to the video modality during training
+    conditions:
+      # Reference conditioning (IC-LoRA): concatenates pre-encoded reference video
+      # latents to the target sequence. The model learns to transform the reference
+      # into the target video based on the text prompt.
+      - type: reference
+        # Directory name (within preprocessed_data_root) containing reference video latents
+        # These are the conditioning inputs that guide the transformation
+        latents_dir: "reference_latents"
+        # Probability of applying reference conditioning per training sample
+        probability: 1.0
 
-  # Directory name (within preprocessed_data_root) containing audio latents
-  # Only used when with_audio is true
-  audio_latents_dir: "audio_latents"
+      # Optional first-frame conditioning to improve I2V capabilities
+      # At low probability, this teaches the model to also accept first-frame input
+      - type: first_frame
+        probability: 0.2
 
 # -----------------------------------------------------------------------------
 # Optimization Configuration
@@ -119,10 +140,10 @@ training_strategy:
 optimization:
   # Learning rate for the optimizer
   # Typical range for LoRA: 1e-5 to 1e-4
-  learning_rate: 1e-4
+  learning_rate: 2e-4
 
   # Total number of training steps
-  steps: 2000
+  steps: 3000
 
   # Batch size per GPU
   # Reduce if running out of memory
@@ -166,10 +187,11 @@ acceleration:
   # Useful when GPU memory is limited
   load_text_encoder_in_8bit: false
 
-  # Offload optimizer state to CPU during validation video sampling.
-  # Helps avoid OOM when VAE decoder + transformer + optimizer state can't coexist
-  # on the GPU (full fine-tune, high-rank LoRA). No effect for FSDP.
+  # Offload optimizer state to CPU during validation video sampling and restore it after.
+  # Frees VRAM for the VAE decoder when optimizer state is large (full fine-tune, high-rank
+  # LoRA). No effect under FSDP (sharded state).
   offload_optimizer_during_validation: false
+
 
 # -----------------------------------------------------------------------------
 # Data Configuration
@@ -177,7 +199,7 @@ acceleration:
 # Specifies the training data location and loading parameters.
 data:
   # Root directory containing preprocessed training data
-  # Should contain: latents/, conditions/, and optionally audio_latents/
+  # Should contain: latents/, conditions/, and reference_latents/ subdirectories
   preprocessed_data_root: "/path/to/preprocessed/data"
 
   # Number of worker processes for data loading
@@ -187,28 +209,51 @@ data:
 # -----------------------------------------------------------------------------
 # Validation Configuration
 # -----------------------------------------------------------------------------
-# Controls validation video generation during training.
+# Controls validation sampling during training.
 # NOTE: Validation sampling use simplified inference pipelines and prioritizes speed over
 # maximum quality. For production-quality inference, use `packages/ltx-pipelines`.
 validation:
-  # Text prompts for validation video generation
-  # Provide prompts representative of your training data
-  # LTX-2 prefers longer, detailed prompts that describe both visual content and audio
-  prompts:
-    - "A woman with long brown hair sits at a wooden desk in a cozy home office, typing on a laptop while occasionally glancing at notes beside her. Soft natural light streams through a large window, casting warm shadows across the room. She pauses to take a sip from a ceramic mug, then continues working with focused concentration. The audio captures the gentle clicking of keyboard keys, the soft rustle of papers, and ambient room tone with occasional distant bird chirps from outside."
-    - "A chef in a white uniform stands in a professional kitchen, carefully plating a gourmet dish with precise movements. Steam rises from freshly cooked vegetables as he arranges them with tweezers. The stainless steel surfaces gleam under bright overhead lights, and various pots simmer on the stove behind him. The audio features the sizzling of pans, the clinking of utensils against plates, and the ambient hum of kitchen ventilation."
+  # Validation samples — each sample describes a self-contained generation request.
+  # For IC-LoRA, each sample includes a reference condition pointing to the conditioning video.
+  samples:
+    - prompt: >-
+        A man in a casual blue jacket walks along a winding path through a lush green park on a
+        bright sunny afternoon. Tall oak trees line the pathway, their leaves rustling gently in
+        the breeze. Dappled sunlight creates shifting patterns on the ground as he strolls at a
+        relaxed pace, occasionally looking up at the scenery around him. The audio captures
+        footsteps on gravel, birds singing in the trees, distant children playing, and the soft
+        whisper of wind through the foliage.
+      conditions:
+        - type: reference
+          video: "/path/to/reference_video_1.mp4"
+          # Set these to match --reference-downscale-factor / --reference-temporal-scale-factor
+          # if reference latents were preprocessed at reduced spatial or temporal resolution.
+          downscale_factor: 1
+          temporal_scale_factor: 1
+          include_in_output: true
+    - prompt: >-
+        A fluffy orange tabby cat sits perfectly still on a wooden windowsill, its green eyes
+        intently tracking small birds hopping on a branch just outside the glass. The cat's ears
+        twitch and rotate, following every movement. Warm afternoon light illuminates its fur,
+        creating a soft golden glow. Behind the cat, a cozy living room with a bookshelf and
+        houseplants is visible. The audio features gentle purring, occasional soft meows, muffled
+        bird chirps through the window, and quiet ambient room sounds.
+      conditions:
+        - type: reference
+          video: "/path/to/reference_video_2.mp4"
+          # Set these to match --reference-downscale-factor / --reference-temporal-scale-factor
+          # if reference latents were preprocessed at reduced spatial or temporal resolution.
+          downscale_factor: 1
+          temporal_scale_factor: 1
+          include_in_output: true
 
   # Negative prompt to avoid unwanted artifacts
   negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"
 
-  # Optional: First frame images for image-to-video validation
-  # If provided, must have one image per prompt
-  images: null
-
   # Output video dimensions [width, height, frames]
   # Width and height must be divisible by 32
   # Frames must satisfy: frames % 8 == 1 (e.g., 1, 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, ...)
-  video_dims: [ 576, 576, 89 ]
+  video_dims: [ 512, 512, 81 ]
 
   # Frame rate for generated videos
   frame_rate: 25.0
@@ -232,12 +277,11 @@ validation:
   # STG is combined with CFG for better temporal coherence
   stg_scale: 1.0  # Recommended: 1.0 (0.0 disables STG)
   stg_blocks: [29]  # Recommended: single block 29
-  stg_mode: "stg_av"  # "stg_av" perturbs both audio and video, "stg_v" video only
+  stg_mode: "stg_v"  # "stg_v" for video-only (no audio training)
 
   # Whether to generate audio in validation samples
-  # Independent of training_strategy.with_audio - you can generate audio
-  # in validation even when not training the audio branch
-  generate_audio: true
+  # Can be enabled even when not training the audio branch
+  generate_audio: false
 
   # Skip validation at the beginning of training (step 0)
   skip_initial_validation: false
@@ -253,7 +297,7 @@ checkpoints:
 
   # Number of most recent checkpoints to keep
   # Set to -1 to keep all checkpoints
-  keep_last_n: -1
+  keep_last_n: 3
 
   # Precision to use when saving checkpoint weights
   # Options: "bfloat16" (default, smaller files) or "float32" (full precision)
@@ -279,7 +323,7 @@ hub:
   # Whether to push the trained model to the Hub
   push_to_hub: false
 
-  # Repository ID on Hugging Face Hub (e.g., "username/my-lora-model")
+  # Repository ID on Hugging Face Hub (e.g., "username/my-ic-lora-model")
   # Required if push_to_hub is true
   hub_model_id: null
 
@@ -298,9 +342,9 @@ wandb:
   entity: null
 
   # Tags to help organize runs
-  tags: [ "ltx2", "lora" ]
+  tags: [ "ltx2", "ic-lora", "v2v" ]
 
-  # Log validation videos to W&B
+  # Log validation media (video/audio) to W&B
   log_validation_videos: true
 
 # -----------------------------------------------------------------------------
@@ -312,4 +356,4 @@ wandb:
 seed: 42
 
 # Directory to save outputs (checkpoints, validation videos, logs)
-output_dir: "outputs/ltx2_av_lora"
+output_dir: "outputs/v2v_ic_lora"

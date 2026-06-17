@@ -14,6 +14,7 @@ from ltx_core.types import Audio, VideoPixelShape
 from ltx_pipelines.iclora_utils import (
     append_ic_lora_reference_video_conditionings,
     read_lora_reference_downscale_factor,
+    read_lora_reference_temporal_scale_factor,
 )
 from ltx_pipelines.utils.args import (
     ImageConditioningInput,
@@ -102,10 +103,11 @@ class ICLoraPipeline:
         self.video_decoder = VideoDecoder(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
         self.audio_decoder = AudioDecoder(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
 
-        # Read reference downscale factor from LoRA metadata.
-        # IC-LoRAs trained with low-resolution reference videos store this factor
-        # so inference can resize reference videos to match training conditions.
+        # Read reference scale factors from LoRA metadata.
+        # IC-LoRAs trained with scaled reference videos store these factors
+        # so inference can resize/subsample reference videos to match training conditions.
         self.reference_downscale_factor = 1
+        self.reference_temporal_scale_factor = 1
         for lora in loras:
             scale = read_lora_reference_downscale_factor(lora.path)
             if scale != 1:
@@ -116,6 +118,15 @@ class ICLoraPipeline:
                         f"specifies {scale}. Cannot combine LoRAs with different reference scales."
                     )
                 self.reference_downscale_factor = scale
+            temporal = read_lora_reference_temporal_scale_factor(lora.path)
+            if temporal != 1:
+                if self.reference_temporal_scale_factor not in (1, temporal):
+                    raise ValueError(
+                        f"Conflicting reference_temporal_scale_factor values in LoRAs: "
+                        f"already have {self.reference_temporal_scale_factor}, but {lora.path} "
+                        f"specifies {temporal}. Cannot combine LoRAs with different temporal scales."
+                    )
+                self.reference_temporal_scale_factor = temporal
 
     def __call__(  # noqa: PLR0913
         self,
@@ -318,6 +329,7 @@ class ICLoraPipeline:
             dtype=self.dtype,
             device=self.device,
             reference_downscale_factor=self.reference_downscale_factor,
+            reference_temporal_scale_factor=self.reference_temporal_scale_factor,
             conditioning_attention_strength=conditioning_attention_strength,
             conditioning_attention_mask=conditioning_attention_mask,
             tiling_config=None,

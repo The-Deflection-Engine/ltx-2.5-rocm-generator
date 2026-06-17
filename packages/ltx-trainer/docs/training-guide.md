@@ -8,7 +8,7 @@ model uploads.
 After preprocessing your dataset and preparing a configuration file, you can start training using the trainer script:
 
 ```bash
-uv run python scripts/train.py configs/ltx2_av_lora.yaml
+uv run python scripts/train.py configs/t2v_lora.yaml
 ```
 
 The trainer will:
@@ -19,19 +19,31 @@ The trainer will:
 4. **Generate validation videos** (if configured)
 5. **Save the trained weights** in your output directory
 
+### Agent-Assisted Training
+
+If your environment supports repository skills, the
+[`train-model`](../../../.claude/skills/train-model/SKILL.md) skill provides an end-to-end
+orchestrator for this package. It asks what you want the model to learn, maps that intent to
+one of the documented [training modes](training-modes.md), probes your filesystem and GPU,
+prepares/preprocesses the dataset, writes a run-specific config, launches training, and
+monitors the job. It uses the trainer docs as its source of truth and stops for approval before
+captioning, preprocessing, or starting expensive training work.
+
 ### Output Files
 
 **For LoRA training:**
 
-- `lora_weights.safetensors` - Main LoRA weights file
+- `checkpoints/lora_weights_step_00000.safetensors` - LoRA checkpoint weights, with the current step in the filename
 - `training_config.yaml` - Copy of training configuration
-- `validation_samples/` - Generated validation videos (if enabled)
+- `samples/` - Generated validation samples (if enabled)
+- `checkpoints/training_state_step_00000.pt` - Optional resume state, depending on `checkpoints.save_training_state`
 
 **For full model fine-tuning:**
 
-- `model_weights.safetensors` - Full model weights
+- `checkpoints/model_weights_step_00000.safetensors` - Full model checkpoint weights, with the current step in the filename
 - `training_config.yaml` - Copy of training configuration
-- `validation_samples/` - Generated validation videos (if enabled)
+- `samples/` - Generated validation samples (if enabled)
+- `checkpoints/training_state_step_00000.pt` - Optional resume state, depending on `checkpoints.save_training_state`
 
 ## 🖥️ Distributed / Multi-GPU Training
 
@@ -62,22 +74,22 @@ Launch with a specific config using `--config_file`:
 # DDP (2 GPUs shown as example)
 CUDA_VISIBLE_DEVICES=0,1 \
 uv run accelerate launch --config_file configs/accelerate/ddp.yaml \
-  scripts/train.py configs/ltx2_av_lora.yaml
+  scripts/train.py configs/t2v_lora.yaml
 
 # DDP + torch.compile
 CUDA_VISIBLE_DEVICES=0,1 \
 uv run accelerate launch --config_file configs/accelerate/ddp_compile.yaml \
-  scripts/train.py configs/ltx2_av_lora.yaml
+  scripts/train.py configs/t2v_lora.yaml
 
 # FSDP (4 GPUs shown as example)
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 uv run accelerate launch --config_file configs/accelerate/fsdp.yaml \
-  scripts/train.py configs/ltx2_av_lora.yaml
+  scripts/train.py configs/t2v_lora.yaml
 
 # FSDP + torch.compile
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 uv run accelerate launch --config_file configs/accelerate/fsdp_compile.yaml \
-  scripts/train.py configs/ltx2_av_lora.yaml
+  scripts/train.py configs/t2v_lora.yaml
 ```
 
 **Notes:**
@@ -93,13 +105,13 @@ If you prefer to use your default Accelerate profile:
 
 ```bash
 # Use settings from your default accelerate config
-uv run accelerate launch scripts/train.py configs/ltx2_av_lora.yaml
+uv run accelerate launch scripts/train.py configs/t2v_lora.yaml
 
 # Override number of processes on the fly (e.g., 2 GPUs)
-uv run accelerate launch --num_processes 2 scripts/train.py configs/ltx2_av_lora.yaml
+uv run accelerate launch --num_processes 2 scripts/train.py configs/t2v_lora.yaml
 
 # Select specific GPUs
-CUDA_VISIBLE_DEVICES=0,1 uv run accelerate launch scripts/train.py configs/ltx2_av_lora.yaml
+CUDA_VISIBLE_DEVICES=0,1 uv run accelerate launch scripts/train.py configs/t2v_lora.yaml
 ```
 
 > [!TIP]

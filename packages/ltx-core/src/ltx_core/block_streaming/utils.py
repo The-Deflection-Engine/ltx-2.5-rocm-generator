@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import weakref
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 from torch import nn
@@ -84,7 +84,7 @@ def _alloc_pinned_exact(nbytes: int) -> torch.Tensor | None:
     return buf
 
 
-def _alloc_buffer(nbytes: int, device: torch.device | None, pin_memory: bool) -> torch.Tensor:
+def alloc_buffer(nbytes: int, device: torch.device | None, pin_memory: bool) -> torch.Tensor:
     """Allocate one ``uint8`` buffer for :func:`allocate_layout_views`.
     For pinned host buffers, prefer ``cudaHostRegister`` to dodge the caching
     allocator's power-of-2 rounding. Falls back to the caching allocator if
@@ -112,6 +112,47 @@ class _TensorSlice:
         return math.prod(self.shape) * self.dtype.itemsize
 
 
+class LayoutSlices(NamedTuple):
+    """Per-key tensor slices of a layout plus the total aligned buffer size."""
+
+    slices: dict[str, _TensorSlice]
+    nbytes: int
+
+
+def _layout_slices(layout: TensorLayout) -> LayoutSlices:
+    """Compute the byte offset of each key in *layout* and the total aligned size.
+    The size is at least one byte so empty layouts still produce a valid buffer.
+    """
+    slices: dict[str, _TensorSlice] = {}
+    cursor = 0
+    for key, (shape, dtype) in layout.items():
+        cursor = _align_up(cursor, _BUFFER_ALIGN)
+        slices[key] = _TensorSlice(offset=cursor, shape=shape, dtype=dtype)
+        cursor += slices[key].size()
+    return LayoutSlices(slices, max(_align_up(cursor, _BUFFER_ALIGN), 1))
+
+
+def layout_nbytes(layout: TensorLayout) -> int:
+    """Byte size of one contiguous, 16-byte-aligned buffer holding *layout* (>= 1)."""
+    return _layout_slices(layout).nbytes
+
+
+def carve_buffer(buffer: torch.Tensor, layout: TensorLayout) -> dict[str, torch.Tensor]:
+    """Carve per-key tensor views for *layout* into the front of *buffer*.
+    *buffer* is a 1-D ``uint8`` tensor at least :func:`layout_nbytes` long. Each
+    returned tensor is a non-overlapping slice of its leading bytes reinterpreted
+    at the requested shape and dtype; any trailing bytes are left unused. That
+    slack is what lets one max-sized pool slot hold a smaller (heterogeneous)
+    block. The views keep *buffer*'s storage alive via PyTorch refcounting.
+    """
+    if buffer.dtype != torch.uint8 or buffer.dim() != 1:
+        raise ValueError(f"carve_buffer expects a 1-D uint8 buffer, got {buffer.dim()}-D {buffer.dtype}")
+    slices, nbytes = _layout_slices(layout)
+    if buffer.numel() < nbytes:
+        raise ValueError(f"buffer too small to carve layout: need {nbytes} bytes, got {buffer.numel()}")
+    return {key: buffer[s.offset : s.offset + s.size()].view(s.dtype).view(s.shape) for key, s in slices.items()}
+
+
 def allocate_layout_views(
     layout: TensorLayout,
     device: torch.device | None = None,
@@ -123,12 +164,5 @@ def allocate_layout_views(
     requested shape and dtype. The views keep the underlying storage alive
     via PyTorch refcounting — drop them all to release the memory.
     """
-    slices: dict[str, _TensorSlice] = {}
-    cursor = 0
-    for key, (shape, dtype) in layout.items():
-        cursor = _align_up(cursor, _BUFFER_ALIGN)
-        slices[key] = _TensorSlice(offset=cursor, shape=shape, dtype=dtype)
-        cursor += slices[key].size()
-    # Allocate at least one byte so empty layouts still produce a valid buffer.
-    buffer = _alloc_buffer(max(_align_up(cursor, _BUFFER_ALIGN), 1), device, pin_memory)
-    return {key: buffer[s.offset : s.offset + s.size()].view(s.dtype).view(s.shape) for key, s in slices.items()}
+    buffer = alloc_buffer(layout_nbytes(layout), device, pin_memory)
+    return carve_buffer(buffer, layout)

@@ -51,7 +51,7 @@ class AudioConditionByReferenceLatent:
         )
 
         return LatentState(
-            latent=torch.cat([latent_state.latent, tokens], dim=1),
+            latent=torch.cat([latent_state.latent, torch.zeros_like(tokens)], dim=1),
             denoise_mask=torch.cat([latent_state.denoise_mask, denoise_mask], dim=1),
             positions=torch.cat([latent_state.positions, self.positions], dim=2),
             clean_latent=torch.cat([latent_state.clean_latent, tokens], dim=1),

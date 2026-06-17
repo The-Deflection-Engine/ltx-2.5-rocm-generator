@@ -1,165 +1,167 @@
 # Training Modes Guide
 
-The trainer supports several training modes, each suited for different use cases and requirements.
+The trainer uses the **flexible** training strategy (`name: "flexible"`) — a unified conditioning framework that
+supports all training modes through configuration. Every scenario is expressed by setting `is_generated` on each
+modality and adding optional conditions, rather than choosing a separate strategy class.
 
-## 🎯 Standard LoRA Training (Video-Only)
+## Key Concepts
 
-Standard LoRA (Low-Rank Adaptation) training fine-tunes the model by adding small, trainable adapter layers while
-keeping the base model frozen. This approach:
+Before diving into individual modes, here are the core ideas behind the flexible strategy:
 
-- **Requires significantly less memory and compute** than full fine-tuning
-- **Produces small, portable weight files** (typically a few hundred MB)
-- **Is ideal for learning specific styles, effects, or concepts**
-- **Can be easily combined with other LoRAs** during inference
+- **`is_generated: true`** — the modality is denoised during training and contributes to the loss. This is the
+  modality the model learns to generate.
+- **`is_generated: false`** — the modality is frozen (sigma=0, no noise, no loss). It passes through the transformer
+  clean and acts as cross-modal conditioning for the generated modality.
+- **At least one modality must have `is_generated: true`.**
+- **Conditions** are per-modality and can be composed (e.g., `reference` + `first_frame` together on the video
+  modality).
+- Audio does **not** support `first_frame` or `spatial_crop` conditions — only `prefix`, `suffix`, `mask`,
+  and `reference`.
 
-Configure standard LoRA training with:
+> [!TIP]
+> If you are using an agent-enabled environment with repository skills and are unsure which mode to choose,
+> ask for the [`train-model`](../../../.claude/skills/train-model/SKILL.md) skill. It maps your intent to one of
+> these configs and walks through dataset preparation, preprocessing, launch, and monitoring.
+
+## 📊 Quick Reference
+
+| Mode                  | Video     | Audio     | Conditions          | Config |
+|-----------------------|-----------|-----------|---------------------|--------|
+| **T2V**               | Generated | Generated | —                   | [`t2v_lora`](../configs/t2v_lora.yaml) |
+| **I2V**               | Generated | Generated | `first_frame`       | [`i2v_lora`](../configs/i2v_lora.yaml) |
+| **Video Extension**   | Generated | Generated | `prefix`/`suffix`   | [`video_extend_lora`](../configs/video_extend_lora.yaml) |
+| **V2V IC-LoRA**       | Generated | —         | `reference`         | [`v2v_ic_lora`](../configs/v2v_ic_lora.yaml) |
+| **A2V**               | Generated | Frozen    | —                   | [`a2v_lora`](../configs/a2v_lora.yaml) |
+| **V2A (Foley)**       | Frozen    | Generated | —                   | [`v2a_lora`](../configs/v2a_lora.yaml) |
+| **Video Inpainting**  | Generated | —         | `mask`              | [`video_inpainting_lora`](../configs/video_inpainting_lora.yaml) |
+| **Video Outpainting** | Generated | —         | `spatial_crop`      | [`video_outpainting_lora`](../configs/video_outpainting_lora.yaml) |
+| **T2A**               | —         | Generated | —                   | [`t2a_lora`](../configs/t2a_lora.yaml) |
+| **Audio Extension**   | —         | Generated | `prefix`/`suffix`   | [`audio_extend_lora`](../configs/audio_extend_lora.yaml) |
+| **Audio Inpainting**  | —         | Generated | `mask`              | [`audio_inpainting_lora`](../configs/audio_inpainting_lora.yaml) |
+| **A2A IC-LoRA**       | —         | Generated | `reference`         | [`a2a_ic_lora`](../configs/a2a_ic_lora.yaml) |
+| **AV2AV IC-LoRA**     | Generated | Generated | `reference` (both)  | [`av2av_ic_lora`](../configs/av2av_ic_lora.yaml) |
+
+---
+
+## 🎯 Text-to-Video (T2V)
+
+Generate video and audio from text prompts. Both modalities are denoised with no additional conditions.
 
 ```yaml
-model:
-  training_mode: "lora"
-
 training_strategy:
-  name: "text_to_video"
-  first_frame_conditioning_p: 0.1
-  with_audio: false  # Video-only training
+  name: "flexible"
+  video:
+    is_generated: true
+    latents_dir: "latents"
+  audio:
+    is_generated: true
+    latents_dir: "audio_latents"
 ```
 
-## 🔊 Audio-Video LoRA Training
+**Example config:** 📄 [t2v_lora.yaml](../configs/t2v_lora.yaml)
 
-LTX-2 supports joint audio-video generation. You can train LoRA adapters that affect both video and audio output:
+---
 
-- **Synchronized audio-video generation** - Audio matches the visual content
-- **Same efficient LoRA approach** - Just enable audio training
-- **Requires audio latents** - Dataset must include preprocessed audio
+## 🖼️ Image-to-Video (I2V)
 
-Configure audio-video training with:
+Generate video conditioned on a starting image. The first frame is provided as a clean conditioning signal — no noise,
+timestep=0, excluded from loss. The `probability` parameter controls how often first-frame conditioning is applied;
+remaining samples train in pure T2V mode.
 
 ```yaml
-model:
-  training_mode: "lora"
-
 training_strategy:
-  name: "text_to_video"
-  first_frame_conditioning_p: 0.1
-  with_audio: true  # Enable audio training
-  audio_latents_dir: "audio_latents"  # Directory containing audio latents
+  name: "flexible"
+  video:
+    is_generated: true
+    latents_dir: "latents"
+    conditions:
+      - type: first_frame
+        probability: 0.5
+  audio:
+    is_generated: true
+    latents_dir: "audio_latents"
 ```
 
-**Example configuration file:**
+**Example config:** 📄 [i2v_lora.yaml](../configs/i2v_lora.yaml)
 
-- 📄 [Audio-Video LoRA Training](../configs/ltx2_av_lora.yaml)
+---
 
-**Dataset structure for audio-video training:**
+## ⏩ Video Extension
 
+Extend a video forward (or backward) in time. Prefix or suffix conditioning provides a span of existing latent frames
+as clean conditioning. The `temporal_boundary` sets the number of **latent frames** used as context (each latent frame
+= 8 pixel frames due to temporal compression).
+
+```yaml
+training_strategy:
+  name: "flexible"
+  video:
+    is_generated: true
+    latents_dir: "latents"
+    conditions:
+      - type: prefix            # or "suffix" for backward extension
+        temporal_boundary: 8    # 8 latent frames = 64 pixel frames
+        probability: 1.0
+  audio:
+    is_generated: true
+    latents_dir: "audio_latents"
 ```
-preprocessed_data_root/
-├── latents/           # Video latents
-├── conditions/        # Text embeddings
-└── audio_latents/     # Audio latents (required when with_audio: true)
-```
-
-> [!IMPORTANT]
-> When training audio-video LoRAs, ensure your `target_modules` configuration captures video, audio, and
-> cross-modal attention branches. Use patterns like `"to_k"` instead of `"attn1.to_k"` to match:
-> - Video modules: `attn1.to_k`, `attn2.to_k`
-> - Audio modules: `audio_attn1.to_k`, `audio_attn2.to_k`
-> - Cross-modal modules: `audio_to_video_attn.to_k`, `video_to_audio_attn.to_k`
->
-> The cross-modal attention modules (`audio_to_video_attn` and `video_to_audio_attn`) enable bidirectional
-> information flow between audio and video, which is critical for synchronized audiovisual generation.
-> See [Understanding Target Modules](configuration-reference.md#understanding-target-modules) for detailed guidance.
 
 > [!NOTE]
-> You can generate audio during validation even if you're not training the audio branch.
-> Set `validation.generate_audio: true` independently of `training_strategy.with_audio`.
+> The `prefix` and `suffix` conditions also work on the audio modality for audio extension.
+> Set `temporal_boundary` on the audio modality's conditions list to condition on a prefix or suffix
+> of the audio latents.
 
-## 🔥 Full Model Fine-tuning
+**Example configs:** 📄 [video_extend_lora.yaml](../configs/video_extend_lora.yaml) (forward), 📄 [video_suffix_lora.yaml](../configs/video_suffix_lora.yaml) (backward)
 
-Full model fine-tuning updates all parameters of the base model, providing maximum flexibility but
-requiring substantial computational resources and larger training datasets:
+---
 
-- **Offers the highest potential quality and capability improvements**
-- **Requires multiple GPUs** and distributed training techniques (e.g., FSDP)
-- **Produces large checkpoint files** (several GB)
-- **Best for major model adaptations** or when LoRA limitations are reached
+## 🔄 IC-LoRA / Video-to-Video (V2V)
 
-Configure full fine-tuning with:
-
-```yaml
-model:
-  training_mode: "full"
-
-training_strategy:
-  name: "text_to_video"
-  first_frame_conditioning_p: 0.1
-```
-
-> [!IMPORTANT]
-> Full fine-tuning of LTX-2 requires multiple high-end GPUs (e.g., 4-8× H100 80GB) and distributed
-> training with FSDP. See [Training Guide](training-guide.md) for multi-GPU setup instructions.
-
-## 🔄 In-Context LoRA (IC-LoRA) Training
-
-IC-LoRA is a specialized training mode for video-to-video transformations.
-Unlike standard training modes that learn from individual videos, IC-LoRA learns transformations from pairs of videos.
-IC-LoRA enables a wide range of advanced video-to-video applications, such as:
-
-- **Control adapters** (e.g., Depth, Pose): Learn to map from a control signal (like a depth map or pose skeleton) to a
-  target video
-- **Video deblurring**: Transform blurry input videos into sharp, high-quality outputs
-- **Style transfer**: Apply the style of a reference video to a target video sequence
-- **Colorization**: Convert grayscale reference videos into colorized outputs
-- **Restoration and enhancement**: Denoise, upscale, or restore old or degraded videos
-
-By providing paired reference and target videos, IC-LoRA can learn complex transformations that go beyond caption-based
-conditioning.
-
-IC-LoRA training fundamentally differs from standard LoRA and full fine-tuning:
-
-- **Reference videos** provide clean, unnoised conditioning input showing the "before" state
-- **Target videos** are noised during training and represent the desired "after" state
-- **The model learns transformations** from reference videos to target videos
-- **Loss is applied only to the target portion**, not the reference
-- **Training and inference time increase significantly** due to the doubled sequence length
-
-To enable IC-LoRA training, configure your YAML file with:
+In-Context LoRA learns transformations from paired videos. Pre-encoded reference latents are concatenated to the target
+sequence — reference tokens participate in bidirectional self-attention but receive no noise and are excluded from loss.
+This enables control adapters (depth, pose), style transfer, deblurring, colorization, and more.
 
 ```yaml
-model:
-  training_mode: "lora"  # Required: IC-LoRA uses LoRA mode
-
 training_strategy:
-  name: "video_to_video"
-  first_frame_conditioning_p: 0.1
-  reference_latents_dir: "reference_latents"  # Directory for reference video latents
+  name: "flexible"
+  video:
+    is_generated: true
+    latents_dir: "latents"
+    conditions:
+      - type: reference
+        latents_dir: "reference_latents"
+        probability: 1.0
+      - type: first_frame       # optional — composable with reference
+        probability: 0.2
 ```
 
-**Example configuration file:**
+> [!NOTE]
+> IC-LoRA is video-only by default (no audio modality block). Conditions can be composed — the example above also
+> applies first-frame conditioning with 20% probability alongside the reference.
+> Use [AV2AV IC-LoRA](#av2av-ic-lora) when both video and audio references should be trained jointly.
 
-- 📄 [IC-LoRA Training](../configs/ltx2_v2v_ic_lora.yaml) - Video-to-video transformation training
+**Example config:** 📄 [v2v_ic_lora.yaml](../configs/v2v_ic_lora.yaml)
 
-### Dataset Requirements for IC-LoRA
+### Dataset Requirements
 
-- Your dataset must contain **paired videos** where each target video has a corresponding reference video
-- Reference and target videos must have the **same frame count** (length)
-- Reference videos can optionally be at **lower spatial resolution** than target videos (
-  see [Scaled Reference Conditioning](#scaled-reference-conditioning) below)
-- Both reference and target videos should be **preprocessed** before training
+- **Paired videos** — each target video has a corresponding reference video
+- **Same frame count** between reference and target
+- Reference videos can optionally be at **lower spatial resolution** (see [Scaled Reference](#scaled-reference-conditioning) below)
+- Both must be **preprocessed** before training
 
-**Dataset structure for IC-LoRA training:**
+**Dataset structure:**
 
 ```
 preprocessed_data_root/
-├── latents/            # Target video latents (what the model learns to generate)
-├── conditions/         # Text embeddings for each video
+├── latents/            # Target video latents
+├── conditions/         # Text embeddings
 └── reference_latents/  # Reference video latents (conditioning input)
 ```
 
 ### Generating Reference Videos
 
-We provide an example script to generate reference videos (e.g., Canny edge maps) for a given dataset.
-The script takes a JSON file as input (e.g., output of `caption_videos.py`) and updates it with the generated reference
-video paths.
+Use the `compute_reference.py` script to generate reference videos (e.g., Canny edge maps) for a dataset:
 
 ```bash
 uv run python scripts/compute_reference.py scenes_output_dir/ \
@@ -169,84 +171,392 @@ uv run python scripts/compute_reference.py scenes_output_dir/ \
 To compute a different condition (depth maps, pose skeletons, etc.), modify the `compute_reference()` function in the
 script.
 
-### Configuration Requirements for IC-LoRA
-
-- You **must** provide `reference_videos` in your validation configuration when using IC-LoRA training
-- The number of reference videos must match the number of validation prompts
-
-Example validation configuration for IC-LoRA:
-
-```yaml
-validation:
-  prompts:
-    - "First prompt describing the desired output"
-    - "Second prompt describing the desired output"
-  reference_videos:
-    - "/path/to/reference1.mp4"
-    - "/path/to/reference2.mp4"
-  reference_downscale_factor: 1  # Set to match preprocessing (e.g., 2 for half resolution)
-  include_reference_in_output: true  # Show reference side-by-side with output
-```
+> [!NOTE]
+> `compute_reference.py` writes generated references to the `reference_video` column, which
+> `process_dataset.py` detects automatically. The legacy `ref_media_path` column is also accepted.
 
 ### Scaled Reference Conditioning
 
-For more efficient training and inference, you can use **downscaled reference videos** while keeping target videos at
-full resolution. This reduces the number of conditioning tokens, leading to:
+For more efficient training and inference, use **downscaled reference videos** while keeping targets at full
+resolution. During training, the strategy infers the spatial and temporal scale factors from the preprocessed
+reference and target latents and adjusts positional encodings accordingly. This reduces conditioning tokens, leading to:
 
-- **Faster training** due to shorter sequence lengths
-- **Faster inference** with reduced memory usage
+- **Faster training** — shorter sequence lengths
+- **Faster inference** — reduced memory usage
 - **Same aspect ratio** maintained between reference and target
 
-#### How It Works
-
-When the reference video has resolution `H/n × W/n` and the target video has resolution `H × W`, the trainer
-automatically detects this scale factor `n` and adjusts the positional encodings so that the reference positions
-map to the correct locations in the target coordinate space.
-
-#### Preprocessing Datasets with Scaled References
-
-Use the `--reference-downscale-factor` option when running `process_dataset.py`:
+Preprocess with the `--reference-downscale-factor` option:
 
 ```bash
-# Process dataset with scaled reference videos (half resolution)
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets 768x768x25 \
     --model-path /path/to/ltx2.safetensors \
     --text-encoder-path /path/to/gemma \
-    --reference-column "reference_path" \
     --reference-downscale-factor 2
 ```
 
-This will:
+> [!NOTE]
+> The `reference_video` column is auto-detected by convention — no `--reference-column` flag needed.
 
-- Process target videos at 768×768 resolution
-- Process reference videos at 384×384 resolution (768 / 2)
-- The trainer will automatically infer the scale factor from the dimension ratio
-
-**Important**: Set `reference_downscale_factor: 2` in your validation configuration to match the preprocessing:
+Validation encodes reference media on the fly, so set `downscale_factor` and `temporal_scale_factor`
+on each `reference` validation condition to match the preprocessing factors:
 
 ```yaml
 validation:
-  reference_downscale_factor: 2  # Must match the preprocessing factor
-  reference_videos:
-    - "/path/to/reference1.mp4"
-    - "/path/to/reference2.mp4"
+  samples:
+    - prompt: "..."
+      conditions:
+        - type: reference
+          video: "/path/to/reference.mp4"
+          downscale_factor: 2
+          temporal_scale_factor: 1
+          include_in_output: true
 ```
 
 > [!NOTE]
 > The scale factor must be a positive integer, and all dimensions must be divisible by 32.
-> Common scale factors are 1 (no scaling), 2 (half resolution), or 4 (quarter resolution).
+> Common values are 1 (no scaling), 2 (half resolution), or 4 (quarter resolution).
 
-## 📊 Training Mode Comparison
+---
 
-| Aspect               | LoRA                           | Audio-Video LoRA               | Full Fine-tuning | IC-LoRA                        |
-|----------------------|--------------------------------|--------------------------------|------------------|--------------------------------|
-| **Memory Usage**     | Low                            | Low-Medium                     | High             | Medium                         |
-| **Training Speed**   | Fast                           | Fast                           | Slow             | Medium                         |
-| **Output Size**      | 100MB-few GB (depends on rank) | 100MB-few GB (depends on rank) | Tens of GB       | 100MB-few GB (depends on rank) |
-| **Flexibility**      | Medium                         | Medium                         | High             | Specialized                    |
-| **Audio Support**    | Optional                       | Yes                            | Optional         | No                             |
-| **Reference Videos** | No                             | No                             | No               | Yes (required)                 |
+## 🔊 Audio-to-Video (A2V)
+
+Generate video conditioned on frozen audio. Audio passes through the transformer clean (sigma=0) and influences video
+via the built-in cross-modal attention. Only video is denoised.
+
+```yaml
+training_strategy:
+  name: "flexible"
+  video:
+    is_generated: true
+    latents_dir: "latents"
+  audio:
+    is_generated: false
+    latents_dir: "audio_latents"
+```
+
+**Example config:** 📄 [a2v_lora.yaml](../configs/a2v_lora.yaml)
+
+---
+
+## 🎵 Video-to-Audio / Foley (V2A)
+
+Generate audio (Foley) conditioned on frozen video. Video passes through the transformer clean (sigma=0) and
+conditions audio via cross-modal attention. Only audio is denoised.
+
+```yaml
+training_strategy:
+  name: "flexible"
+  video:
+    is_generated: false
+    latents_dir: "latents"
+  audio:
+    is_generated: true
+    latents_dir: "audio_latents"
+```
+
+**Example config:** 📄 [v2a_lora.yaml](../configs/v2a_lora.yaml)
+
+---
+
+## 🎭 Video Inpainting
+
+Fill in masked regions of a video. Per-sample masks loaded from disk define which tokens are conditioning and which
+must be generated. Masks are thresholded at `0.5` to match validation/inference: tokens with `mask > 0.5` receive clean
+latents and timestep=0 and are excluded from loss; tokens with `mask <= 0.5` are denoised normally and contribute to
+loss.
+
+```yaml
+training_strategy:
+  name: "flexible"
+  video:
+    is_generated: true
+    latents_dir: "latents"
+    conditions:
+      - type: mask
+        mask_dir: "video_masks"
+        probability: 1.0
+```
+
+**Dataset structure:**
+
+```
+preprocessed_data_root/
+├── latents/        # Video latents
+├── conditions/     # Text embeddings
+└── video_masks/    # Per-sample binary masks (1 → conditioning, 0 → generate)
+```
+
+In dataset metadata, provide mask media via the `video_mask` column; preprocessing converts it into `video_masks/`.
+
+**Example config:** 📄 [video_inpainting_lora.yaml](../configs/video_inpainting_lora.yaml)
+
+---
+
+## 🌅 Video Outpainting
+
+Extend a video spatially beyond its original boundaries. A rectangular pixel region is provided as clean conditioning
+(no noise, timestep=0, excluded from loss) — the model learns to generate the surrounding content. The `spatial_region`
+is specified in pixel coordinates `[y1, x1, y2, x2]` and automatically converted to latent space.
+
+```yaml
+training_strategy:
+  name: "flexible"
+  video:
+    is_generated: true
+    latents_dir: "latents"
+    conditions:
+      - type: spatial_crop
+        spatial_region: [0, 0, 288, 576]  # y1, x1, y2, x2 in pixels
+        probability: 1.0
+```
+
+> [!NOTE]
+> `spatial_crop` is a video-only condition — it is not supported on the audio modality.
+
+**Example config:** 📄 [video_outpainting_lora.yaml](../configs/video_outpainting_lora.yaml)
+
+---
+
+## 🔈 Text-to-Audio (T2A)
+
+Generate audio from text prompts with no video modality. Only the audio branch of the transformer is denoised. Since
+no video modality is configured, this mode uses **audio-only LoRA targets** — explicitly targeting `audio_attn1`,
+`audio_attn2`, and `audio_ff` modules.
+
+```yaml
+training_strategy:
+  name: "flexible"
+  audio:
+    is_generated: true
+    latents_dir: "audio_latents"
+```
+
+> [!NOTE]
+> With no `video` block in the strategy, the trainer only loads audio latents and text embeddings. LoRA adapters
+> should explicitly target audio modules (e.g., `audio_attn1.to_k`) rather than short patterns like `to_k` which
+> would also match video modules. See [LoRA Target Modules Guidance](#lora-target-modules-guidance) below.
+
+**Example config:** 📄 [t2a_lora.yaml](../configs/t2a_lora.yaml)
+
+---
+
+## 🔊 Audio Extension
+
+Extend audio forward (prefix) or backward (suffix) in time — the audio equivalent of Video Extension. A span of
+existing audio latent frames is provided as clean conditioning, and the model generates the continuation. The
+`temporal_boundary` sets the number of latent frames used as context. This mode uses **audio-only LoRA targets**.
+
+```yaml
+training_strategy:
+  name: "flexible"
+  audio:
+    is_generated: true
+    latents_dir: "audio_latents"
+    conditions:
+      - type: prefix            # or "suffix" for backward extension
+        temporal_boundary: 8
+        probability: 1.0
+```
+
+**Example configs:** 📄 [audio_extend_lora.yaml](../configs/audio_extend_lora.yaml), 📄 [audio_suffix_lora.yaml](../configs/audio_suffix_lora.yaml)
+
+---
+
+## 🎭 Audio Inpainting
+
+Fill in masked regions of audio. Per-sample masks loaded from disk define which audio tokens are conditioning and
+which must be generated — the audio equivalent of Video Inpainting. Masks are thresholded at `0.5` with the same
+binary semantics as video inpainting. This mode uses **audio-only LoRA targets**.
+
+```yaml
+training_strategy:
+  name: "flexible"
+  audio:
+    is_generated: true
+    latents_dir: "audio_latents"
+    conditions:
+      - type: mask
+        mask_dir: "audio_masks"
+        probability: 1.0
+```
+
+**Dataset structure:**
+
+```
+preprocessed_data_root/
+├── conditions/      # Text embeddings
+├── audio_latents/   # Audio latents
+└── audio_masks/     # Per-sample binary masks (1 → conditioning, 0 → generate)
+```
+
+In dataset metadata, provide mask media via the `audio_mask` column; preprocessing converts it into `audio_masks/`.
+
+**Example config:** 📄 [audio_inpainting_lora.yaml](../configs/audio_inpainting_lora.yaml)
+
+---
+
+## 🔄 IC-LoRA / Audio-to-Audio (A2A)
+
+In-Context LoRA for audio-to-audio transformations. Pre-encoded reference audio latents are concatenated to the target
+sequence — reference tokens participate in bidirectional self-attention but receive no noise and are excluded from loss.
+This enables audio style transfer, voice conversion, sound effect transformation, and more. This mode uses
+**audio-only LoRA targets**.
+
+```yaml
+training_strategy:
+  name: "flexible"
+  audio:
+    is_generated: true
+    latents_dir: "audio_latents"
+    conditions:
+      - type: reference
+        latents_dir: "reference_audio_latents"
+        probability: 1.0
+```
+
+**Dataset structure:**
+
+```
+preprocessed_data_root/
+├── conditions/              # Text embeddings
+├── audio_latents/           # Target audio latents
+└── reference_audio_latents/ # Reference audio latents (conditioning input)
+```
+
+**Example config:** 📄 [a2a_ic_lora.yaml](../configs/a2a_ic_lora.yaml)
+
+---
+
+## 🔄 AV2AV IC-LoRA
+
+Joint audio-video In-Context LoRA — both modalities have reference conditioning. Pre-encoded reference latents are
+concatenated to each modality's target sequence independently. This enables joint audiovisual transformations such as
+synchronized style transfer across both video and audio.
+
+```yaml
+training_strategy:
+  name: "flexible"
+  video:
+    is_generated: true
+    latents_dir: "latents"
+    conditions:
+      - type: reference
+        latents_dir: "reference_latents"
+        probability: 1.0
+  audio:
+    is_generated: true
+    latents_dir: "audio_latents"
+    conditions:
+      - type: reference
+        latents_dir: "reference_audio_latents"
+        probability: 1.0
+```
+
+> [!NOTE]
+> Unlike audio-only IC-LoRA (A2A), AV2AV uses short LoRA target patterns like `"to_k"` to match all branches
+> (video, audio, and cross-modal attention), since both modalities are trained.
+
+**Dataset structure:**
+
+```
+preprocessed_data_root/
+├── latents/                 # Target video latents
+├── audio_latents/           # Target audio latents
+├── conditions/              # Text embeddings
+├── reference_latents/       # Reference video latents (conditioning input)
+└── reference_audio_latents/ # Reference audio latents (conditioning input)
+```
+
+**Example config:** 📄 [av2av_ic_lora.yaml](../configs/av2av_ic_lora.yaml)
+
+---
+
+## 🔥 Full Model Fine-tuning
+
+All modes above default to `training_mode: "lora"`. For full fine-tuning, set `training_mode: "full"` — this updates
+all model parameters rather than adding LoRA adapters.
+
+```yaml
+model:
+  training_mode: "full"
+
+training_strategy:
+  name: "flexible"
+  video:
+    is_generated: true
+    latents_dir: "latents"
+  audio:
+    is_generated: true
+    latents_dir: "audio_latents"
+```
+
+> [!IMPORTANT]
+> Full fine-tuning requires multiple high-end GPUs (e.g., 4-8× H100 80GB) and distributed training with FSDP.
+> See [Training Guide](training-guide.md) for multi-GPU setup instructions.
+
+---
+
+## 🎛️ LoRA Target Modules Guidance
+
+The `target_modules` configuration determines which transformer modules receive LoRA adapters. The right choice depends
+on whether your training involves cross-modal (audio ↔ video) interaction.
+
+**For T2V, I2V, A2V, V2A, or any mode involving both modalities** — use short patterns to match all branches
+(video, audio, and cross-modal attention):
+
+```yaml
+target_modules:
+  - "to_k"
+  - "to_q"
+  - "to_v"
+  - "to_out.0"
+```
+
+> [!IMPORTANT]
+> Short patterns like `"to_k"` match video modules (`attn1.to_k`, `attn2.to_k`), audio modules
+> (`audio_attn1.to_k`, `audio_attn2.to_k`), and cross-modal modules (`audio_to_video_attn.to_k`,
+> `video_to_audio_attn.to_k`). The cross-modal attention modules enable bidirectional information flow between
+> audio and video, which is critical for synchronized audiovisual generation.
+> See [Understanding Target Modules](configuration-reference.md#understanding-target-modules) for detailed guidance.
+
+**For video-only IC-LoRA** — explicitly target video modules (including FFN layers for better transformation quality):
+
+```yaml
+target_modules:
+  - "attn1.to_k"
+  - "attn1.to_q"
+  - "attn1.to_v"
+  - "attn1.to_out.0"
+  - "attn2.to_k"
+  - "attn2.to_q"
+  - "attn2.to_v"
+  - "attn2.to_out.0"
+  - "ff.net.0.proj"
+  - "ff.net.2"
+```
+
+**For audio-only modes (T2A, Audio Extension, Audio Inpainting, A2A IC-LoRA)** — explicitly target audio modules:
+
+```yaml
+target_modules:
+  - "audio_attn1.to_k"
+  - "audio_attn1.to_q"
+  - "audio_attn1.to_v"
+  - "audio_attn1.to_out.0"
+  - "audio_attn2.to_k"
+  - "audio_attn2.to_q"
+  - "audio_attn2.to_v"
+  - "audio_attn2.to_out.0"
+  - "audio_ff.net.0.proj"
+  - "audio_ff.net.2"
+```
+
+> [!NOTE]
+> Audio-only modes have no `video` block in the strategy, so there is no need to train video or cross-modal
+> attention modules. Targeting only `audio_*` modules keeps the LoRA small and focused.
+
+---
 
 ## 🎬 Using Trained Models for Inference
 
@@ -255,12 +565,25 @@ LoRAs:
 
 | Training Mode           | Recommended Pipeline                                  |
 |-------------------------|-------------------------------------------------------|
-| LoRA / Audio-Video LoRA | `TI2VidOneStagePipeline` or `TI2VidTwoStagesPipeline` |
-| IC-LoRA                 | `ICLoraPipeline`                                      |
+| T2V / I2V / A2V / Extension / Inpainting / Outpainting | `TI2VidOneStagePipeline` or `TI2VidTwoStagesPipeline` |
+| IC-LoRA (V2V / A2A / AV2AV) | `ICLoraPipeline`                                 |
+| V2A (Foley) / T2A / Audio Extension / Audio Inpainting | `TI2VidOneStagePipeline` or `TI2VidTwoStagesPipeline` |
 
 All pipelines support loading custom LoRAs via the `loras` parameter. See the [`ltx-pipelines`](../../ltx-pipelines/)
-package
-documentation for detailed usage instructions.
+package documentation for detailed usage instructions.
+
+> [!NOTE]
+> You can generate audio during validation even if you're not training the audio branch.
+> Set `validation.generate_audio: true` independently of whether audio has `is_generated: true`.
+
+---
+
+## 🔄 Migration from Legacy Strategies
+
+Legacy `text_to_video` and `video_to_video` strategy configs are forward-compatible and will continue to work (with a
+deprecation warning). We recommend migrating to `flexible` for access to all conditioning modes.
+
+---
 
 ## 🚀 Next Steps
 
@@ -272,6 +595,6 @@ Once you've chosen your training mode:
 
 > [!TIP]
 > Need a training mode that's not covered here?
-> See [Implementing Custom Training Strategies](custom-training-strategies.md)
-> to learn how to create your own strategy for specialized use cases like video inpainting, audio-only training, or
-> custom conditioning.
+> First check whether it can be expressed by composing existing `flexible` conditions. Use
+> [Implementing Custom Training Strategies](custom-training-strategies.md) only for custom losses,
+> noising rules, model outputs, or preprocessing that cannot be represented by configuration.

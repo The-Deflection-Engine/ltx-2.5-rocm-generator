@@ -182,6 +182,8 @@ def _guided_denoise(  # noqa: PLR0913,PLR0915
     r = dict(zip(pass_names, zip(splits_v, splits_a, strict=True), strict=True))
 
     cond_v, cond_a = r["cond"]
+    cond_v = cond_v if isinstance(cond_v, torch.Tensor) else torch.tensor(cond_v)
+    cond_a = cond_a if isinstance(cond_a, torch.Tensor) else torch.tensor(cond_a)
     uncond_v, uncond_a = r.get("uncond", (0.0, 0.0))
     ptb_v, ptb_a = r.get("ptb", (0.0, 0.0))
     mod_v, mod_a = r.get("mod", (0.0, 0.0))

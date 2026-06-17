@@ -9,8 +9,8 @@ from ltx_core.types import LatentState
 class VideoConditionByLatentIndex(ConditioningItem):
     """
     Conditions video generation by injecting latents at a specific latent frame index.
-    Replaces tokens in the latent state at positions corresponding to latent_idx,
-    and sets denoise strength according to the strength parameter.
+    Sets the clean latents at positions corresponding to latent_idx to the injected latents,
+    sets denoise strength according to the strength parameter.
     """
 
     def __init__(self, latent: torch.Tensor, strength: float, latent_idx: int):
@@ -37,7 +37,6 @@ class VideoConditionByLatentIndex(ConditioningItem):
 
         latent_state = latent_state.clone()
 
-        latent_state.latent[:, start_token:stop_token] = tokens
         latent_state.clean_latent[:, start_token:stop_token] = tokens
         latent_state.denoise_mask[:, start_token:stop_token] = 1.0 - self.strength
 

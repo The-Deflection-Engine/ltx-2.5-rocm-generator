@@ -436,7 +436,7 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
     return video_state, audio_state
 
 
-def euler_cfg_pp_denoising_loop(
+def euler_cfg_pp_denoising_loop(  # noqa: PLR0912
     sigmas: torch.Tensor,
     video_state: LatentState | None,
     audio_state: LatentState | None,
@@ -514,9 +514,15 @@ def euler_cfg_pp_denoising_loop(
             )
 
         if video_state is not None and denoised_video is not None:
-            denoised_video = post_process_latent(denoised_video, video_state.denoise_mask, video_state.clean_latent)
+            denoised_video = post_process_latent(
+                denoised_video.float(), video_state.denoise_mask, video_state.clean_latent
+            )
+            noisy_video = video_state.latent.float()
         if audio_state is not None and denoised_audio is not None:
-            denoised_audio = post_process_latent(denoised_audio, audio_state.denoise_mask, audio_state.clean_latent)
+            denoised_audio = post_process_latent(
+                denoised_audio.float(), audio_state.denoise_mask, audio_state.clean_latent
+            )
+            noisy_audio = audio_state.latent.float()
 
         if sigmas[step_idx + 1] == 0:
             if video_state is not None and denoised_video is not None:
@@ -525,30 +531,31 @@ def euler_cfg_pp_denoising_loop(
                 audio_state = replace(audio_state, latent=denoised_audio.to(model_dtype))
             return video_state, audio_state
 
-        # Draw noise consecutively from the same generator: video first, audio second.
-        noise_video = new_noise_fn(video_state.latent, generator) if (video_state is not None and draw_noise) else None
-        noise_audio = new_noise_fn(audio_state.latent, generator) if (audio_state is not None and draw_noise) else None
-
         if video_state is not None and denoised_video is not None:
+            video_noise = new_noise_fn(video_state.latent, generator) if draw_noise else None
             x_next = stepper.step(
-                sample=video_state.latent,
+                sample=noisy_video,
                 denoised_sample=denoised_video,
                 sigmas=sigmas,
                 step_index=step_idx,
                 uncond_denoised=uncond_video,
-                noise=noise_video,
+                noise=video_noise,
             )
+            if draw_noise:
+                x_next = post_process_latent(x_next, video_state.denoise_mask, video_state.clean_latent)
             video_state = replace(video_state, latent=x_next.to(model_dtype))
 
         if audio_state is not None and denoised_audio is not None:
+            audio_noise = new_noise_fn(audio_state.latent, generator) if draw_noise else None
             x_next = stepper.step(
-                sample=audio_state.latent,
+                sample=noisy_audio,
                 denoised_sample=denoised_audio,
                 sigmas=sigmas,
                 step_index=step_idx,
                 uncond_denoised=uncond_audio,
-                noise=noise_audio,
+                noise=audio_noise,
             )
+            if draw_noise:
+                x_next = post_process_latent(x_next, audio_state.denoise_mask, audio_state.clean_latent)
             audio_state = replace(audio_state, latent=x_next.to(model_dtype))
-
     return video_state, audio_state

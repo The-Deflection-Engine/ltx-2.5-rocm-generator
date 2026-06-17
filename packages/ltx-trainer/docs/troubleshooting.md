@@ -8,7 +8,7 @@ Memory management is crucial for successful training with LTX-2.
 
 > [!TIP]
 > For GPUs with 32GB VRAM, use the pre-configured low VRAM config:
-> [`configs/ltx2_av_lora_low_vram.yaml`](../configs/ltx2_av_lora_low_vram.yaml)
+> [`configs/t2v_lora_low_vram.yaml`](../configs/t2v_lora_low_vram.yaml)
 > which combines 8-bit optimizer, INT8 quantization, and reduced LoRA rank.
 
 ### Memory Optimization Techniques
@@ -111,7 +111,7 @@ Ensure you've installed the dependencies and are using `uv run` to execute scrip
 # From the repository root
 uv sync
 cd packages/ltx-trainer
-uv run python scripts/train.py configs/ltx2_av_lora.yaml
+uv run python scripts/train.py configs/t2v_lora.yaml
 ```
 
 > [!TIP]
@@ -168,29 +168,29 @@ LTX-2 requires the number of frames to satisfy `frames % 8 == 1`:
 
    ```bash
    uv run accelerate launch --config_file configs/accelerate/ddp_compile.yaml \
-     scripts/train.py configs/ltx2_av_lora.yaml
+     scripts/train.py configs/t2v_lora.yaml
    ```
 
 ### Issue: Poor Quality Validation Outputs
 
 **Solutions:**
 
-1. **Use Image-to-Video Validation:**
-   For more reliable validation, use image-to-video (first-frame conditioning) rather than pure text-to-video:
+1. **Use conditioned validation:** For more reliable validation, use image-to-video (first-frame conditioning) rather than pure text-to-video:
 
    ```yaml
    validation:
-     prompts:
-       - "a professional portrait video of a person"
-     images:
-       - "/path/to/first_frame.png"  # One image per prompt
+     samples:
+       - prompt: "a professional portrait video of a person"
+         conditions:
+           - type: first_frame
+             image_or_video: "/path/to/first_frame.png"
    ```
 
 2. **Increase inference steps:**
 
    ```yaml
    validation:
-     inference_steps: 50  # Default is 30
+     inference_steps: 30
    ```
 
 3. **Adjust guidance settings:**
