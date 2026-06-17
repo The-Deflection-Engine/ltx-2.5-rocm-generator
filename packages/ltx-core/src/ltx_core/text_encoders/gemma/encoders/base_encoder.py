@@ -30,21 +30,31 @@ class GemmaTextEncoder(torch.nn.Module):
 
     def encode(
         self,
-        text: str,
+        prompts: list[str],
         padding_side: str = "left",  # noqa: ARG002
-    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-        """Run Gemma LLM and return raw hidden states + attention mask.
-        Calls the inner model (self.model.model) to skip lm_head logits computation (~500 MiB saving).
-        Returns:
-            (hidden_states, attention_mask) where hidden_states is a tuple of per-layer tensors.
+    ) -> list[tuple[tuple[torch.Tensor, ...], torch.Tensor]]:
+        """Run a single fused Gemma forward over a batch of prompts.
+        Calls the inner model (self.model.model) to skip lm_head logits computation
+        (~500 MiB saving). The tokenizer pads every prompt to ``max_length`` (1024),
+        so the inputs stack into a single ``[N, 1024]`` batch with no further padding
+        logic; per-prompt outputs are sliced back to ``[1, 1024, D]`` / ``[1, 1024]``
+        in the original order.
         """
-        token_pairs = self.tokenizer.tokenize_with_weights(text)["gemma"]
-        input_ids = torch.tensor([[t[0] for t in token_pairs]], device=self.model.device)
-        attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=self.model.device)
+        if not prompts:
+            return []
+        tokenized = [self.tokenizer.tokenize_with_weights(t)["gemma"] for t in prompts]
+        input_ids = torch.tensor(
+            [[tok for tok, _ in pairs] for pairs in tokenized],
+            device=self.model.device,
+        )
+        attention_mask = torch.tensor(
+            [[w for _, w in pairs] for pairs in tokenized],
+            device=self.model.device,
+        )
         outputs = self.model.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
         hidden_states = outputs.hidden_states
         del outputs
-        return hidden_states, attention_mask
+        return [(tuple(h[i : i + 1] for h in hidden_states), attention_mask[i : i + 1]) for i in range(len(prompts))]
 
     # --- Prompt enhancement methods ---
 

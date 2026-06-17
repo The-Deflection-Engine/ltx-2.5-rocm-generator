@@ -6,10 +6,22 @@ This file provides guidance to AI coding assistants (Claude, Cursor, etc.) when 
 
 **LTX Trainer** is a training toolkit for fine-tuning the Lightricks LTX audio-video generation models. It supports:
 
+- **Text-to-video (T2V)** - Generate video from text prompts
+- **Text-to-audio (T2A)** - Generate audio from text prompts
+- **Image-to-video (I2V)** - Generate video conditioned on a first frame
+- **Video extension** - Forward (prefix) and backward (suffix) video continuation
+- **Video inpainting** - Mask-based spatial/temporal inpainting
+- **Video outpainting** - Spatial crop-based outpainting
+- **IC-LoRA video-to-video** - In-context control adapters for style/structure transfer
+- **Audio-to-video (A2V)** and **Video-to-audio (V2A)** - Cross-modal generation with frozen conditioning
+- **Audio extension** - Forward (prefix) and backward (suffix) audio continuation
+- **Audio inpainting** - Mask-based audio inpainting
+- **IC-LoRA audio-to-audio (A2A)** - Audio reference conditioning for style transfer
+- **AV2AV IC-LoRA** - Combined video and audio reference conditioning
 - **LoRA training** - Efficient fine-tuning with adapters
 - **Full fine-tuning** - Complete model training
-- **Audio-video training** - Joint audio and video generation
-- **IC-LoRA training** - In-context control adapters for video-to-video transformations
+
+All conditioning scenarios are expressed through the unified `FlexibleStrategy` configuration.
 
 **Supported model versions:**
 
@@ -39,13 +51,14 @@ packages/ltx-trainer/
 │   ├── config_display.py         # Config pretty-printing
 │   ├── trainer.py                # Main training orchestration with Accelerate
 │   ├── model_loader.py           # Model loading using ltx-core
-│   ├── validation_sampler.py     # Inference for validation samples
+│   ├── validation_runner.py      # ValidationRunner — conditioned validation sampling
 │   ├── datasets.py               # PrecomputedDataset, DummyDataset
 │   ├── training_strategies/      # Strategy pattern for different training modes
 │   │   ├── __init__.py           # Factory function: get_training_strategy()
 │   │   ├── base_strategy.py      # TrainingStrategy ABC, ModelInputs, TrainingStrategyConfigBase
-│   │   ├── text_to_video.py      # TextToVideoStrategy, TextToVideoConfig
-│   │   └── video_to_video.py     # VideoToVideoStrategy, VideoToVideoConfig
+│   │   ├── flexible.py           # FlexibleStrategy, FlexibleStrategyConfig [RECOMMENDED]
+│   │   ├── text_to_video.py      # TextToVideoStrategy, TextToVideoConfig [DEPRECATED]
+│   │   └── video_to_video.py     # VideoToVideoStrategy, VideoToVideoConfig [DEPRECATED]
 │   ├── timestep_samplers.py      # Flow matching timestep sampling
 │   ├── gemma_8bit.py             # 8-bit Gemma text encoder loading (bitsandbytes)
 │   ├── quantization.py           # Transformer INT8/INT4/FP8 quantization
@@ -62,13 +75,25 @@ packages/ltx-trainer/
 │   ├── process_captions.py       # Text embedding computation
 │   ├── caption_videos.py         # Automatic video captioning
 │   ├── decode_latents.py         # Latent decoding for debugging
-│   ├── inference.py              # Inference with trained models
 │   ├── compute_reference.py      # Generate IC-LoRA reference videos
 │   └── split_scenes.py           # Scene detection and splitting
 ├── configs/                      # Example training configurations
-│   ├── ltx2_av_lora.yaml         # Audio-video LoRA training
-│   ├── ltx2_av_lora_low_vram.yaml
-│   ├── ltx2_v2v_ic_lora.yaml     # IC-LoRA video-to-video
+│   ├── t2v_lora.yaml             # Text-to-video LoRA
+│   ├── t2v_lora_low_vram.yaml    # Text-to-video LoRA (low VRAM)
+│   ├── i2v_lora.yaml             # Image-to-video LoRA
+│   ├── v2v_ic_lora.yaml          # IC-LoRA video-to-video
+│   ├── a2v_lora.yaml             # Audio-to-video LoRA
+│   ├── v2a_lora.yaml             # Video-to-audio LoRA
+│   ├── video_extend_lora.yaml    # Video extension (forward)
+│   ├── video_suffix_lora.yaml    # Video extension (backward)
+│   ├── video_inpainting_lora.yaml # Video inpainting
+│   ├── video_outpainting_lora.yaml # Video outpainting
+│   ├── t2a_lora.yaml             # Text-to-audio LoRA
+│   ├── audio_extend_lora.yaml    # Audio extension (forward)
+│   ├── audio_suffix_lora.yaml    # Audio extension (backward)
+│   ├── audio_inpainting_lora.yaml # Audio inpainting
+│   ├── a2a_ic_lora.yaml          # Audio-to-audio IC-LoRA
+│   ├── av2av_ic_lora.yaml        # AV2AV IC-LoRA
 │   └── accelerate/               # FSDP, DDP configs
 ├── tests/                        # Pytest tests
 └── docs/                         # Documentation
@@ -83,7 +108,8 @@ packages/ltx-trainer/
   `load_text_encoder()`, `load_embeddings_processor()`, etc.
 - Combined loader: `load_model()` returns `LtxModelComponents` dataclass
 - Uses `SingleGPUModelBuilder` from ltx-core internally
-- Text encoder and embeddings processor are loaded separately (the text encoder only needs Gemma weights; the embeddings processor only needs the LTX checkpoint)
+- Text encoder and embeddings processor are loaded separately (the text encoder only needs Gemma weights; the embeddings
+  processor only needs the LTX checkpoint)
 - 8-bit text encoder loading via `gemma_8bit.py` (bitsandbytes)
 
 **Training Flow:**
@@ -94,7 +120,7 @@ packages/ltx-trainer/
    kept)
 4. Each training step: embedding connectors applied → strategy prepares `ModelInputs` → transformer forward pass →
    strategy computes loss
-5. Training strategies (`TextToVideoStrategy`, `VideoToVideoStrategy`) handle mode-specific logic
+5. Training strategies (`FlexibleStrategy`) handle mode-specific logic including conditioning, masking, and loss computation
 6. Accelerate handles distributed training, mixed precision, and device placement
 7. Data flows as precomputed latents through `PrecomputedDataset`
 
@@ -136,7 +162,12 @@ LTX-2.3) and cross-modality (video↔audio) attention conditioning (both version
 
 - All config in `src/ltx_trainer/config.py`
 - Main class: `LtxTrainerConfig`
-- Training strategy configs: `TextToVideoConfig`, `VideoToVideoConfig`
+- `TrainingStrategyConfig` - Union of `FlexibleStrategyConfig` | `TextToVideoConfig` (deprecated) | `VideoToVideoConfig` (deprecated)
+- `FlexibleStrategyConfig` - Unified strategy config with `video`/`audio` `ModalityConfig` blocks
+- `ModalityConfig` - Per-modality config: `is_generated`, `latents_dir`, `conditions` list
+- `ConditionConfig` - Discriminated union: `FirstFrameConditionConfig`, `PrefixConditionConfig`, `SuffixConditionConfig`, `SpatialCropConditionConfig`, `MaskConditionConfig`, `ReferenceConditionConfig`
+- `ValidationSample` - Per-sample validation config with `prompt`, `conditions`, optional `video_dims`/`seed` overrides
+- `ValidationCondition` - Discriminated union for validation conditions (first_frame, prefix, suffix, spatial_crop, mask, reference, video_to_audio, audio_to_video)
 - Uses Pydantic field validators and model validators
 - Config uses `extra="forbid"` — unknown fields cause validation errors
 - Config files in `configs/` directory
@@ -206,8 +237,8 @@ These values are shared across all supported model versions:
 | Video latent channels        | 128                              | VAE encoder/decoder, patchifier, `VideoLatentShape`       |
 | Spatial compression          | 32× (H and W)                    | `SpatioTemporalScaleFactors.default()`, config validators |
 | Temporal compression         | 8×                               | `SpatioTemporalScaleFactors.default()`, config validators |
-| Frame constraint             | `frames % 8 == 1`                | Config validators, validation sampler                     |
-| Resolution constraint        | Width and height divisible by 32 | Config validators, validation sampler                     |
+| Frame constraint             | `frames % 8 == 1`                | Config validators, validation runner                      |
+| Resolution constraint        | Width and height divisible by 32 | Config validators, validation runner                      |
 | Audio latent channels        | 8                                | `AudioLatentShape`, audio patchifier                      |
 | Audio mel bins               | 16                               | `AudioLatentShape`, audio patchifier                      |
 | Patchified token dim (video) | 128 (`128 × 1 × 1 × 1`)          | Transformer `in_channels`                                 |
@@ -245,11 +276,52 @@ uv run pytest
 
 ```bash
 # Single GPU
-uv run python scripts/train.py configs/ltx2_av_lora.yaml
+uv run python scripts/train.py configs/t2v_lora.yaml
 
 # Multi-GPU with Accelerate
-uv run accelerate launch scripts/train.py configs/ltx2_av_lora.yaml
+uv run accelerate launch scripts/train.py configs/t2v_lora.yaml
 ```
+
+## Testing Standards
+
+### Structure
+
+- **Flat functions only** — use `def test_*()`, never `class Test*` with methods. Pytest collects standalone functions.
+- **Only test public interfaces** — never call private methods (`_method`) directly. Verify private behavior
+  indirectly through the public API.
+
+### What to Test
+
+- **Custom validators and business logic** — cross-field validators, domain constraints, error paths. These catch real
+  bugs.
+- **Behavioral tests** — call the public method, verify the outputs have the right shape, values, and structure. One
+  behavioral test is worth ten config-only tests.
+- **Edge cases and error paths** — boundary conditions, composed behaviors, expected exceptions.
+- **Contract tests** — required fields, rejected invalid inputs, safety mechanisms like `extra="forbid"`.
+
+### What NOT to Test
+
+- **Pydantic storing a value** — `Foo(x=1); assert foo.x == 1` tests Pydantic, not your code. If a behavioral test
+  already creates the same config and uses it, the config-only test adds nothing.
+- **Pydantic Literal defaults** — `assert config.type == "first_frame"` when `type` is `Literal["first_frame"]`.
+- **Pydantic default factories** — `assert config.conditions == []` when the field has `default_factory=list`.
+- **Tests already covered by behavioral tests** — if `test_prefix_conditioning` creates a valid `PrefixConditionConfig`
+  and exercises it end-to-end, a separate `test_prefix_valid` that just creates the same config is redundant.
+- **Trivial instantiation tests** — `strategy = Strategy(config); assert strategy.config is not None` when every other
+  test creates a strategy.
+
+### Keeping Tests DRY
+
+- **Use helper functions** for repeated setup patterns (e.g., `_make_strategy(video=_video_modality(...))` instead of
+  6-8 lines of config/strategy creation per test).
+- **Use named constants** for test dimensions (e.g., `VIDEO_SEQ_LEN`, `TOKENS_PER_FRAME`) instead of magic numbers.
+- **Merge tests that share identical setup** — when 5+ tests call `prepare_training_inputs` with the exact same
+  config and batch, each checking one assertion, merge them into one test that checks all assertions. Pytest reports
+  the exact failing line anyway.
+- **Use `@pytest.mark.parametrize`** for the same logic tested with different inputs (e.g., valid/invalid values for
+  a field).
+- **Use pytest fixtures** for shared batch data and test directories, but prefer explicit helper functions over
+  fixtures for strategy/config creation (makes the test self-documenting).
 
 ## Code Standards
 
@@ -286,7 +358,12 @@ Key classes:
 
 - `LtxTrainerConfig` - Main configuration container
 - `ModelConfig` - Model paths, training mode (`lora` | `full`), checkpoint loading
-- `TrainingStrategyConfig` - Union of `TextToVideoConfig` | `VideoToVideoConfig` (discriminated by `name`)
+- `TrainingStrategyConfig` - Union of `FlexibleStrategyConfig` | `TextToVideoConfig` (deprecated) | `VideoToVideoConfig` (deprecated)
+- `FlexibleStrategyConfig` - Unified strategy config with `video`/`audio` `ModalityConfig` blocks
+- `ModalityConfig` - Per-modality config: `is_generated`, `latents_dir`, `conditions` list
+- `ConditionConfig` - Discriminated union: `FirstFrameConditionConfig`, `PrefixConditionConfig`, `SuffixConditionConfig`, `SpatialCropConditionConfig`, `MaskConditionConfig`, `ReferenceConditionConfig`
+- `ValidationSample` - Per-sample validation config with `prompt`, `conditions`, optional `video_dims`/`seed` overrides
+- `ValidationCondition` - Discriminated union for validation conditions (first_frame, prefix, suffix, spatial_crop, mask, reference, video_to_audio, audio_to_video)
 - `LoraConfig` - Rank, alpha, dropout, target modules
 - `OptimizationConfig` - Learning rate, batch size, gradient accumulation, scheduler, gradient checkpointing
 - `AccelerationConfig` - Mixed precision, quantization, 8-bit text encoder
@@ -310,21 +387,23 @@ Key classes:
 - Implements distributed training with Accelerate
 - Handles mixed precision, gradient accumulation, checkpointing
 - `_training_step()` applies embedding connectors then delegates to strategy
-- `_load_text_encoder_and_cache_embeddings()` loads the text encoder + embeddings processor, caches validation embeddings, then unloads the Gemma LLM (keeps only the embeddings processor connectors for training)
+- `_load_text_encoder_and_cache_embeddings()` loads the text encoder + embeddings processor, caches validation
+  embeddings, then unloads the Gemma LLM (keeps only the embeddings processor connectors for training)
 - Uses training strategies for mode-specific logic
 
 **`src/ltx_trainer/training_strategies/`** - Strategy pattern
 
 - `base_strategy.py`: `TrainingStrategy` ABC, `ModelInputs` dataclass
-- `text_to_video.py`: Standard text-to-video (with optional audio)
-- `video_to_video.py`: IC-LoRA video-to-video transformations
+- `flexible.py`: FlexibleStrategy — unified conditioning framework (recommended)
+- `text_to_video.py`: TextToVideoStrategy (deprecated — use FlexibleStrategy)
+- `video_to_video.py`: VideoToVideoStrategy (deprecated — use FlexibleStrategy)
 
 Key methods each strategy implements:
 
-- `get_data_sources()` - Required data directories
 - `prepare_training_inputs()` - Convert batch to `ModelInputs` with `Modality` objects
 - `compute_loss()` - Calculate training loss (velocity prediction, MSE with masking)
-- `requires_audio` property - Whether audio components needed
+
+The strategy's **config** declares its data directories via `get_data_sources()` (single source of truth, used for both dataset wiring and existence validation).
 
 **`src/ltx_trainer/model_loader.py`** - Model loading
 
@@ -339,14 +418,13 @@ Component loaders:
 - `load_embeddings_processor(checkpoint_path)` → `EmbeddingsProcessor` (feature extractor + connectors)
 - `load_model()` → `LtxModelComponents` (convenience wrapper)
 
-**`src/ltx_trainer/validation_sampler.py`** - Inference for validation
+**`src/ltx_trainer/validation_runner.py`** - Conditioned validation sampling
 
-Uses ltx-core components for denoising:
-
-- `LTX2Scheduler` for sigma scheduling
-- `EulerDiffusionStep` for diffusion steps
-- `CFGGuider` for classifier-free guidance
-- `STGGuider` for spatio-temporal guidance
+- Manages the full validation lifecycle: embedding caching, media encoding, denoising, decoding
+- Supports all validation condition types: first_frame, prefix, suffix, spatial_crop, mask, reference, video_to_audio, audio_to_video
+- Handles frozen modality paths (sigma=0 for conditioning modality)
+- Builds conditioning items using ltx-core's `VideoConditionByLatentIndex`, `VideoConditionByReferenceLatent`, `VideoConditionByMask`
+- Optional side-by-side reference output for IC-LoRA validation
 
 **`src/ltx_trainer/timestep_samplers.py`** - Flow matching timestep sampling
 
@@ -367,11 +445,17 @@ constructs the `GemmaTextEncoder` with quantized model, feature extractor, and e
 **`src/ltx_trainer/datasets.py`** - Dataset handling
 
 - `PrecomputedDataset` loads pre-computed VAE latents and text embeddings
-- Supports video latents, audio latents, text embeddings, reference latents (for IC-LoRA)
+- Supports video latents, audio latents, text embeddings, reference video latents, reference audio latents, video masks, and audio masks
 - Handles legacy patchified format `[seq_len, C]` → automatically unpatchifies to `[C, F, H, W]`
 - `DummyDataset` for benchmarking and minimal testing
 
 ## Common Development Tasks
+
+### Agent-Assisted Training
+
+When a user asks to train, fine-tune, create a LoRA, or produce a custom LTX-2 model, use the repository skill at
+[`.claude/skills/train-model`](../../.claude/skills/train-model/SKILL.md). The skill is the orchestrator for dataset probing, mode selection, preprocessing,
+training launch, monitoring, and post-train validation; it treats `packages/ltx-trainer/docs/` as the source of truth.
 
 ### Adding a New Configuration Parameter
 
@@ -382,10 +466,16 @@ constructs the `GemmaTextEncoder` with quantized model, feature extractor, and e
 
 ### Implementing a New Training Strategy
 
+The `FlexibleStrategy` now covers all use cases (T2V, T2A, I2V, V2V, A2A, AV2AV, inpainting, outpainting, extension, A2V, V2A, IC-LoRA) through
+configuration alone. A new strategy is only needed for fundamentally different training paradigms that cannot be
+expressed via `ModalityConfig` + `ConditionConfig` combinations.
+
+If you do need a new strategy:
+
 1. Create new file in `src/ltx_trainer/training_strategies/`
-2. Create config class inheriting `TrainingStrategyConfigBase`
+2. Create config class inheriting `TrainingStrategyConfigBase` and implement `get_data_sources()`
 3. Create strategy class inheriting `TrainingStrategy`
-4. Implement: `get_data_sources()`, `prepare_training_inputs()`, `compute_loss()`
+4. Implement: `prepare_training_inputs()`, `compute_loss()`
 5. Add to `__init__.py`: import, add to `TrainingStrategyConfig` union, update factory
 6. Add discriminator tag to config.py's `TrainingStrategyConfig`
 7. Create example config file in `configs/`
@@ -449,8 +539,8 @@ video_embeds, audio_embeds, binary_mask = text_encoder.embeddings_processor.crea
 
 - Validation errors: Check validators in `config.py`
 - Unknown fields: Config uses `extra="forbid"` — all fields must be defined
-- Strategy validation: IC-LoRA requires `reference_videos` in validation config
-- Video-to-video strategy requires `training_mode: "lora"`
+- FlexibleStrategy requires at least one modality with `is_generated: true`
+- Audio modality cannot use `first_frame` or `spatial_crop` conditions
 
 **Precomputed Data:**
 
@@ -480,7 +570,7 @@ Width and height must be divisible by 32.
 ### Platform Requirements
 
 - Linux required (uses `triton` which is Linux-only)
-- CUDA GPU with 24GB+ VRAM recommended (80GB+ for full fine-tuning)
+- CUDA GPU with 32GB+ VRAM recommended
 
 ## Reference: ltx-core Key Components
 

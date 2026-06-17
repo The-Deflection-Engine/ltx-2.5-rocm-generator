@@ -2,6 +2,7 @@
 LTX-2 Pipelines: High-level video generation pipelines and utilities.
 This package provides ready-to-use pipelines for video generation:
 - TI2VidOneStagePipeline: Text/image-to-video in a single stage
+- T2AOneStagePipeline: Text-to-audio in a single stage (audio-only output)
 - TI2VidTwoStagesPipeline: Two-stage generation with upsampling
 - DistilledPipeline: Fast distilled two-stage generation
 - ICLoraPipeline: Image/video conditioning with distilled LoRA
@@ -18,6 +19,7 @@ from ltx_pipelines.ic_lora import ICLoraPipeline
 from ltx_pipelines.keyframe_interpolation import KeyframeInterpolationPipeline
 from ltx_pipelines.lipdub import LipDubPipeline
 from ltx_pipelines.retake import RetakePipeline
+from ltx_pipelines.t2a_one_stage import T2AOneStagePipeline
 from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
 from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 
@@ -28,6 +30,7 @@ __all__ = [
     "KeyframeInterpolationPipeline",
     "LipDubPipeline",
     "RetakePipeline",
+    "T2AOneStagePipeline",
     "TI2VidOneStagePipeline",
     "TI2VidTwoStagesPipeline",
 ]

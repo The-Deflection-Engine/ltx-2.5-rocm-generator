@@ -41,6 +41,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms.functional import crop, resize, to_tensor
+from torchvision.transforms.functional import resize as tv_resize
 from transformers.utils.logging import disable_progress_bar
 
 from ltx_core.model.audio_vae import AudioProcessor
@@ -73,6 +74,10 @@ app = typer.Typer(
 )
 
 
+def _clamp_01(x: torch.Tensor) -> torch.Tensor:
+    return x.clamp_(0, 1)
+
+
 class MediaDataset(Dataset):
     """
     Dataset for processing video and image files.
@@ -92,6 +97,7 @@ class MediaDataset(Dataset):
         resolution_buckets: list[tuple[int, int, int]],
         reshape_mode: str = "center",
         with_audio: bool = False,
+        temporal_subsample_factor: int = 1,
     ) -> None:
         """
         Initialize the media dataset.
@@ -101,6 +107,8 @@ class MediaDataset(Dataset):
             resolution_buckets: List of (frames, height, width) tuples
             reshape_mode: How to crop videos ("center", "random")
             with_audio: Whether to extract audio from video files
+            temporal_subsample_factor: Factor for VAE-aligned temporal subsampling.
+                When > 1, keeps frame 0 then takes every Nth frame from frame 1 onwards.
         """
         super().__init__()
 
@@ -109,6 +117,7 @@ class MediaDataset(Dataset):
         self.resolution_buckets = resolution_buckets
         self.reshape_mode = reshape_mode
         self.with_audio = with_audio
+        self.temporal_subsample_factor = temporal_subsample_factor
 
         # First load main media paths
         self.main_media_paths = self._load_video_paths(main_media_column)
@@ -124,7 +133,7 @@ class MediaDataset(Dataset):
         # Set up video transforms
         self.transforms = transforms.Compose(
             [
-                transforms.Lambda(lambda x: x.clamp_(0, 1)),
+                transforms.Lambda(_clamp_01),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
             ]
         )
@@ -142,8 +151,8 @@ class MediaDataset(Dataset):
 
         # Compute relative path of the video
         data_root = self.dataset_file.parent
-        relative_path = str(video_path.relative_to(data_root))
-        media_relative_path = str(self.main_media_paths[index].relative_to(data_root))
+        relative_path = str(_output_relative(video_path, data_root))
+        media_relative_path = str(_output_relative(self.main_media_paths[index], data_root))
 
         if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
             media_tensor = self._preprocess_image(video_path)
@@ -185,97 +194,29 @@ class MediaDataset(Dataset):
 
     @staticmethod
     def _extract_audio(video_path: Path, target_duration: float) -> dict[str, torch.Tensor | int] | None:
-        """Extract audio track from a video file, trimmed to match video duration."""
-        try:
-            # torchaudio can extract audio from video files directly
-            # waveform shape: [channels, samples]
-            waveform, sample_rate = torchaudio.load(str(video_path))
-
-            # Trim or pad to target duration
-            target_samples = int(target_duration * sample_rate)
-            current_samples = waveform.shape[-1]
-
-            if current_samples > target_samples:
-                # Trim to target duration
-                waveform = waveform[..., :target_samples]
-            elif current_samples < target_samples:
-                # Pad with zeros to target duration
-                padding = target_samples - current_samples
-                waveform = torch.nn.functional.pad(waveform, (0, padding))
-                logger.warning(f"Padded audio to {target_duration:.2f} seconds for {video_path}")
-
-            return {"waveform": waveform, "sample_rate": sample_rate}
-
-        except Exception as e:
-            logger.debug(f"Could not extract audio from {video_path}: {e}")
+        """Extract audio track from a video file, trimmed/padded to match video duration."""
+        audio = _load_audio_from_file(video_path, max_duration=target_duration)
+        if audio is None:
             return None
 
-    def _load_video_paths(self, column: str) -> list[Path]:
-        """Load video paths from the specified data source."""
-        if self.dataset_file.suffix == ".csv":
-            return self._load_video_paths_from_csv(column)
-        elif self.dataset_file.suffix == ".json":
-            return self._load_video_paths_from_json(column)
-        elif self.dataset_file.suffix == ".jsonl":
-            return self._load_video_paths_from_jsonl(column)
+        # Pad if shorter than target (_load_audio_from_file only trims, doesn't pad)
+        target_samples = int(target_duration * audio.sampling_rate)
+        if audio.waveform.shape[-1] < target_samples:
+            padding = target_samples - audio.waveform.shape[-1]
+            waveform = torch.nn.functional.pad(audio.waveform, (0, padding))
+            logger.warning(f"Padded audio to {target_duration:.2f} seconds for {video_path}")
         else:
-            raise ValueError("Expected `dataset_file` to be a path to a CSV, JSON, or JSONL file.")
+            waveform = audio.waveform
 
-    def _load_video_paths_from_csv(self, column: str) -> list[Path]:
-        """Load video paths from a CSV file."""
-        df = pd.read_csv(self.dataset_file)
-        if column not in df.columns:
-            raise ValueError(f"Column '{column}' not found in CSV file")
+        return {"waveform": waveform, "sample_rate": audio.sampling_rate}
 
-        data_root = self.dataset_file.parent
-        video_paths = [data_root / Path(line.strip()) for line in df[column].tolist()]
-
-        # Validate that all paths exist
-        invalid_paths = [path for path in video_paths if not path.is_file()]
-        if invalid_paths:
-            raise ValueError(f"Found {len(invalid_paths)} invalid video paths. First few: {invalid_paths[:5]}")
-
-        return video_paths
-
-    def _load_video_paths_from_json(self, column: str) -> list[Path]:
-        """Load video paths from a JSON file."""
-        with open(self.dataset_file, "r", encoding="utf-8") as file:
-            data = json.load(file)
-
-        if not isinstance(data, list):
-            raise ValueError("JSON file must contain a list of objects")
-
-        data_root = self.dataset_file.parent
-        video_paths = []
-        for entry in data:
-            if column not in entry:
-                raise ValueError(f"Key '{column}' not found in JSON entry")
-            video_paths.append(data_root / Path(entry[column].strip()))
-
-        # Validate that all paths exist
-        invalid_paths = [path for path in video_paths if not path.is_file()]
-        if invalid_paths:
-            raise ValueError(f"Found {len(invalid_paths)} invalid video paths. First few: {invalid_paths[:5]}")
-
-        return video_paths
-
-    def _load_video_paths_from_jsonl(self, column: str) -> list[Path]:
-        """Load video paths from a JSONL file."""
-        data_root = self.dataset_file.parent
-        video_paths = []
-        with open(self.dataset_file, "r", encoding="utf-8") as file:
-            for line in file:
-                entry = json.loads(line)
-                if column not in entry:
-                    raise ValueError(f"Key '{column}' not found in JSONL entry")
-                video_paths.append(data_root / Path(entry[column].strip()))
-
-        # Validate that all paths exist
-        invalid_paths = [path for path in video_paths if not path.is_file()]
-        if invalid_paths:
-            raise ValueError(f"Found {len(invalid_paths)} invalid video paths. First few: {invalid_paths[:5]}")
-
-        return video_paths
+    def _load_video_paths(self, column: str) -> list[Path]:
+        """Load video paths from the specified data source, validating existence."""
+        paths = _load_paths_from_dataset(self.dataset_file, column)
+        invalid = [p for p in paths if not p.is_file()]
+        if invalid:
+            raise ValueError(f"Found {len(invalid)} invalid paths in '{column}'. First few: {invalid[:5]}")
+        return paths
 
     def _filter_valid_videos(self) -> None:
         """Filter out videos with insufficient frames."""
@@ -347,6 +288,11 @@ class MediaDataset(Dataset):
 
         # Trim video to target number of frames
         frames_resized = frames_resized[:target_num_frames]
+
+        # VAE-aligned temporal subsampling: keep frame 0, then every Nth frame
+        if self.temporal_subsample_factor > 1:
+            indices = _compute_temporal_subsample_indices(target_num_frames, self.temporal_subsample_factor)
+            frames_resized = frames_resized[indices]
 
         # Apply transforms to each frame and stack
         video = torch.stack([self.transforms(frame) for frame in frames_resized], dim=0)
@@ -434,7 +380,18 @@ class MediaDataset(Dataset):
         return media_tensor
 
 
-def compute_latents(  # noqa: PLR0913, PLR0915
+def _compute_temporal_subsample_indices(num_frames: int, factor: int) -> list[int]:
+    """Compute VAE-aligned temporal subsample indices.
+    Keeps frame 0 (the VAE's standalone first-frame latent), then takes every
+    ``factor``-th frame from frame 1 onwards.  This ensures each resulting
+    8-frame VAE group spans ``factor`` groups of the original video.
+    """
+    if factor == 1:
+        return list(range(num_frames))
+    return [0, *list(range(1, num_frames, factor))]
+
+
+def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
     dataset_file: str | Path,
     video_column: str,
     resolution_buckets: list[tuple[int, int, int]],
@@ -447,7 +404,9 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     vae_tiling: bool = False,
     with_audio: bool = False,
     audio_output_dir: str | None = None,
+    num_dataloader_workers: int = 4,
     overwrite: bool = False,
+    temporal_subsample_factor: int = 1,
 ) -> None:
     """
     Process videos and save latent representations.
@@ -468,9 +427,28 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         vae_tiling: Whether to enable VAE tiling
         with_audio: Whether to extract and encode audio from videos
         audio_output_dir: Directory to save audio latents (required if with_audio=True)
+        num_dataloader_workers: Number of DataLoader worker processes (0 for in-process loading)
         overwrite: Re-process every item even if its output exists. Use when rerunning with
             changed parameters (different model, resolution, etc.) so stale outputs are replaced.
+        temporal_subsample_factor: Factor for VAE-aligned temporal subsampling of reference videos
     """
+    # Validate temporal subsampling compatibility with resolution buckets
+    if temporal_subsample_factor > 1:
+        for frames, _h, _w in resolution_buckets:
+            pixel_frames_minus_one = frames - 1
+            if pixel_frames_minus_one % temporal_subsample_factor != 0:
+                raise ValueError(
+                    f"Frame count {frames} is not compatible with "
+                    f"temporal_subsample_factor={temporal_subsample_factor}. "
+                    f"(frames - 1) must be divisible by the factor."
+                )
+            subsampled = 1 + pixel_frames_minus_one // temporal_subsample_factor
+            if (subsampled - 1) % VAE_TEMPORAL_FACTOR != 0:
+                raise ValueError(
+                    f"After temporal subsampling {frames} → {subsampled} frames, "
+                    f"result does not satisfy (frames - 1) % {VAE_TEMPORAL_FACTOR} == 0."
+                )
+
     if with_audio and audio_output_dir is None:
         raise ValueError("audio_output_dir must be provided when with_audio=True")
 
@@ -484,11 +462,13 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         resolution_buckets=resolution_buckets,
         reshape_mode=reshape_mode,
         with_audio=with_audio,
+        temporal_subsample_factor=temporal_subsample_factor,
     )
     logger.info(f"Loaded {len(dataset)} valid media files")
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+
     audio_output_path: Path | None = None
     if with_audio:
         audio_output_path = Path(audio_output_dir)
@@ -499,10 +479,10 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         logger.warning("Audio processing requires batch_size=1. Overriding batch_size to 1.")
         batch_size = 1
 
-    data_root = dataset.dataset_file.parent
+    data_root = Path(dataset_file).parent
 
     def _is_done(idx: int) -> bool:
-        rel = dataset.main_media_paths[idx].relative_to(data_root).with_suffix(".pt")
+        rel = _output_relative(dataset.main_media_paths[idx], data_root).with_suffix(".pt")
         if not (output_path / rel).is_file():
             return False
         return audio_output_path is None or (audio_output_path / rel).is_file()
@@ -510,18 +490,16 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     dataloader = _build_sharded_dataloader(
         dataset,
         batch_size=batch_size,
-        num_workers=4,
+        num_workers=num_dataloader_workers,
         is_done=_is_done,
         overwrite=overwrite,
     )
     if dataloader is None:
         return
 
-    # Load video VAE encoder
     with console.status(f"[bold]Loading video VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
         vae = load_video_vae_encoder(model_path, device=torch_device, dtype=torch.bfloat16)
 
-    # Load audio VAE encoder and audio processor if needed
     audio_vae_encoder = None
     audio_processor = None
     if with_audio:
@@ -531,7 +509,6 @@ def compute_latents(  # noqa: PLR0913, PLR0915
                 device=torch_device,
                 dtype=torch.float32,  # Audio VAE needs float32 for quality. TODO: re-test with bfloat16.
             )
-            # Create audio processor for waveform-to-spectrogram conversion
             audio_processor = AudioProcessor(
                 target_sample_rate=audio_vae_encoder.sample_rate,
                 mel_bins=audio_vae_encoder.mel_bins,
@@ -562,7 +539,7 @@ def compute_latents(  # noqa: PLR0913, PLR0915
 
             # Encode video
             with torch.inference_mode():
-                video_latent_data = encode_video(vae=vae, video=video, use_tiling=vae_tiling)
+                video_latent_data = _encode_video(vae=vae, video=video, use_tiling=vae_tiling)
 
             # Save latents for each item in batch
             for i in range(len(batch["relative_path"])):
@@ -572,13 +549,15 @@ def compute_latents(  # noqa: PLR0913, PLR0915
                 # Create output directory maintaining structure
                 output_file.parent.mkdir(parents=True, exist_ok=True)
 
-                # Index into batch to get this item's latents
+                # Store the latent's effective fps (= source_fps / subsample factor).
+                # Downstream position math expects the rate the saved latents actually have.
+                effective_fps = batch["video_metadata"]["fps"][i].item() / temporal_subsample_factor
                 latent_data = {
                     "latents": video_latent_data["latents"][i].cpu().contiguous(),  # [C, F', H', W']
                     "num_frames": video_latent_data["num_frames"],
                     "height": video_latent_data["height"],
                     "width": video_latent_data["width"],
-                    "fps": batch["video_metadata"]["fps"][i].item(),
+                    "fps": effective_fps,
                 }
 
                 _atomic_save(latent_data, output_file)
@@ -596,7 +575,7 @@ def compute_latents(  # noqa: PLR0913, PLR0915
 
                         # Encode audio
                         with torch.inference_mode():
-                            audio_latents = encode_audio(audio_vae_encoder, audio_processor, audio_data)
+                            audio_latents = _encode_audio(audio_vae_encoder, audio_processor, audio_data)
 
                         # Save audio latents
                         audio_output_file = audio_output_path / output_rel_path
@@ -625,7 +604,7 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         )
 
 
-def encode_video(
+def _encode_video(
     vae: torch.nn.Module,
     video: torch.Tensor,
     dtype: torch.dtype | None = None,
@@ -662,7 +641,7 @@ def encode_video(
 
     # Choose encoding method based on tiling flag
     if use_tiling:
-        latents = tiled_encode_video(
+        latents = _tiled_encode_video(
             vae=vae,
             video=video,
             tile_size=tile_size,
@@ -685,7 +664,7 @@ def encode_video(
     }
 
 
-def tiled_encode_video(  # noqa: PLR0912, PLR0915
+def _tiled_encode_video(  # noqa: PLR0912, PLR0915
     vae: torch.nn.Module,
     video: torch.Tensor,
     tile_size: int = DEFAULT_TILE_SIZE,
@@ -840,7 +819,7 @@ def tiled_encode_video(  # noqa: PLR0912, PLR0915
     return output
 
 
-def encode_audio(
+def _encode_audio(
     audio_vae_encoder: torch.nn.Module,
     audio_processor: torch.nn.Module,
     audio: Audio,
@@ -868,6 +847,35 @@ def encode_audio(
     if waveform.dim() == 2:
         waveform = waveform.unsqueeze(0)
 
+    # Convert to stereo if needed (audio VAE expects 2 channels)
+    # Channel order for surround: 5.1=[L,R,C,LFE,Ls,Rs], 7.1=[L,R,C,LFE,Ls,Rs,Lb,Rb]
+    num_channels = waveform.shape[1]
+    if num_channels == 1:
+        # Mono to stereo: duplicate the channel
+        waveform = waveform.repeat(1, 2, 1)
+    elif num_channels == 6:
+        # 5.1 downmix with normalized weights (sum to 1.0)
+        # Original: L = L + 0.707*C + 0.707*Ls, weights sum = 2.414
+        w_main = 1.0 / 2.414  # ~0.414
+        w_other = 0.707 / 2.414  # ~0.293
+        left = w_main * waveform[:, 0, :] + w_other * waveform[:, 2, :] + w_other * waveform[:, 4, :]
+        right = w_main * waveform[:, 1, :] + w_other * waveform[:, 2, :] + w_other * waveform[:, 5, :]
+        waveform = torch.stack([left, right], dim=1)
+    elif num_channels == 8:
+        # 7.1 downmix with normalized weights (sum to 1.0)
+        # Original: L = L + 0.707*C + 0.707*Ls + 0.707*Lb, weights sum = 3.121
+        w_main = 1.0 / 3.121  # ~0.320
+        w_other = 0.707 / 3.121  # ~0.227
+        center = waveform[:, 2, :]
+        left = w_main * waveform[:, 0, :] + w_other * (center + waveform[:, 4, :] + waveform[:, 6, :])
+        right = w_main * waveform[:, 1, :] + w_other * (center + waveform[:, 5, :] + waveform[:, 7, :])
+        waveform = torch.stack([left, right], dim=1)
+    elif num_channels > 2:
+        # Unknown layout: average all channels to mono, then duplicate to stereo
+        logger.warning(f"Unknown audio channel layout ({num_channels} channels), using mean downmix")
+        mono = waveform.mean(dim=1, keepdim=True)
+        waveform = mono.repeat(1, 2, 1)
+
     # Calculate duration
     duration = waveform.shape[-1] / audio.sampling_rate
 
@@ -887,6 +895,372 @@ def encode_audio(
         "frequency_bins": freq_bins,
         "duration": duration,
     }
+
+
+AUDIO_FILE_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".aac", ".m4a"}
+VIDEO_FILE_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+IMAGE_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".heic", ".heif", ".bmp", ".tiff", ".webp"}
+
+
+def compute_video_masks(
+    dataset_file: str | Path,
+    mask_column: str,
+    latents_dir: str,
+    output_dir: str,
+    main_media_column: str | None = None,
+    overwrite: bool = False,
+) -> None:
+    """Preprocess video mask files to latent-space binary masks.
+    For each sample, loads the mask video/image, applies the same spatial
+    resize/crop as the target video (read from saved latent metadata), downsamples
+    to latent dimensions, binarizes, and saves as a .pt tensor.
+    Args:
+        dataset_file: Path to metadata file (CSV/JSON/JSONL).
+        mask_column: Column name containing mask video/image paths.
+        latents_dir: Directory containing the target video latents (for reading
+            spatial/temporal metadata to ensure mask alignment).
+        output_dir: Directory to save mask .pt files.
+        main_media_column: Column for output file naming (defaults to mask_column).
+    """
+    dataset_path = Path(dataset_file)
+    data_root = dataset_path.parent
+    latents_path = Path(latents_dir)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    naming_column = main_media_column or mask_column
+    mask_paths = _load_paths_from_dataset(dataset_path, mask_column)
+    naming_paths = _load_paths_from_dataset(dataset_path, naming_column) if naming_column != mask_column else mask_paths
+
+    success = 0
+    for mask_file, naming_file in zip(mask_paths, naming_paths, strict=True):
+        rel_path = _output_relative(naming_file, data_root)
+        latent_file = latents_path / rel_path.with_suffix(".pt")
+        out_file = output_path / rel_path.with_suffix(".pt")
+
+        if not latent_file.exists():
+            logger.warning(f"No target latent found at {latent_file}, skipping mask {mask_file}")
+            continue
+
+        if not overwrite and out_file.is_file():
+            continue
+
+        target_meta = torch.load(latent_file, map_location="cpu", weights_only=True)
+        latent_f = target_meta["num_frames"]
+        latent_h = target_meta["height"]
+        latent_w = target_meta["width"]
+        pixel_h = latent_h * VAE_SPATIAL_FACTOR
+        pixel_w = latent_w * VAE_SPATIAL_FACTOR
+        pixel_f = (latent_f - 1) * VAE_TEMPORAL_FACTOR + 1
+
+        # Load mask as video or image
+        if mask_file.suffix.lower() in IMAGE_FILE_EXTENSIONS:
+            img = to_tensor(open_image_as_srgb(mask_file)).mean(dim=0, keepdim=True)  # [1, H, W]
+            img = tv_resize(img.unsqueeze(0), [pixel_h, pixel_w]).squeeze(0)  # [1, H, W]
+            mask_pixels = img.expand(pixel_f, -1, -1)  # tile across frames → [F, H, W]
+        else:
+            frames, _ = read_video(str(mask_file), max_frames=pixel_f)  # [F, C, H, W]
+            frames = frames[:pixel_f].mean(dim=1)  # grayscale → [F, H, W]
+            frames = torch.nn.functional.interpolate(
+                frames.unsqueeze(1), size=(pixel_h, pixel_w), mode="nearest"
+            ).squeeze(1)  # [F, H, W]
+            mask_pixels = frames
+
+        # Downsample to latent dims: [F, H, W] → [F', H', W']
+        mask_latent = torch.nn.functional.avg_pool2d(mask_pixels.unsqueeze(1), kernel_size=VAE_SPATIAL_FACTOR).squeeze(
+            1
+        )  # [F, H', W'] → spatial done
+        # Temporal: max-pool over groups of VAE_TEMPORAL_FACTOR frames (any masked frame masks the group)
+        f_spatial = mask_latent.shape[0]
+        pad_f = (VAE_TEMPORAL_FACTOR - f_spatial % VAE_TEMPORAL_FACTOR) % VAE_TEMPORAL_FACTOR
+        if pad_f > 0:
+            mask_latent = torch.nn.functional.pad(mask_latent, (0, 0, 0, 0, 0, pad_f))
+        h_prime, w_prime = mask_latent.shape[1], mask_latent.shape[2]
+        mask_latent = mask_latent.reshape(-1, VAE_TEMPORAL_FACTOR, h_prime, w_prime).amax(dim=1)[:latent_f]
+
+        # Binarize
+        mask_latent = (mask_latent > 0.5).float()
+
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_save({"mask": mask_latent}, out_file)
+        success += 1
+
+    logger.info(f"Mask preprocessing complete: {success} masks saved to {output_path}")
+
+
+def compute_audio_masks(
+    dataset_file: str | Path,
+    mask_column: str,
+    audio_latents_dir: str,
+    output_dir: str,
+    main_media_column: str | None = None,
+    overwrite: bool = False,
+) -> None:
+    """Preprocess audio mask files to latent-space binary masks.
+    For each sample, loads the mask (a 1D waveform-like signal or a simple tensor),
+    resamples it to match the target audio latent temporal length, binarizes, and saves.
+    Args:
+        dataset_file: Path to metadata file (CSV/JSON/JSONL).
+        mask_column: Column name containing mask file paths (.wav or .pt).
+        audio_latents_dir: Directory containing the target audio latents (for reading
+            temporal metadata to ensure mask alignment).
+        output_dir: Directory to save mask .pt files.
+        main_media_column: Column for output file naming (defaults to mask_column).
+    """
+    dataset_path = Path(dataset_file)
+    data_root = dataset_path.parent
+    audio_latents_path = Path(audio_latents_dir)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    naming_column = main_media_column or mask_column
+    mask_paths = _load_paths_from_dataset(dataset_path, mask_column)
+    naming_paths = _load_paths_from_dataset(dataset_path, naming_column) if naming_column != mask_column else mask_paths
+
+    success = 0
+    for mask_file, naming_file in zip(mask_paths, naming_paths, strict=True):
+        rel_path = _output_relative(naming_file, data_root)
+        latent_file = audio_latents_path / rel_path.with_suffix(".pt")
+        out_file = output_path / rel_path.with_suffix(".pt")
+
+        if not latent_file.exists():
+            logger.warning(f"No target audio latent found at {latent_file}, skipping mask {mask_file}")
+            continue
+
+        if not overwrite and out_file.is_file():
+            continue
+
+        target_meta = torch.load(latent_file, map_location="cpu", weights_only=True)
+        latent_t = target_meta["num_time_steps"]
+
+        # Load mask: .pt file (raw tensor) or .wav (use amplitude envelope)
+        if mask_file.suffix == ".pt":
+            raw_mask = torch.load(mask_file, map_location="cpu", weights_only=True)
+            if isinstance(raw_mask, dict):
+                raw_mask = raw_mask.get("mask", next(iter(raw_mask.values())))
+            raw_mask = raw_mask.float().flatten()
+        else:
+            audio = _load_audio_from_file(mask_file)
+            if audio is None:
+                logger.warning(f"Could not load audio mask from {mask_file}")
+                continue
+            raw_mask = audio.waveform.abs().mean(dim=0)  # mono amplitude envelope
+
+        # Resample to target audio latent length
+        mask_resampled = torch.nn.functional.interpolate(
+            raw_mask.unsqueeze(0).unsqueeze(0), size=latent_t, mode="nearest"
+        ).squeeze()  # [latent_t]
+
+        mask_binary = (mask_resampled > 0.5).float()
+
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_save({"mask": mask_binary}, out_file)
+        success += 1
+
+    logger.info(f"Audio mask preprocessing complete: {success} masks saved to {output_path}")
+
+
+def compute_audio_latents(  # noqa: PLR0915
+    dataset_file: str | Path,
+    audio_column: str,
+    output_dir: str,
+    model_path: str,
+    main_media_column: str | None = None,
+    max_duration: float | None = None,
+    duration_buckets: list[float] | None = None,
+    device: str = "cuda",
+    overwrite: bool = False,
+) -> None:
+    """Encode audio files into latent representations.
+    Supports standalone audio files (.wav, .mp3, etc.) and audio tracks
+    extracted from video files (.mp4, etc.).
+    Args:
+        dataset_file: Path to metadata file (CSV/JSON/JSONL).
+        audio_column: Column name containing audio file paths.
+        output_dir: Directory to save audio latents.
+        model_path: Path to LTX-2 checkpoint (.safetensors).
+        main_media_column: Column for output file naming (defaults to audio_column).
+            Ensures alignment with other latent directories.
+        max_duration: Maximum audio duration in seconds. Audio is trimmed if longer.
+            Mutually exclusive with duration_buckets.
+        duration_buckets: List of allowed durations in seconds (e.g. [2.0, 4.0, 8.0]).
+            Each audio file is matched to the largest bucket that fits its duration,
+            then trimmed to exactly that length. Files shorter than the smallest
+            bucket are skipped. Ensures uniform lengths for batched training.
+        device: Device to use for computation.
+    """
+    console = Console()
+    torch_device = torch.device(device)
+
+    dataset_path = Path(dataset_file)
+    data_root = dataset_path.parent
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    naming_column = main_media_column or audio_column
+    audio_paths = _load_paths_from_dataset(dataset_path, audio_column)
+    naming_paths = (
+        _load_paths_from_dataset(dataset_path, naming_column) if naming_column != audio_column else audio_paths
+    )
+
+    with console.status(f"[bold]Loading audio VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
+        audio_vae_encoder = load_audio_vae_encoder(
+            checkpoint_path=model_path,
+            device=torch_device,
+            dtype=torch.float32,
+        )
+        audio_processor = AudioProcessor(
+            target_sample_rate=audio_vae_encoder.sample_rate,
+            mel_bins=audio_vae_encoder.mel_bins,
+            mel_hop_length=audio_vae_encoder.mel_hop_length,
+            n_fft=audio_vae_encoder.n_fft,
+        ).to(torch_device)
+
+    sorted_buckets = sorted(duration_buckets, reverse=True) if duration_buckets else None
+    success_count = 0
+    skip_count = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Encoding audio", total=len(audio_paths))
+
+        for audio_path, naming_path in zip(audio_paths, naming_paths, strict=True):
+            rel_path = _output_relative(naming_path, data_root)
+            output_file = output_path / rel_path.with_suffix(".pt")
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+
+            if not overwrite and output_file.is_file():
+                success_count += 1
+                progress.advance(task)
+                continue
+
+            # Load audio (no trimming yet — need full duration for bucket matching)
+            audio = _load_audio_from_file(audio_path)
+            if audio is None:
+                skip_count += 1
+                progress.advance(task)
+                continue
+
+            file_duration = audio.waveform.shape[-1] / audio.sampling_rate
+
+            # Determine target duration: bucket matching, max_duration cap, or full file
+            target_duration = file_duration
+            if sorted_buckets:
+                bucket = next((b for b in sorted_buckets if b <= file_duration), None)
+                if bucket is None:
+                    logger.warning(
+                        f"Skipping {audio_path.name} ({file_duration:.1f}s) — shorter than "
+                        f"smallest bucket ({sorted_buckets[-1]:.1f}s)"
+                    )
+                    skip_count += 1
+                    progress.advance(task)
+                    continue
+                target_duration = bucket
+            elif max_duration is not None:
+                target_duration = min(file_duration, max_duration)
+
+            # Trim to target duration
+            target_samples = int(target_duration * audio.sampling_rate)
+            trimmed_waveform = audio.waveform[:, :target_samples]
+            audio = Audio(waveform=trimmed_waveform, sampling_rate=audio.sampling_rate)
+
+            with torch.inference_mode():
+                audio_latents = _encode_audio(audio_vae_encoder, audio_processor, audio)
+
+            _atomic_save(
+                {
+                    "latents": audio_latents["latents"].cpu().contiguous(),
+                    "num_time_steps": audio_latents["num_time_steps"],
+                    "frequency_bins": audio_latents["frequency_bins"],
+                    "duration": audio_latents["duration"],
+                },
+                output_file,
+            )
+            success_count += 1
+            progress.advance(task)
+
+    logger.info(f"Audio encoding complete: {success_count} encoded, {skip_count} skipped. Saved to {output_path}")
+
+
+def _output_relative(path: Path, data_root: Path) -> Path:
+    """Relative path used to name a sample's cached output, mirroring the input layout.
+    Normally media lives under the dataset directory and this is just the path relative to it.
+    If a media path is absolute or otherwise outside the dataset directory (e.g. a one-off
+    metadata file that references media elsewhere), mirror its absolute structure under the
+    output directory instead of raising, so out-of-tree media stays collision-free.
+    """
+    try:
+        return path.relative_to(data_root)
+    except ValueError:
+        return Path(*path.parts[1:]) if path.is_absolute() else path
+
+
+def _load_paths_from_dataset(dataset_file: Path, column: str) -> list[Path]:
+    """Load file paths from a dataset column, resolving relative to the dataset file's directory."""
+    data_root = dataset_file.parent
+
+    if dataset_file.suffix == ".csv":
+        df = pd.read_csv(dataset_file)
+        if column not in df.columns:
+            raise ValueError(f"Column '{column}' not found in CSV file")
+        return [data_root / Path(str(v).strip()) for v in df[column].tolist()]
+
+    if dataset_file.suffix == ".json":
+        with open(dataset_file, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError("JSON file must contain a list of objects")
+        return [data_root / Path(entry[column].strip()) for entry in data]
+
+    if dataset_file.suffix == ".jsonl":
+        paths = []
+        with open(dataset_file, encoding="utf-8") as f:
+            for line in f:
+                entry = json.loads(line)
+                paths.append(data_root / Path(entry[column].strip()))
+        return paths
+
+    raise ValueError(f"Unsupported dataset format: {dataset_file.suffix}")
+
+
+def _load_audio_from_file(audio_path: Path, max_duration: float | None = None) -> Audio | None:
+    """Load audio from an audio or video file, optionally trimming to max_duration."""
+    try:
+        waveform, sample_rate = torchaudio.load(str(audio_path))
+    except Exception:
+        logger.debug(f"Could not load audio from {audio_path}")
+        return None
+
+    if max_duration is not None:
+        max_samples = int(max_duration * sample_rate)
+        if waveform.shape[-1] > max_samples:
+            waveform = waveform[:, :max_samples]
+
+    return Audio(waveform=waveform, sampling_rate=sample_rate)
+
+
+def detect_dataset_columns(dataset_file: str | Path) -> set[str]:
+    """Read column names from a dataset file without loading all data."""
+    path = Path(dataset_file)
+    if path.suffix == ".csv":
+        df = pd.read_csv(path, nrows=0)
+        return set(df.columns)
+    if path.suffix == ".json":
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data[0].keys()) if isinstance(data, list) and data else set()
+    if path.suffix == ".jsonl":
+        with open(path, encoding="utf-8") as f:
+            return set(json.loads(f.readline()).keys())
+    return set()
 
 
 def parse_resolution_buckets(resolution_buckets_str: str) -> list[tuple[int, int, int]]:
@@ -1041,11 +1415,11 @@ def main(  # noqa: PLR0913
     ),
 ) -> None:
     """Process videos/images and save latent representations for video generation training.
-    For multi-GPU preprocessing, invoke under ``accelerate launch`` - each process
-    will handle an interleaved shard of the dataset.
     This script processes videos and images from metadata files and saves latent representations
     that can be used for training video generation models. The output latents will maintain
     the same folder structure and naming as the corresponding media files.
+    For multi-GPU preprocessing, invoke under ``accelerate launch`` -- each process
+    will handle an interleaved shard of the dataset.
     Examples:
         # Process videos from a CSV file
         python scripts/process_videos.py dataset.csv --resolution-buckets 768x768x25 \\

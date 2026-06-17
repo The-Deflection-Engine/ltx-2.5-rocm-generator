@@ -31,6 +31,17 @@ def read_lora_reference_downscale_factor(lora_path: str) -> int:
         return 1
 
 
+def read_lora_reference_temporal_scale_factor(lora_path: str) -> int:
+    """Read ``reference_temporal_scale_factor`` from LoRA safetensors metadata (default 1)."""
+    try:
+        with safe_open(lora_path, framework="pt") as f:
+            metadata = f.metadata() or {}
+            return int(metadata.get("reference_temporal_scale_factor", 1))
+    except Exception as e:
+        logging.warning("Failed to read metadata from LoRA file '%s': %s", lora_path, e)
+        return 1
+
+
 def downsample_mask_video_to_latent(
     mask: torch.Tensor,
     target_latent_shape: VideoLatentShape,
@@ -66,6 +77,12 @@ def downsample_mask_video_to_latent(
     return rearrange(latent_mask, "b 1 f h w -> b (f h w)")
 
 
+def temporal_subsample(video: torch.Tensor, temporal_scale_factor: int) -> torch.Tensor:
+    """VAE-aligned temporal subsampling: keep frame 0, then every Nth frame."""
+    indices = [0, *list(range(1, video.shape[2], temporal_scale_factor))]
+    return video[:, :, indices]
+
+
 def append_ic_lora_reference_video_conditionings(  # noqa: PLR0913
     conditionings: list[ConditioningItem],
     video_conditioning: list[tuple[str, float]],
@@ -77,6 +94,7 @@ def append_ic_lora_reference_video_conditionings(  # noqa: PLR0913
     dtype: torch.dtype,
     device: torch.device,
     reference_downscale_factor: int,
+    reference_temporal_scale_factor: int = 1,
     conditioning_attention_strength: float,
     conditioning_attention_mask: torch.Tensor | None,
     tiling_config: TilingConfig | None = None,
@@ -93,6 +111,8 @@ def append_ic_lora_reference_video_conditionings(  # noqa: PLR0913
     for video_path, strength in video_conditioning:
         frame_gen = decode_video_by_frame(path=video_path, frame_cap=num_frames, device=device)
         video = video_preprocess(frame_gen, ref_height, ref_width, dtype, device)
+        if reference_temporal_scale_factor > 1:
+            video = temporal_subsample(video, reference_temporal_scale_factor)
         if tiling_config is not None:
             encoded_video = video_encoder.tiled_encode(video, tiling_config)
         else:
@@ -113,6 +133,7 @@ def append_ic_lora_reference_video_conditionings(  # noqa: PLR0913
         cond = VideoConditionByReferenceLatent(
             latent=encoded_video,
             downscale_factor=scale,
+            temporal_scale_factor=reference_temporal_scale_factor,
             strength=strength,
         )
         if attn_mask is not None:

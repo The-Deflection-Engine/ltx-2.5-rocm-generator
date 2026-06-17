@@ -1,8 +1,8 @@
 # =============================================================================
-# LTX-2 Audio-Video LoRA Training Configuration (Low VRAM)
+# LTX-2 Text-to-Video LoRA Training Configuration (Low VRAM)
 # =============================================================================
 #
-# This is a memory-optimized variant of the standard audio-video LoRA config.
+# This is a memory-optimized variant of the standard text-to-video LoRA config.
 # It uses 8-bit optimizer, int8 quantization, and reduced LoRA rank to minimize
 # GPU memory usage while maintaining good training quality.
 #
@@ -15,15 +15,15 @@
 # Recommended for GPUs with 32GB VRAM (e.g., RTX 5090).
 #
 # Use this configuration when you want to:
-#   - Fine-tune LTX-2 on your own video dataset
-#   - Train with or without audio generation
+#   - Fine-tune LTX-2 on your own video dataset with limited GPU memory
+#   - Train joint audio-video generation from text prompts
 #   - Create custom video generation styles or audiovisual concepts
 #
-# Dataset structure for text-to-video training:
+# Dataset structure:
 #   preprocessed_data_root/
 #   ├── latents/        # Video latents (VAE-encoded videos)
 #   ├── conditions/     # Text embeddings for each video
-#   └── audio_latents/  # Audio latents (only if with_audio: true)
+#   └── audio_latents/  # Audio latents (VAE-encoded audio)
 #
 # =============================================================================
 
@@ -103,24 +103,29 @@ lora:
 # -----------------------------------------------------------------------------
 # Training Strategy Configuration
 # -----------------------------------------------------------------------------
-# Defines the text-to-video training approach.
+# Defines the training approach using the unified flexible strategy.
+# This configuration trains both video and audio generation from text prompts.
 training_strategy:
-  # Strategy name: "text_to_video" for standard text-to-video training
-  name: "text_to_video"
+  # Strategy name: "flexible" for the unified conditioning framework
+  # Supports all training modes (T2V, I2V, V2V, A2V, V2A, etc.) through
+  # modality-specific configuration blocks.
+  name: "flexible"
 
-  # Probability of conditioning on the first frame during training
-  # Higher values train the model to perform better in image-to-video (I2V) mode,
-  # where a clean first frame is provided and the model generates the rest of the video
-  # Increase this value to train the model to perform better in image-to-video (I2V) mode
-  first_frame_conditioning_p: 0.5
+  # Video modality configuration
+  # When is_generated is true, the model learns to generate (denoise) video
+  video:
+    # Whether the model generates video (true) or uses it as frozen conditioning (false)
+    is_generated: true
+    # Directory name (within preprocessed_data_root) containing video latents
+    latents_dir: "latents"
 
-  # Enable joint audio-video training
-  # Set to true if your dataset includes audio and you want to train the audio branch
-  with_audio: true
-
-  # Directory name (within preprocessed_data_root) containing audio latents
-  # Only used when with_audio is true
-  audio_latents_dir: "audio_latents"
+  # Audio modality configuration
+  # When is_generated is true, the model learns to generate (denoise) audio
+  audio:
+    # Whether the model generates audio (true) or uses it as frozen conditioning (false)
+    is_generated: true
+    # Directory name (within preprocessed_data_root) containing audio latents
+    latents_dir: "audio_latents"
 
 # -----------------------------------------------------------------------------
 # Optimization Configuration
@@ -178,9 +183,9 @@ acceleration:
   # Useful when GPU memory is limited
   load_text_encoder_in_8bit: true
 
-  # Offload optimizer state to CPU during validation video sampling.
-  # Helps avoid OOM when VAE decoder + transformer + optimizer state can't coexist
-  # on the GPU (full fine-tune, high-rank LoRA). No effect for FSDP.
+  # Offload optimizer state to CPU during validation video sampling and restore it after.
+  # Frees VRAM for the VAE decoder when optimizer state is large (full fine-tune, high-rank
+  # LoRA). No effect under FSDP (sharded state).
   offload_optimizer_during_validation: true
 
 # -----------------------------------------------------------------------------
@@ -189,7 +194,7 @@ acceleration:
 # Specifies the training data location and loading parameters.
 data:
   # Root directory containing preprocessed training data
-  # Should contain: latents/, conditions/, and optionally audio_latents/
+  # Should contain: latents/, conditions/, and audio_latents/
   preprocessed_data_root: "/path/to/preprocessed/data"
 
   # Number of worker processes for data loading
@@ -199,23 +204,30 @@ data:
 # -----------------------------------------------------------------------------
 # Validation Configuration
 # -----------------------------------------------------------------------------
-# Controls validation video generation during training.
+# Controls validation sampling during training.
 # NOTE: Validation sampling use simplified inference pipelines and prioritizes speed over
 # maximum quality. For production-quality inference, use `packages/ltx-pipelines`.
 validation:
-  # Text prompts for validation video generation
-  # Provide prompts representative of your training data
-  # LTX-2 prefers longer, detailed prompts that describe both visual content and audio
-  prompts:
-    - "A woman with long brown hair sits at a wooden desk in a cozy home office, typing on a laptop while occasionally glancing at notes beside her. Soft natural light streams through a large window, casting warm shadows across the room. She pauses to take a sip from a ceramic mug, then continues working with focused concentration. The audio captures the gentle clicking of keyboard keys, the soft rustle of papers, and ambient room tone with occasional distant bird chirps from outside."
-    - "A chef in a white uniform stands in a professional kitchen, carefully plating a gourmet dish with precise movements. Steam rises from freshly cooked vegetables as he arranges them with tweezers. The stainless steel surfaces gleam under bright overhead lights, and various pots simmer on the stove behind him. The audio features the sizzling of pans, the clinking of utensils against plates, and the ambient hum of kitchen ventilation."
+  # Validation samples — each sample describes a self-contained generation request.
+  # Use 'conditions' to add conditioning (first_frame, prefix, suffix, reference, video_to_audio, etc.)
+  # See docs/configuration-reference.md#validation-condition-types for the full list of condition types.
+  samples:
+    - prompt: >-
+        A woman with long brown hair sits at a wooden desk in a cozy home office, typing on a
+        laptop while occasionally glancing at notes beside her. Soft natural light streams through
+        a large window, casting warm shadows across the room. She pauses to take a sip from a
+        ceramic mug, then continues working with focused concentration. The audio captures the
+        gentle clicking of keyboard keys, the soft rustle of papers, and ambient room tone with
+        occasional distant bird chirps from outside.
+    - prompt: >-
+        A chef in a white uniform stands in a professional kitchen, carefully plating a gourmet
+        dish with precise movements. Steam rises from freshly cooked vegetables as he arranges
+        them with tweezers. The stainless steel surfaces gleam under bright overhead lights, and
+        various pots simmer on the stove behind him. The audio features the sizzling of pans,
+        the clinking of utensils against plates, and the ambient hum of kitchen ventilation.
 
   # Negative prompt to avoid unwanted artifacts
   negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"
-
-  # Optional: First frame images for image-to-video validation
-  # If provided, must have one image per prompt
-  images: null
 
   # Output video dimensions [width, height, frames]
   # Width and height must be divisible by 32
@@ -247,7 +259,7 @@ validation:
   stg_mode: "stg_av"  # "stg_av" perturbs both audio and video, "stg_v" video only
 
   # Whether to generate audio in validation samples
-  # Independent of training_strategy.with_audio - you can generate audio
+  # Independent of training_strategy audio modality settings — you can generate audio
   # in validation even when not training the audio branch
   generate_audio: true
 
@@ -310,9 +322,9 @@ wandb:
   entity: null
 
   # Tags to help organize runs
-  tags: [ "ltx2", "lora" ]
+  tags: [ "ltx2", "lora", "t2v", "low-vram" ]
 
-  # Log validation videos to W&B
+  # Log validation media (video/audio) to W&B
   log_validation_videos: true
 
 # -----------------------------------------------------------------------------
@@ -324,4 +336,4 @@ wandb:
 seed: 42
 
 # Directory to save outputs (checkpoints, validation videos, logs)
-output_dir: "outputs/ltx2_av_lora"
+output_dir: "outputs/t2v_lora_low_vram"

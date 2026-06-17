@@ -1,59 +1,117 @@
 """
 Audio-visual media captioning using multimodal models.
 This module provides captioning capabilities for videos with audio using:
-- Qwen2.5-Omni: Local model supporting text, audio, image, and video inputs (default)
-- Gemini Flash: Cloud-based API for audio-visual captioning
-Requirements:
-- Qwen2.5-Omni: transformers>=4.50, torch
-- Gemini Flash: google-generativeai (uv pip install google-generativeai)
-  Set GEMINI_API_KEY or GOOGLE_API_KEY environment variable
+- Qwen3-Omni via a local vLLM server (default)
+- Gemini Flash 3.5 (cloud API)
+Both produce a single combined English caption per video as a single
+continuous paragraph of prose.
+The Qwen3-Omni backend runs in a separately-launched vLLM server rather than
+in-process, so vLLM's heavy CUDA dependencies stay out of this package. The
+captioner talks to it over the OpenAI-compatible HTTP API.
+Launch the server once (in an isolated environment) with:
+.. code-block:: bash
+    uv run python scripts/serve_captioner.py
+That helper picks BF16 vs FP8 dynamic quantization based on the GPU's free
+memory and forwards everything else to ``vllm serve``. To check the recommended
+command without running it, pass ``--print-cmd``.
+To use Gemini instead, install ``google-genai`` and either set ``GEMINI_API_KEY``
+(Gemini Developer API) or have Google Cloud credentials available (gcloud / an
+attached service account), in which case it uses Vertex AI automatically.
 """
 
-import itertools
+import json
+import os
 import re
+import subprocess
+import tempfile
 from abc import ABC, abstractmethod
 from enum import Enum
 from pathlib import Path
+from typing import ClassVar
 
-import torch
+DEFAULT_VIDEO_CAPTION_INSTRUCTION = """\
+Analyze this video and produce a single detailed caption covering both its visual content and its audio. Be \
+detailed enough that someone reading the caption could form an accurate mental picture of what happens on screen \
+and what can be heard. Be exhaustive: include every meaningful detail you can see and hear, including small \
+objects, textures, secondary movements, and minor background sounds.
 
-# Instruction for audio-visual captioning (default) - includes speech transcription and sounds
-DEFAULT_CAPTION_INSTRUCTION = """\
-Analyze this media and provide a detailed caption in the following EXACT format. Fill in ALL sections:
+Begin the caption directly with the action or visual detail; do not preface it with phrases like \
+"The video opens with...", "The scene shows...", "We see...", or "There is...".
 
-[VISUAL]: <Detailed description of people, objects, actions, settings, colors, and movements>
-[SPEECH]: <Word-for-word transcription of everything spoken.
-           Listen carefully and transcribe the exact words. If no speech, write "None">
-[SOUNDS]: <Description of music, ambient sounds, sound effects. If none, write "None">
-[TEXT]: <Any on-screen text visible. If none, write "None">
+For every shot, include:
+- The shot type and framing (extreme wide / wide / medium / medium close-up / close-up / extreme close-up) and any \
+camera motion.
+- Characters' clothing, appearance, posture, and movement (direction, speed, quality).
+- The environment's materials, textures, lighting, and colors.
+- All audio: spoken dialogue (quoted exactly in the original language), tone of voice, music (style, mood, \
+volume changes), and environmental sounds. If a category is absent -- for example no music is playing, or no one is \
+speaking -- state that explicitly. Do not invent specific instruments, music genres, moods, or ambient sounds \
+that are not actually present.
+- Any on-screen text (signs, titles, labels).
 
-You MUST fill in all four sections. For [SPEECH], transcribe the actual words spoken, not a summary."""
+Describe only what is visible or audible. Do not infer emotions, intentions, or anything outside the segment. \
+Refer to people descriptively (e.g., "the man in the blue jacket"). Narrate strictly in chronological order; if \
+the video contains multiple shots, describe each one in turn.
 
-# Instruction for video-only captioning (no audio processing)
-VIDEO_ONLY_CAPTION_INSTRUCTION = """\
-Analyze this media and provide a detailed caption in the following EXACT format. Fill in ALL sections:
+Write everything as a single continuous paragraph of prose. Do not use section headers, bullet points, or labels \
+like "Audio:" / "Visual:" / "Shot:". Integrate visual and audio details naturally within the same sentences.
 
-[VISUAL]: <Detailed description of people, objects, actions, settings, colors, and movements>
-[TEXT]: <Any on-screen text visible. If none, write "None">
+Return a JSON object with exactly one key:
 
-You MUST fill in both sections."""
+{"combined_caption_english": "<your caption here>"}"""
+
+
+DEFAULT_IMAGE_CAPTION_INSTRUCTION = """\
+Analyze this image and produce a single detailed caption of its visual content. Be detailed enough that \
+someone reading the caption could form an accurate mental picture of the image. Be thorough: include every meaningful \
+detail that is actually present, including small objects, textures, and background elements.
+
+Begin the caption directly with the main subject or a visual detail; do not preface it with phrases like \
+"The image shows...", "This is a photo of...", "We see...", or "There is...".
+
+Include:
+- The framing and composition (close-up / medium / wide / overhead, etc.) and the vantage point.
+- The medium or style if distinctive (photograph, illustration, 3D render, painting).
+- People's clothing, appearance, and posture, and what they are doing.
+- The setting's materials, textures, lighting, and colors.
+- Transcribe any visible text verbatim (signs, labels, titles, captions).
+
+Describe only what is visible. Do not infer emotions or intentions, and do not describe sounds, motion, or \
+events before or after the moment shown -- this is a single still image. When something is ambiguous, describe \
+the visible cue (e.g., "warm low-angle light") rather than guessing the underlying fact (e.g., "sunrise"). \
+Refer to people descriptively (e.g., "the man in the blue jacket").
+
+Only describe what is present. Never state that something is absent or missing -- do not write phrases like \
+"there is no text", "no people are present", or "no other objects". If a category such as people or text does \
+not appear, simply leave it out.
+
+Write everything as a single continuous paragraph of prose. Do not use section headers, bullet points, or \
+labels.
+
+Return a JSON object with exactly one key:
+
+{"combined_caption_english": "<your caption here>"}"""
+
+
+# Default model served by ``scripts/serve_captioner.py``. The captioner does not
+# download or load this model itself -- it just sends requests to the vLLM
+# server, which already has the model loaded.
+DEFAULT_QWEN_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Thinking"
+DEFAULT_VLLM_BASE_URL = "http://127.0.0.1:8001/v1"
+
+# Key the combined-caption prompt asks the model to return its caption under.
+_CAPTION_JSON_KEY = "combined_caption_english"
 
 
 class CaptionerType(str, Enum):
     """Enum for different types of media captioners."""
 
-    QWEN_OMNI = "qwen_omni"  # Local Qwen2.5-Omni model (audio + video)
-    GEMINI_FLASH = "gemini_flash"  # Gemini Flash API (audio + video)
+    QWEN_OMNI = "qwen_omni"  # Qwen3-Omni via local vLLM HTTP server
+    GEMINI_FLASH = "gemini_flash"  # Gemini Flash 3.5 cloud API
 
 
 def create_captioner(captioner_type: CaptionerType, **kwargs) -> "MediaCaptioningModel":
-    """Factory function to create a media captioner.
-    Args:
-        captioner_type: The type of captioner to create
-        **kwargs: Additional arguments to pass to the captioner constructor
-    Returns:
-        An instance of a MediaCaptioningModel
-    """
+    """Factory function to create a media captioner."""
     match captioner_type:
         case CaptionerType.QWEN_OMNI:
             return QwenOmniCaptioner(**kwargs)
@@ -66,336 +124,332 @@ def create_captioner(captioner_type: CaptionerType, **kwargs) -> "MediaCaptionin
 class MediaCaptioningModel(ABC):
     """Abstract base class for audio-visual media captioning models."""
 
+    instruction: str | None = None
+
     @abstractmethod
     def caption(self, path: str | Path, **kwargs) -> str:
-        """Generate a caption for the given video or image.
-        Args:
-            path: Path to the video/image file to caption
-        Returns:
-            A string containing the generated caption
-        """
+        """Generate a caption for the given video or image."""
 
-    @property
-    @abstractmethod
-    def supports_audio(self) -> bool:
-        """Whether this captioner supports audio input."""
+    def _resolve_instruction(self, path: str | Path) -> str:
+        """Return the custom instruction, or the image/video default for this input."""
+        if self.instruction is not None:
+            return self.instruction
+        return DEFAULT_IMAGE_CAPTION_INSTRUCTION if self._is_image_file(path) else DEFAULT_VIDEO_CAPTION_INSTRUCTION
 
     @staticmethod
     def _is_image_file(path: str | Path) -> bool:
-        """Check if the file is an image based on extension."""
         return str(path).lower().endswith((".png", ".jpg", ".jpeg", ".heic", ".heif", ".webp"))
 
     @staticmethod
     def _is_video_file(path: str | Path) -> bool:
-        """Check if the file is a video based on extension."""
         return str(path).lower().endswith((".mp4", ".avi", ".mov", ".mkv", ".webm"))
-
-    @staticmethod
-    def _clean_raw_caption(caption: str) -> str:
-        """Clean up the raw caption by removing common VLM patterns."""
-        start = ["The", "This"]
-        kind = ["video", "image", "scene", "animated sequence", "clip", "footage"]
-        act = ["displays", "shows", "features", "depicts", "presents", "showcases", "captures", "contains"]
-
-        for x, y, z in itertools.product(start, kind, act):
-            caption = caption.replace(f"{x} {y} {z} ", "", 1)
-
-        return caption
 
 
 class QwenOmniCaptioner(MediaCaptioningModel):
-    """Audio-visual captioning using Alibaba's Qwen2.5-Omni model.
-    Qwen2.5-Omni is an end-to-end multimodal model that can perceive text, images, audio, and video.
-    It uses a Thinker-Talker architecture where the Thinker generates text and the Talker can
-    generate speech. For captioning, we use only the Thinker component for text generation.
-    Key features:
-    - Block-wise processing for streaming multimodal inputs
-    - TMRoPE (Time-aligned Multimodal RoPE) for synchronizing video and audio timestamps
-    - Can extract and process audio directly from video files
-    See: https://huggingface.co/docs/transformers/en/model_doc/qwen2_5_omni
-    Model: Qwen/Qwen2.5-Omni-7B (7B parameters)
+    """Audio-visual captioning via a local vLLM server running Qwen3-Omni.
+    The vLLM server must already be running. See ``scripts/serve_captioner.py``
+    for a helper that launches one in an isolated environment (no impact on
+    this package's dependency tree).
+    The captioner uses the OpenAI-compatible chat completions API. It sends
+    a ``file://`` URL pointing at the local video, the default combined-caption
+    prompt, and parses the JSON-wrapped response.
     """
-
-    MODEL_ID = "Qwen/Qwen2.5-Omni-7B"
-
-    # Default system prompt required by Qwen2.5-Omni for proper audio processing
-    DEFAULT_SYSTEM_PROMPT = (
-        "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
-        "capable of perceiving auditory and visual inputs, as well as generating text and speech."
-    )
 
     def __init__(
         self,
-        device: str | torch.device | None = None,
-        use_8bit: bool = False,
+        base_url: str = DEFAULT_VLLM_BASE_URL,
+        model: str = DEFAULT_QWEN_MODEL,
+        api_key: str = "EMPTY",
         instruction: str | None = None,
+        max_tokens: int = 4096,
+        enable_thinking: bool = False,
+        timeout_s: float = 600.0,
     ):
-        """
-        Initialize the Qwen2.5-Omni captioner.
+        """Initialize the Qwen3-Omni captioner.
         Args:
-            device: Device to use for inference (e.g., 'cuda', 'cuda:0', 'cpu')
-            use_8bit: Whether to use 8-bit quantization for reduced memory usage
-            instruction: Custom instruction prompt. If None, uses the default instruction
+            base_url: Base URL of the vLLM OpenAI-compatible server (default
+                ``http://127.0.0.1:8001/v1``).
+            model: Model identifier the server is serving. Must match the
+                server's ``--served-model-name`` (defaults to the HuggingFace
+                model ID).
+            api_key: Token sent in the ``Authorization`` header. vLLM accepts
+                any value by default.
+            instruction: Custom instruction prompt. If ``None``, uses the
+                default combined-caption prompt.
+            max_tokens: Maximum new tokens to generate per caption. 4096 leaves
+                comfortable headroom for both ``enable_thinking`` modes.
+            enable_thinking: Whether to let the Thinking model produce a
+                ``<think>...</think>`` chain-of-thought before the caption.
+                Off by default: it makes captioning ~5x slower with little
+                quality benefit and occasionally introduces hallucinations
+                (e.g., inventing dialogue or background music).
+            timeout_s: Per-request HTTP timeout.
         """
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.instruction = instruction
-        self._load_model(use_8bit=use_8bit)
+        from openai import OpenAI  # noqa: PLC0415
 
-    @property
-    def supports_audio(self) -> bool:
-        return True
+        self.model = model
+        self.instruction = instruction
+        self.max_tokens = max_tokens
+        self.enable_thinking = enable_thinking
+        self._client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout_s)
 
     def caption(
         self,
         path: str | Path,
-        fps: int = 1,
-        include_audio: bool = True,
-        clean_caption: bool = True,
+        fps: int = 2,
     ) -> str:
         """Generate a caption for the given video or image.
         Args:
-            path: Path to the video/image file to caption
-            fps: Frames per second to sample from videos
-            include_audio: Whether to include audio in the captioning (for videos)
-            clean_caption: Whether to clean up the raw caption by removing common VLM patterns
+            path: Path to the video/image file to caption.
+            fps: Frames per second to sample from the video. Passed through to
+                vLLM's multimodal processor (``mm_processor_kwargs.fps``).
+                Default 2 is a typical choice for video MLLMs at this resolution.
+                Ignored for image inputs.
         Returns:
-            A string containing the generated caption
+            The extracted caption string.
         """
         path = Path(path)
         is_image = self._is_image_file(path)
         is_video = self._is_video_file(path)
+        if not (is_image or is_video):
+            raise ValueError(f"Unsupported media file: {path}")
 
-        # Determine if we should process audio
-        use_audio = include_audio and is_video
-
-        # Use custom instruction if provided, otherwise pick appropriate default
-        if self.instruction is not None:
-            instruction = self.instruction
-        else:
-            instruction = DEFAULT_CAPTION_INSTRUCTION if use_audio else VIDEO_ONLY_CAPTION_INSTRUCTION
-
-        # Build the user content based on media type
-        # Based on HuggingFace docs: https://huggingface.co/docs/transformers/en/model_doc/qwen2_5_omni
-        user_content = []
+        instruction = self._resolve_instruction(path)
 
         if is_image:
-            user_content.append({"type": "image", "image": str(path)})
-        elif is_video:
-            user_content.append({"type": "video", "video": str(path)})
+            content = [
+                {"type": "image_url", "image_url": {"url": f"file://{path.resolve()}"}},
+                {"type": "text", "text": instruction},
+            ]
+            return _parse_caption_response(self._chat(content)).strip()
 
-        # Add the instruction text
-        user_content.append({"type": "text", "text": instruction})
+        return self._caption_video(path, instruction, fps)
 
-        # Build conversation - use the default system prompt required by Qwen2.5-Omni
-        # Using a custom system prompt causes warnings and may affect audio processing
-        messages = [
-            {
-                "role": "system",
-                "content": [{"type": "text", "text": self.DEFAULT_SYSTEM_PROMPT}],
-            },
-            {"role": "user", "content": user_content},
-        ]
-
-        # Process inputs using the processor's apply_chat_template
-        # For videos with audio, use load_audio_from_video=True and use_audio_in_video=True
-        inputs = self.processor.apply_chat_template(
-            messages,
-            load_audio_from_video=use_audio,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            fps=fps,
-            padding=True,
-            use_audio_in_video=use_audio,
-        ).to(self.model.device)
-
-        # Generate caption (text only, using Thinker-only model)
-        # Note: For Qwen2_5OmniThinkerForConditionalGeneration, use standard generate params
-        # (not thinker_ prefixed ones, those are for the full Qwen2_5OmniForConditionalGeneration)
-        input_len = inputs["input_ids"].shape[1]
-
-        output_tokens = self.model.generate(
-            **inputs,
-            use_audio_in_video=use_audio,
-            do_sample=False,
-            max_new_tokens=1024,
+    def _chat(self, content: list[dict], mm_kwargs: dict | None = None) -> str:
+        """Send one chat-completions request and return the raw response text."""
+        extra_body: dict = {
+            "repetition_penalty": 1.05,
+            "chat_template_kwargs": {"enable_thinking": self.enable_thinking},
+        }
+        if mm_kwargs:
+            extra_body["mm_processor_kwargs"] = mm_kwargs
+        response = self._client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": content}],
+            max_tokens=self.max_tokens,
+            temperature=0.0,
+            extra_body=extra_body,
         )
+        return response.choices[0].message.content or ""
 
-        # Extract only the generated tokens (exclude the input/prompt tokens)
-        generated_tokens = output_tokens[:, input_len:]
-
-        # Decode only the generated response
-        caption_raw = self.processor.batch_decode(
-            generated_tokens,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )[0]
-
-        # Remove hallucinated conversation turns (e.g., "Human\nHuman\n..." or "Human: ...")
-        # This is a known issue with chat models continuing to generate fake turns
-        # We look for patterns that are clearly hallucinated chat turns, not legitimate uses of "human"
-
-        # Match "\nHuman" followed by ":", "\n", or end of string (chat turn patterns)
-        # This won't match "A human walks..." or "...the human body..."
-        caption_raw = re.split(r"\nHuman(?::|(?:\s*\n)|$)", caption_raw, maxsplit=1)[0]
-        caption_raw = caption_raw.strip()
-
-        # Clean up caption if requested
-        return self._clean_raw_caption(caption_raw) if clean_caption else caption_raw
-
-    def _load_model(self, use_8bit: bool) -> None:
-        """Load the Qwen2.5-Omni model and processor.
-        Uses the Thinker-only model (Qwen2_5OmniThinkerForConditionalGeneration) for text generation
-        to save compute by not loading the audio generation components.
+    def _caption_video(self, path: Path, instruction: str, fps: int) -> str:
+        """Caption a video, sending its audio track as a separate modality.
+        vLLM does not extract a video's audio on its own (and its
+        ``use_audio_in_video`` path is broken server-side), so we pull the audio
+        into a 16 kHz mono WAV and send it alongside the video -- otherwise the
+        model only sees frames and fabricates any spoken content.
         """
-        from transformers import (  # noqa: PLC0415
-            BitsAndBytesConfig,
-            Qwen2_5OmniProcessor,
-            Qwen2_5OmniThinkerForConditionalGeneration,
-        )
+        with tempfile.TemporaryDirectory(prefix="qwencap_") as tmp:
+            work = Path(tmp)
 
-        quantization_config = BitsAndBytesConfig(load_in_8bit=True) if use_8bit else None
+            # Best-effort: ffmpeg fails (and we send video only) if there's no audio.
+            audio_url: str | None = None
+            try:
+                wav = work / "audio.wav"
+                _extract_audio_wav(path, wav)
+                audio_url = f"file://{wav.resolve()}"
+            except subprocess.CalledProcessError:
+                pass
 
-        # Use Thinker-only model for text generation (saves memory by not loading Talker)
-        self.model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
-            self.MODEL_ID,
-            dtype=torch.bfloat16,
-            low_cpu_mem_usage=True,
-            quantization_config=quantization_config,
-            device_map="auto",
-        )
+            def content(video: Path) -> list[dict]:
+                parts: list[dict] = [{"type": "video_url", "video_url": {"url": f"file://{video.resolve()}"}}]
+                if audio_url:
+                    parts.append({"type": "audio_url", "audio_url": {"url": audio_url}})
+                parts.append({"type": "text", "text": instruction})
+                return parts
 
-        self.processor = Qwen2_5OmniProcessor.from_pretrained(self.MODEL_ID)
+            mm_kwargs = {"fps": fps}
+            try:
+                raw = self._chat(content(path), mm_kwargs)
+            except Exception as e:
+                # Raw / variable-frame-rate videos over-report their frame count, which
+                # breaks the server's frame sampler ("... frames from video"). Re-encode
+                # to a constant frame rate and retry once.
+                if "frames from video" not in str(e):
+                    raise
+                cfr = work / "video_cfr.mp4"
+                _transcode_cfr(path, cfr)
+                raw = self._chat(content(cfr), mm_kwargs)
+
+            return _parse_caption_response(raw).strip()
 
 
 class GeminiFlashCaptioner(MediaCaptioningModel):
-    """Audio-visual captioning using Google's Gemini Flash API.
-    Gemini Flash is a cloud-based multimodal model that natively supports
-    audio and video understanding. Requires a Google API key.
-    Note: This captioner requires the `google-generativeai` package and a valid API key.
-    Set the GEMINI_API_KEY or GOOGLE_API_KEY environment variable, or pass the key directly.
+    """Audio-visual captioning using Google's Gemini via the Google Gen AI SDK.
+    Uses the ``google-genai`` package (the current SDK; ``google-generativeai``
+    is deprecated). Auth is resolved automatically:
+    1. If an API key is given (``api_key`` argument, or ``GEMINI_API_KEY`` /
+       ``GOOGLE_API_KEY`` in the environment) -> the Gemini Developer API (AI Studio).
+    2. Otherwise, if Google Cloud Application Default Credentials are available
+       (an attached service account or ``gcloud auth application-default login``)
+       -> Vertex AI. The project comes from ADC (or ``GOOGLE_CLOUD_PROJECT``) and
+       the location defaults to ``global`` (override with ``GOOGLE_CLOUD_LOCATION``).
+       This means it "just works" on a gcloud-authed GCP VM with no env vars.
+    If neither is available, a clear error explains how to authenticate.
+    Media is sent inline (``Part.from_bytes``), which works on both backends.
     """
 
-    MODEL_ID = "gemini-flash-lite-latest"
+    MODEL_ID = "gemini-3.5-flash"
+
+    _MIME_TYPES: ClassVar[dict[str, str]] = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".heic": "image/heic",
+        ".heif": "image/heif",
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".avi": "video/x-msvideo",
+        ".mkv": "video/x-matroska",
+        ".webm": "video/webm",
+    }
 
     def __init__(
         self,
         api_key: str | None = None,
         instruction: str | None = None,
+        model: str | None = None,
     ):
-        """Initialize the Gemini Flash captioner.
+        """Initialize the Gemini captioner.
         Args:
-            api_key: Google API key. If not provided, will look for
-                     GEMINI_API_KEY or GOOGLE_API_KEY environment variable.
-            instruction: Custom instruction prompt. If None, uses the default instruction
+            api_key: Gemini Developer API key. If ``None``, falls back to
+                ``GEMINI_API_KEY`` / ``GOOGLE_API_KEY``; if no key is set at all,
+                uses Vertex AI via Application Default Credentials.
+            instruction: Custom instruction prompt. If ``None``, uses the default
+                image or video prompt depending on the input.
+            model: Override the served model id (defaults to ``MODEL_ID``).
         """
         self.instruction = instruction
-        self._init_client(api_key)
-
-    @property
-    def supports_audio(self) -> bool:
-        return True
+        self.model = model or self.MODEL_ID
+        self._client = self._make_client(api_key)
 
     def caption(
         self,
         path: str | Path,
-        fps: int = 3,  # noqa: ARG002 - kept for API compatibility
-        include_audio: bool = True,
-        clean_caption: bool = True,
+        fps: int = 2,  # noqa: ARG002 - kept for API compatibility
     ) -> str:
-        """Generate a caption for the given video or image.
-        Args:
-            path: Path to the video/image file to caption
-            fps: Frames per second (not used for Gemini, kept for API compatibility)
-            include_audio: Whether to include audio content in the caption
-            clean_caption: Whether to clean up the raw caption
-        Returns:
-            A string containing the generated caption
-        """
-        import time  # noqa: PLC0415
+        from google.genai import types  # noqa: PLC0415
 
         path = Path(path)
-        is_video = self._is_video_file(path)
-        use_audio = include_audio and is_video
+        instruction = self._resolve_instruction(path)
+        media = types.Part.from_bytes(data=path.read_bytes(), mime_type=self._mime_type(path))
+        response = self._client.models.generate_content(
+            model=self.model,
+            contents=[media, instruction],
+            config=types.GenerateContentConfig(temperature=0.0),
+        )
 
-        # Use custom instruction if provided, otherwise pick appropriate default
-        if self.instruction is not None:
-            instruction = self.instruction
-        else:
-            instruction = DEFAULT_CAPTION_INSTRUCTION if use_audio else VIDEO_ONLY_CAPTION_INSTRUCTION
+        # Gemini may also return JSON if it followed our prompt format.
+        return _parse_caption_response(response.text or "").strip()
 
-        # Upload the file to Gemini
-        uploaded_file = self._genai.upload_file(path)
+    @classmethod
+    def _mime_type(cls, path: Path) -> str:
+        try:
+            return cls._MIME_TYPES[path.suffix.lower()]
+        except KeyError:
+            raise ValueError(f"Unsupported media type for Gemini: {path.suffix}") from None
 
-        # Wait for processing to complete (videos need time to process)
-        while uploaded_file.state.name == "PROCESSING":
-            time.sleep(1)
-            uploaded_file = self._genai.get_file(uploaded_file.name)
+    def _make_client(self, api_key: str | None):  # noqa: ANN202 - genai.Client type is lazy-imported
+        from google import genai  # noqa: PLC0415
 
-        if uploaded_file.state.name == "FAILED":
-            raise RuntimeError(f"File processing failed: {uploaded_file.state.name}")
+        # 1. API key (explicit arg or env) -> Gemini Developer API.
+        key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if key:
+            return genai.Client(api_key=key)
 
-        # Generate caption
-        response = self._model.generate_content([uploaded_file, instruction])
-
-        caption_raw = response.text
-
-        # Clean up the uploaded file
-        self._genai.delete_file(uploaded_file.name)
-
-        # Clean up caption if requested
-        return self._clean_raw_caption(caption_raw) if clean_caption else caption_raw
-
-    def _init_client(self, api_key: str | None) -> None:
-        """Initialize the Gemini API client."""
-        import os  # noqa: PLC0415
+        # 2. No key -> Vertex AI via Application Default Credentials (gcloud / service account).
+        import google.auth  # noqa: PLC0415
 
         try:
-            import google.generativeai as genai  # noqa: PLC0415
-        except ImportError as e:
-            raise ImportError(
-                "The `google-generativeai` package is required for Gemini Flash captioning. "
-                "Install it with: `uv pip install google-generativeai`"
+            _, adc_project = google.auth.default()
+        except Exception as e:
+            raise ValueError(
+                "No Gemini credentials found. Provide an API key (--api-key, or "
+                "GEMINI_API_KEY / GOOGLE_API_KEY), or set up Google Cloud credentials "
+                "for Vertex AI (e.g. `gcloud auth application-default login` or an "
+                "attached service account)."
             ) from e
 
-        # Get API key from argument or environment
-        # GEMINI_API_KEY is the recommended variable, GOOGLE_API_KEY also works
-        resolved_api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-
-        if not resolved_api_key:
-            raise ValueError(
-                "Gemini API key is required. Provide it via the `api_key` argument "
-                "or set the GEMINI_API_KEY or GOOGLE_API_KEY environment variable."
-            )
-
-        # Configure the genai library with the API key
-        genai.configure(api_key=resolved_api_key)
-
-        # Store reference to genai module for file operations
-        self._genai = genai
-
-        # Initialize the model
-        self._model = genai.GenerativeModel(self.MODEL_ID)
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT") or adc_project
+        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+        return genai.Client(vertexai=True, project=project, location=location)
 
 
-def example() -> None:
-    """Example usage of the captioning module."""
-    import sys  # noqa: PLC0415
+def _parse_caption_response(raw: str) -> str:
+    """Extract the caption text from a model response.
+    Backend-agnostic: works for any model that follows the combined-caption
+    prompt. Handles the formats a model may produce:
+    - Plain caption text
+    - JSON ``{"combined_caption_english": "..."}``
+    - ``<think>...</think>`` chain-of-thought followed by either of the above
+    - Truncated JSON (when generation hits a token limit mid-string)
+    """
+    text = re.sub(r"<think>[\s\S]*?</think>", "", raw).strip()
 
-    if len(sys.argv) < 2:
-        print(f"Usage: python {sys.argv[0]} <video_path> [captioner_type]")  # noqa: T201
-        print("  captioner_type: qwen_omni (default) or gemini_flash")  # noqa: T201
-        sys.exit(1)
+    # Thinking models (e.g. Qwen3-Omni-*-Thinking) emit the reasoning trace
+    # without an opening ``<think>`` tag, because the chat template injects it
+    # for them -- so the response starts mid-thought and is terminated by a lone
+    # ``</think>`` before the real answer. Drop everything up to that closer.
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[1].strip()
 
-    video_path = sys.argv[1]
-    captioner_type = CaptionerType(sys.argv[2]) if len(sys.argv) > 2 else CaptionerType.QWEN_OMNI
+    if not text:
+        return raw.strip()
 
-    print(f"Using {captioner_type.value} captioner:")  # noqa: T201
-    captioner = create_captioner(captioner_type)
-    caption = captioner.caption(video_path)
-    print(f"CAPTION: {caption}")  # noqa: T201
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and _CAPTION_JSON_KEY in parsed:
+            return parsed[_CAPTION_JSON_KEY]
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    match = re.search(rf"\{{[^{{}}]*\"{_CAPTION_JSON_KEY}\"[^{{}}]*\}}", text)
+    if match:
+        try:
+            parsed = json.loads(match.group())
+            if isinstance(parsed, dict) and _CAPTION_JSON_KEY in parsed:
+                return parsed[_CAPTION_JSON_KEY]
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Truncated JSON: extract the string value even if the closing quote/brace is missing.
+    match = re.search(rf'"{_CAPTION_JSON_KEY}"\s*:\s*"((?:[^"\\]|\\.)*)', text)
+    if match:
+        try:
+            return json.loads('"' + match.group(1) + '"')
+        except (json.JSONDecodeError, ValueError):
+            return match.group(1)
+
+    return text
 
 
-if __name__ == "__main__":
-    example()
+def _run_ffmpeg(args: list[str]) -> None:
+    """Run the ffmpeg binary bundled with ``imageio-ffmpeg`` (a dependency)."""
+    import imageio_ffmpeg  # noqa: PLC0415
+
+    cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error", *args]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def _extract_audio_wav(src: Path, dest: Path) -> None:
+    """Extract the audio track to a 16 kHz mono PCM WAV (matches pretraining).
+    Raises ``CalledProcessError`` when the video has no audio stream.
+    """
+    _run_ffmpeg(["-i", str(src), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(dest)])
+
+
+def _transcode_cfr(src: Path, dest: Path) -> None:
+    """Re-encode the video to a constant frame rate so the server's frame sampler can
+    read every requested index (raw / variable-frame-rate videos over-report frames)."""
+    _run_ffmpeg(["-i", str(src), "-fps_mode", "cfr", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", str(dest)])

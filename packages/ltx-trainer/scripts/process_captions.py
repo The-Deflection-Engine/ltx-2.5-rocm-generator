@@ -154,6 +154,17 @@ class CaptionsDataset(Dataset):
         else:
             raise ValueError("Expected `dataset_file` to be a path to a CSV, JSON, or JSONL file.")
 
+    def _embedding_output_path(self, media_path: Path) -> str:
+        """Output `.pt` path relative to the dataset dir; mirrors `process_videos._output_relative`
+        so caption keys match video/audio latent keys (and absolute paths don't escape output_dir)."""
+        data_root = self.dataset_file.parent
+        resolved = data_root / media_path  # pathlib: an absolute media_path overrides data_root
+        try:
+            rel = resolved.relative_to(data_root)
+        except ValueError:
+            rel = Path(*resolved.parts[1:]) if resolved.is_absolute() else resolved
+        return str(rel.with_suffix(".pt"))
+
     def _load_caption_data_from_csv(self) -> dict[str, str]:
         """Load captions from a CSV file and compute output embedding paths."""
         df = pd.read_csv(self.dataset_file)
@@ -166,8 +177,7 @@ class CaptionsDataset(Dataset):
         caption_data = {}
         for _, row in df.iterrows():
             media_path = Path(row[self.media_column].strip())
-            # Convert media path to embedding output path (same structure, .pt extension)
-            output_path = str(media_path.with_suffix(".pt"))
+            output_path = self._embedding_output_path(media_path)
             caption_data[output_path] = row[self.caption_column]
 
         return caption_data
@@ -188,8 +198,7 @@ class CaptionsDataset(Dataset):
                 raise ValueError(f"Key '{self.media_column}' not found in JSON entry: {entry}")
 
             media_path = Path(entry[self.media_column].strip())
-            # Convert media path to embedding output path (same structure, .pt extension)
-            output_path = str(media_path.with_suffix(".pt"))
+            output_path = self._embedding_output_path(media_path)
             caption_data[output_path] = entry[self.caption_column]
 
         return caption_data
@@ -206,8 +215,7 @@ class CaptionsDataset(Dataset):
                     raise ValueError(f"Key '{self.media_column}' not found in JSONL entry: {entry}")
 
                 media_path = Path(entry[self.media_column].strip())
-                # Convert media path to embedding output path (same structure, .pt extension)
-                output_path = str(media_path.with_suffix(".pt"))
+                output_path = self._embedding_output_path(media_path)
                 caption_data[output_path] = entry[self.caption_column]
 
         return caption_data
@@ -326,7 +334,8 @@ def compute_captions_embeddings(  # noqa: PLR0913
                 # TODO(batch-tokenization): When tokenizer supports batching, encode all prompts at once.
                 # For now, process one at a time:
                 for i in range(len(batch["prompt"])):
-                    hidden_states, prompt_attention_mask = text_encoder.encode(batch["prompt"][i], padding_side="left")
+                    encoded = text_encoder.encode([batch["prompt"][i]], padding_side="left")
+                    hidden_states, prompt_attention_mask = encoded[0]
                     video_prompt_embeds, audio_prompt_embeds = embeddings_processor.feature_extractor(
                         hidden_states, prompt_attention_mask, "left"
                     )

@@ -17,18 +17,20 @@ class GaussianNoiser(Noiser):
 
     def __init__(self, generator: torch.Generator):
         super().__init__()
-
         self.generator = generator
 
-    def __call__(self, latent_state: LatentState, noise_scale: float = 1.0) -> LatentState:
-        noise = torch.randn(
+    def _sample_noise(self, latent_state: LatentState) -> torch.Tensor:
+        return torch.randn(
             *latent_state.latent.shape,
             device=latent_state.latent.device,
             dtype=latent_state.latent.dtype,
             generator=self.generator,
         )
-        scaled_mask = latent_state.denoise_mask * noise_scale
-        latent = noise * scaled_mask + latent_state.latent * (1 - scaled_mask)
+
+    def __call__(self, latent_state: LatentState, noise_scale: float = 1.0) -> LatentState:
+        noise = self._sample_noise(latent_state)
+        latent = torch.lerp(latent_state.latent.float(), noise.float(), noise_scale)
+        latent = torch.lerp(latent_state.clean_latent.float(), latent, latent_state.denoise_mask)
         return replace(
             latent_state,
             latent=latent.to(latent_state.latent.dtype),

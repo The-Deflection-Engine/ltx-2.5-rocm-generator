@@ -39,6 +39,14 @@ class VideoToVideoConfig(TrainingStrategyConfigBase):
         description="Directory name for latents of reference videos",
     )
 
+    def get_data_sources(self) -> dict[str, str]:
+        """IC-LoRA training requires latents, conditions, and reference latents."""
+        return {
+            "latents": "latents",
+            "conditions": "conditions",
+            self.reference_latents_dir: "ref_latents",
+        }
+
 
 class VideoToVideoStrategy(TrainingStrategy):
     """Video-to-video training strategy for IC-LoRA.
@@ -61,14 +69,6 @@ class VideoToVideoStrategy(TrainingStrategy):
         """
         super().__init__(config)
         self.reference_downscale_factor = None  # Will be inferred from first batch
-
-    def get_data_sources(self) -> dict[str, str]:
-        """IC-LoRA training requires latents, conditions, and reference latents."""
-        return {
-            "latents": "latents",
-            "conditions": "conditions",
-            self.config.reference_latents_dir: "ref_latents",
-        }
 
     def prepare_training_inputs(  # noqa: PLR0915
         self,
@@ -133,7 +133,6 @@ class VideoToVideoStrategy(TrainingStrategy):
         ref_seq_len = ref_latents.shape[1]
         target_seq_len = target_latents.shape[1]
         device = target_latents.device
-        dtype = target_latents.dtype
 
         # Create conditioning mask
         # Reference tokens are always conditioning (timestep=0)
@@ -164,7 +163,7 @@ class VideoToVideoStrategy(TrainingStrategy):
         target_conditioning_mask_expanded = target_conditioning_mask.unsqueeze(-1)
         noisy_target = torch.where(target_conditioning_mask_expanded, target_latents, noisy_target)
 
-        # Targets for loss computation
+        # Targets for loss computation (velocity prediction) - only for target portion
         targets = noise - target_latents
 
         # Concatenate reference (clean) and target (noisy)
@@ -181,7 +180,6 @@ class VideoToVideoStrategy(TrainingStrategy):
             batch_size=batch_size,
             fps=fps,
             device=device,
-            dtype=dtype,
         )
 
         # Scale reference positions to match target coordinate space
@@ -200,7 +198,6 @@ class VideoToVideoStrategy(TrainingStrategy):
             batch_size=batch_size,
             fps=fps,
             device=device,
-            dtype=dtype,
         )
 
         # Concatenate positions along sequence dimension
@@ -231,7 +228,6 @@ class VideoToVideoStrategy(TrainingStrategy):
             audio_targets=None,
             video_loss_mask=video_loss_mask,
             audio_loss_mask=None,
-            ref_seq_len=ref_seq_len,
         )
 
     def compute_loss(
@@ -240,13 +236,11 @@ class VideoToVideoStrategy(TrainingStrategy):
         _audio_pred: Tensor | None,
         inputs: ModelInputs,
     ) -> Tensor:
-        """Compute masked loss only on target portion. Returns [B,]."""
-        # Extract target portion of prediction
-        ref_seq_len = inputs.ref_seq_len
-        target_pred = video_pred[:, ref_seq_len:, :]
-
-        # Get target portion of loss mask
-        target_loss_mask = inputs.video_loss_mask[:, ref_seq_len:]
+        """Compute masked loss on target portion only. Returns [B,]."""
+        # Slice prediction to match targets length (removes prepended reference tokens)
+        target_len = inputs.video_targets.shape[1]
+        target_pred = video_pred[:, -target_len:, :]
+        target_loss_mask = inputs.video_loss_mask[:, -target_len:]
 
         # Compute per-element loss [B,]
         loss = (target_pred - inputs.video_targets).pow(2)

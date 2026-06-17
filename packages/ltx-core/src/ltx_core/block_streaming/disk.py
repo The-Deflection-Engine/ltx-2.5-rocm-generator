@@ -128,8 +128,8 @@ class LoraSource:
 
     def as_state_dict_with_strength(self) -> LoraStateDictWithStrength:
         """Return a :class:`LoraStateDictWithStrength` view of the pinned A/B factors.
-        Lets :func:`fuse_lora_weights` consume disk-streaming LoRAs without
-        re-reading the safetensors file or re-applying ``sd_ops``.
+        Lets non-block fusion consume the already-loaded disk-streaming LoRA
+        without re-reading the safetensors file or re-applying ``sd_ops``.
         """
         sd: dict[str, torch.Tensor] = {}
         for prefix, (a, b) in self._pinned_ab.items():

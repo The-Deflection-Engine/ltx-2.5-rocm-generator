@@ -7,7 +7,6 @@ removes the need for :class:`ModelLedger`.
 from __future__ import annotations
 
 import copy
-import dataclasses
 import logging
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -40,9 +39,9 @@ from ltx_core.model.audio_vae import (
 from ltx_core.model.audio_vae import (
     decode_audio as vae_decode_audio,
 )
+from ltx_core.model.model_protocol import LTXModelProtocol, ModelConfigurator
 from ltx_core.model.transformer import (
     LTXV_MODEL_COMFY_RENAMING_MAP,
-    LTXModel,
     LTXModelConfigurator,
     X0Model,
 )
@@ -144,7 +143,7 @@ def _streaming_model(
     """Build a streaming wrapper, yield it, then tear down and free memory."""
     cpu_slots_count = DISK_CPU_SLOTS if offload_mode == OffloadMode.DISK else None
     wrapped = builder.build(
-        target_device=target_device,
+        device=target_device,
         dtype=dtype,
         cpu_slots_count=cpu_slots_count,
     )
@@ -195,7 +194,7 @@ class DiffusionStage:
     pattern in every pipeline.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         checkpoint_path: str,
         dtype: torch.dtype,
@@ -205,7 +204,9 @@ class DiffusionStage:
         registry: Registry | None = None,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
-        transformer_builder: ModelBuilderProtocol[LTXModel] | None = None,
+        transformer_builder: ModelBuilderProtocol[LTXModelProtocol] | None = None,
+        model_configurator: type[ModelConfigurator] = LTXModelConfigurator,
+        model_sd_ops: SDOps = LTXV_MODEL_COMFY_RENAMING_MAP,
     ) -> None:
         self._checkpoint_path = checkpoint_path
         self._dtype = dtype
@@ -213,10 +214,12 @@ class DiffusionStage:
         self._quantization = quantization
         self._compilation_config = compilation_config
         self._offload_mode = offload_mode
+        # A quantization policy may pin its own configurator; otherwise use the one
+        # provided by the caller (defaults to the audio-video LTXModelConfigurator).
         configurator = (
             quantization.model_configurator
             if quantization is not None and quantization.model_configurator is not None
-            else LTXModelConfigurator
+            else model_configurator
         )
         if transformer_builder is not None:
             self._transformer_builder = transformer_builder
@@ -224,14 +227,12 @@ class DiffusionStage:
             self._transformer_builder = Builder(
                 model_path=checkpoint_path,
                 model_class_configurator=configurator,
-                model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
+                model_sd_ops=model_sd_ops,
                 loras=tuple(loras),
                 registry=registry or DummyRegistry(),
             )
 
         if offload_mode != OffloadMode.NONE:
-            if compilation_config is not None:
-                raise ValueError("torch.compile is not supported with layer streaming")
             # WeightsProvider currently only supports plain bf16 + fp8_cast LoRA fusion
             # (no companion-key emission). Quantization policies that emit
             # companion keys (e.g. ``.weight_scale``) cannot be streamed yet.
@@ -240,8 +241,15 @@ class DiffusionStage:
                     "Block streaming is not supported with this quantization policy "
                     "(only bf16 and fp8_cast are currently supported)."
                 )
-            streaming_sd_ops: SDOps = LTXV_MODEL_COMFY_RENAMING_MAP
+            streaming_sd_ops: SDOps = model_sd_ops
             streaming_module_ops: tuple[ModuleOps, ...] = ()
+            streaming_loras = tuple(loras)
+
+            if compilation_config:
+                number_of_layers = self._transformer_builder.model_config()["transformer"]["num_layers"]
+                streaming_sd_ops, streaming_module_ops, streaming_loras = _apply_compile_ops(
+                    streaming_sd_ops, streaming_module_ops, streaming_loras, number_of_layers
+                )
             if quantization is not None:
                 streaming_sd_ops, streaming_module_ops = _chain_quantization(
                     streaming_sd_ops, streaming_module_ops, quantization
@@ -251,7 +259,7 @@ class DiffusionStage:
                 model_path=checkpoint_path,
                 model_sd_ops=streaming_sd_ops,
                 module_ops=streaming_module_ops,
-                loras=tuple(loras),
+                loras=streaming_loras,
                 registry=registry or DummyRegistry(),
                 fuse_rule=quantization.fuse_rule if quantization is not None else bf16_fuse_rule,
                 blocks_attr="transformer_blocks",
@@ -273,9 +281,8 @@ class DiffusionStage:
             (*self._transformer_builder.module_ops, op),
         )
         if self._offload_mode != OffloadMode.NONE:
-            new._streaming_builder = dataclasses.replace(
-                self._streaming_builder,
-                module_ops=(*self._streaming_builder.module_ops, op),
+            new._streaming_builder = self._streaming_builder.with_module_ops(
+                (*self._streaming_builder.module_ops, op),
             )
         return new
 
@@ -531,7 +538,7 @@ class PromptEncoder:
                 prompts[0] = generate_enhanced_prompt(
                     text_encoder, prompts[0], enhance_prompt_image, seed=enhance_prompt_seed
                 )
-            raw_outputs = [text_encoder.encode(p) for p in prompts]
+            raw_outputs = text_encoder.encode(prompts)
         logger.info("Text encoder done, building embeddings processor from %s", self._checkpoint_path)
 
         with gpu_model(self._build_embeddings_processor()) as embeddings_processor:

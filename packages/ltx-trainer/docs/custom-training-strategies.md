@@ -1,7 +1,7 @@
 # Implementing Custom Training Strategies
 
-This guide explains how to implement your own training strategy for specialized use cases like audio-only training,
-video inpainting, or other custom training recipes.
+This guide explains how to implement your own training strategy for specialized recipes that cannot be expressed with
+the built-in `flexible` strategy.
 
 ## 📋 Overview
 
@@ -15,12 +15,20 @@ This architecture lets you implement new training modes without modifying the co
 
 ### When You Need a Custom Strategy
 
+> [!NOTE]
+> The built-in `flexible` strategy already supports most conditioning scenarios out of the box:
+> first-frame conditioning, video extension (prefix/suffix), spatial crop (outpainting),
+> mask-based inpainting, IC-LoRA reference conditioning, and frozen modality cross-conditioning
+> (audio-to-video, video-to-audio). Only implement a custom strategy if your use case requires
+> fundamentally different training logic that cannot be expressed through the flexible strategy's
+> configuration.
+
 Consider implementing a custom strategy when you need:
 
-- **Different input modalities** (e.g., audio-only, audio-to-video conditioning)
-- **Additional conditioning signals** (e.g., masks for inpainting, depth maps)
-- **Custom loss computation** (e.g., weighted losses, auxiliary losses)
-- **Different noise application patterns** (e.g., partial masking)
+- **Custom loss computation** (e.g., weighted losses, auxiliary losses, perceptual losses)
+- **Non-standard noise application** (e.g., noise schedules different from flow matching)
+- **Novel conditioning mechanisms** not covered by the flexible strategy's condition types
+- **Additional model outputs** beyond the standard video/audio predictions
 
 ## 🏗️ Architecture Overview
 
@@ -28,7 +36,7 @@ Consider implementing a custom strategy when you need:
 
 The trainer delegates all training-mode-specific logic to the strategy:
 
-1. **Initialization** — The trainer calls `get_data_sources()` to determine which preprocessed data directories to load
+1. **Initialization** — The trainer calls `config.get_data_sources()` to determine which preprocessed data directories to load
 2. **Each training step:**
     - Calls `prepare_training_inputs()` to transform the raw batch into model-ready inputs
     - Runs the transformer forward pass
@@ -52,8 +60,8 @@ The trainer handles everything else: optimization, checkpointing, validation, an
 Before writing code, answer these questions:
 
 1. **What additional data does your strategy need?**
-    - Example: Inpainting needs mask latents alongside video latents
-    - Example: Audio-to-video needs reference audio embeddings
+    - Example: A perceptual-loss strategy may need auxiliary feature targets
+    - Example: A novel conditioning mechanism may need an additional precomputed directory
 
 2. **What does conditioning look like?**
     - Which tokens should be noised vs. kept clean?
@@ -164,6 +172,20 @@ class InpaintingConfig(TrainingStrategyConfigBase):
         ge=0.0,
         le=1.0,
     )
+
+    def get_data_sources(self) -> dict[str, str]:
+        """Define which data directories to load.
+
+        Returns a mapping of directory names (under preprocessed_data_root) to
+        batch keys. The trainer loads .pt files from each directory and exposes
+        them in the batch under the specified key. The trainer also uses this
+        mapping to validate that all required directories exist.
+        """
+        return {
+            "latents": "latents",  # -> batch["latents"]
+            "conditions": "conditions",  # -> batch["conditions"]
+            self.mask_latents_dir: "masks",  # -> batch["masks"]
+        }
 ```
 
 **Key points:**
@@ -171,6 +193,7 @@ class InpaintingConfig(TrainingStrategyConfigBase):
 - Inherit from `TrainingStrategyConfigBase`
 - Use `Literal["your_strategy_name"]` for the `name` field - this enables automatic strategy selection
 - Use Pydantic `Field` for validation and documentation
+- Implement `get_data_sources()` on the config — it's the single source of truth for data directories (used for both dataset wiring and existence validation)
 
 ### Step 4: Implement the Strategy Class
 
@@ -186,24 +209,6 @@ class InpaintingStrategy(TrainingStrategy):
 
     def __init__(self, config: InpaintingConfig):
         super().__init__(config)
-
-    @property
-    def requires_audio(self) -> bool:
-        """Whether this strategy requires audio components."""
-        return False  # Set to True if your strategy needs audio
-
-    def get_data_sources(self) -> dict[str, str]:
-        """Define which data directories to load.
-
-        Returns a mapping of directory names to batch keys.
-        The trainer will load .pt files from each directory and
-        make them available in the batch under the specified key.
-        """
-        return {
-            "latents": "latents",  # -> batch["latents"]
-            "conditions": "conditions",  # -> batch["conditions"]
-            self.config.mask_latents_dir: "masks",  # -> batch["masks"]
-        }
 
     def prepare_training_inputs(
             self,
@@ -275,7 +280,6 @@ class InpaintingStrategy(TrainingStrategy):
             batch_size=batch_size,
             fps=24.0,  # Or get from latents_data
             device=device,
-            dtype=dtype,
         )
 
         # Create video Modality
@@ -328,7 +332,7 @@ You need to register your strategy in two places:
 from ltx_trainer.training_strategies.inpainting import InpaintingConfig, InpaintingStrategy
 
 # Add to the TrainingStrategyConfig type alias
-TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | InpaintingConfig
+TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | FlexibleStrategyConfig | InpaintingConfig
 
 # Add to __all__
 __all__ = [
@@ -356,7 +360,8 @@ from ltx_trainer.training_strategies.inpainting import InpaintingConfig
 TrainingStrategyConfig = Annotated[
     Annotated[TextToVideoConfig, Tag("text_to_video")]
     | Annotated[VideoToVideoConfig, Tag("video_to_video")]
-    | Annotated[InpaintingConfig, Tag("inpainting")],  # Add your config
+    | Annotated[FlexibleStrategyConfig, Tag("flexible")]
+    | Annotated[InpaintingConfig, Tag("inpainting")],
     Discriminator(_get_strategy_discriminator),
 ]
 ```
@@ -366,7 +371,7 @@ TrainingStrategyConfig = Annotated[
 Create an example config in `configs/`:
 
 ```yaml
-# configs/ltx2_inpainting_lora.yaml
+# configs/custom_inpainting_lora.yaml
 
 model:
   model_path: "/path/to/ltx2.safetensors"
@@ -408,8 +413,8 @@ The base `TrainingStrategy` class provides these helper methods:
 | `_audio_patchifier.patchify(latents)`        | Convert `[B, C, T, F]` → `[B, T, C*F]`          |
 | `_get_video_positions(...)`                  | Generate position embeddings for video          |
 | `_get_audio_positions(...)`                  | Generate position embeddings for audio          |
-| `_create_per_token_timesteps(mask, sigma)`   | Create timesteps with 0 for conditioning tokens |
-| `_create_first_frame_conditioning_mask(...)` | Create mask for first-frame conditioning        |
+| `_create_per_token_timesteps(conditioning_mask, sampled_sigma)` | Create timesteps with 0 for conditioning tokens |
+| `_create_first_frame_conditioning_mask(...)`                    | Create mask for first-frame conditioning        |
 
 ## 📊 Understanding ModelInputs
 
@@ -418,16 +423,14 @@ The `ModelInputs` dataclass contains everything needed for the forward pass and 
 ```python
 @dataclass
 class ModelInputs:
-    video: Modality  # Video modality data
-    audio: Modality | None  # Audio modality (None if video-only)
+    video: Modality | None  # Video modality data
+    audio: Modality | None  # Audio modality data
 
-    video_targets: Tensor  # Target values for loss (velocity)
-    audio_targets: Tensor | None
+    video_targets: Tensor | None  # Target values for video loss (velocity)
+    audio_targets: Tensor | None  # Target values for audio loss (velocity)
 
-    video_loss_mask: Tensor  # Boolean: True = compute loss for this token
-    audio_loss_mask: Tensor | None
-
-    ref_seq_len: int | None = None  # For IC-LoRA: reference sequence length
+    video_loss_mask: Tensor | None  # Boolean loss mask for video tokens
+    audio_loss_mask: Tensor | None  # Boolean loss mask for audio tokens
 ```
 
 ## 📊 Understanding Modality
@@ -437,18 +440,20 @@ The `Modality` dataclass (from ltx-core) represents a single modality's data:
 ```python
 @dataclass(frozen=True)
 class Modality:
-    enabled: bool  # Whether this modality is active
-    latent: Tensor  # [B, seq_len, C] - the latent tokens
-    timesteps: Tensor  # [B, seq_len] - per-token timesteps (sigmas)
-    positions: Tensor  # [B, dims, seq_len, 2] - position bounds
-    context: Tensor  # [B, ctx_len, C] - text embeddings
-    context_mask: Tensor  # [B, ctx_len] - attention mask for context
+    latent: Tensor     # [B, T, D] — patchified latent tokens
+    sigma: Tensor      # [B,] — per-batch noise level (for cross-attn conditioning)
+    timesteps: Tensor  # [B, T] — per-token timestep embeddings
+    positions: Tensor  # [B, 3, T, 2] for video, [B, 1, T, 2] for audio — positional bounds
+    context: Tensor    # text conditioning embeddings
+    enabled: bool = True
+    context_mask: Tensor | None = None     # attention mask for text context
+    attention_mask: Tensor | None = None   # optional 2D self-attention mask [B, T, T]
 ```
 
 > [!NOTE]
 > **Per-token timesteps:** Each token in the sequence has its own timestep. Conditioning tokens—those that should remain
 > un-noised—must have `timestep=0`. This is how the model distinguishes clean reference tokens from tokens to denoise. Use
-`_create_per_token_timesteps(conditioning_mask, sigma)` to set this up correctly.
+> `_create_per_token_timesteps(conditioning_mask, sampled_sigma)` to set this up correctly.
 
 > [!NOTE]
 > `Modality` is immutable (frozen dataclass). Use `dataclasses.replace()` to create modified copies.
@@ -461,7 +466,7 @@ class Modality:
    from ltx_trainer.config import LtxTrainerConfig
    import yaml
 
-   with open('configs/ltx2_inpainting_lora.yaml') as f:
+   with open('configs/custom_inpainting_lora.yaml') as f:
        config = LtxTrainerConfig(**yaml.safe_load(f))
    print(f'Strategy: {config.training_strategy.name}')
    "
@@ -475,13 +480,13 @@ class Modality:
 
    config = InpaintingConfig()
    strategy = get_training_strategy(config)
-   print(f'Data sources: {strategy.get_data_sources()}')
+   print(f'Data sources: {config.get_data_sources()}')
    "
    ```
 
 3. **Run a short training test:**
    ```bash
-   uv run python scripts/train.py configs/ltx2_inpainting_lora.yaml
+   uv run python scripts/train.py configs/custom_inpainting_lora.yaml
    ```
 
 ## 💡 Tips and Best Practices
@@ -503,7 +508,8 @@ class Modality:
 
 Study these implementations for guidance:
 
-| Strategy                                                                           | Complexity | Key Features                                   |
-|------------------------------------------------------------------------------------|------------|------------------------------------------------|
-| [`TextToVideoStrategy`](../src/ltx_trainer/training_strategies/text_to_video.py)   | Simple     | First-frame conditioning, optional audio       |
-| [`VideoToVideoStrategy`](../src/ltx_trainer/training_strategies/video_to_video.py) | Medium     | Reference video concatenation, split loss mask |
+| Strategy | Complexity | Key Features |
+|----------|------------|--------------|
+| [`FlexibleStrategy`](../src/ltx_trainer/training_strategies/flexible.py) | Medium | Unified conditioning framework — supports all built-in modes |
+| [`TextToVideoStrategy`](../src/ltx_trainer/training_strategies/text_to_video.py) | Simple | First-frame conditioning, optional audio (deprecated) |
+| [`VideoToVideoStrategy`](../src/ltx_trainer/training_strategies/video_to_video.py) | Medium | Reference video concatenation, split loss mask (deprecated) |

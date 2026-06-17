@@ -650,6 +650,62 @@ def default_1_stage_arg_parser(params: PipelineParams = LTX_2_3_PARAMS) -> argpa
     return parser
 
 
+def default_1_stage_t2a_arg_parser(params: PipelineParams = LTX_2_3_PARAMS) -> argparse.ArgumentParser:
+    """Argument parser for single-stage text-to-audio pipelines (audio-only)."""
+    audio_guider = params.audio_guider_params
+    parser = basic_arg_parser(params=params)
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=params.num_frames,
+        help="Number of frames used to derive audio duration (num-frames / frame-rate).",
+    )
+    parser.add_argument(
+        "--frame-rate",
+        type=float,
+        default=params.frame_rate,
+        help="Frame rate used with --num-frames to derive the audio duration.",
+    )
+    parser.add_argument(
+        "--negative-prompt",
+        type=str,
+        default=DEFAULT_NEGATIVE_PROMPT,
+        help="Negative prompt to steer audio generation away from artifacts.",
+    )
+    parser.add_argument(
+        "--audio-cfg-guidance-scale",
+        type=float,
+        default=audio_guider.cfg_scale,
+        help=f"Audio CFG scale (default: {audio_guider.cfg_scale}).",
+    )
+    parser.add_argument(
+        "--audio-stg-guidance-scale",
+        type=float,
+        default=audio_guider.stg_scale,
+        help=f"Audio STG scale (default: {audio_guider.stg_scale}).",
+    )
+    parser.add_argument(
+        "--audio-rescale-scale",
+        type=float,
+        default=audio_guider.rescale_scale,
+        help=f"Audio rescale scale (default: {audio_guider.rescale_scale}).",
+    )
+    parser.add_argument(
+        "--audio-stg-blocks",
+        type=int,
+        nargs="*",
+        default=audio_guider.stg_blocks,
+        help=f"Blocks to perturb for Audio STG (default: {audio_guider.stg_blocks}).",
+    )
+    parser.add_argument(
+        "--audio-skip-step",
+        type=int,
+        default=audio_guider.skip_step,
+        help=f"Audio skip step (default: {audio_guider.skip_step}).",
+    )
+    return parser
+
+
 def default_2_stage_arg_parser(params: PipelineParams = LTX_2_3_PARAMS) -> argparse.ArgumentParser:
     parser = default_1_stage_arg_parser(params=params)
     parser.set_defaults(height=params.stage_2_height, width=params.stage_2_width)

@@ -10,8 +10,9 @@ from ltx_core.types import LatentState, VideoLatentShape
 class VideoConditionByKeyframeIndex(ConditioningItem):
     """
     Conditions video generation on keyframe latents at a specific frame index.
-    Appends keyframe tokens to the latent state with positions offset by frame_idx,
-    and sets denoise strength according to the strength parameter.
+    Appends keyframe tokens to the sequence with positions offset by frame_idx: the keyframe
+    latents become clean-latent tokens (placeholder zeros in the noisy latent) and the denoise
+    mask is set from the strength parameter.
     To add attention masking, wrap with :class:`ConditioningItemAttentionStrengthWrapper`.
     Args:
         keyframes: Keyframe latents [B, C, F, H, W].
@@ -75,7 +76,7 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
         )
 
         return LatentState(
-            latent=torch.cat([latent_state.latent, tokens], dim=1),
+            latent=torch.cat([latent_state.latent, torch.zeros_like(tokens)], dim=1),
             denoise_mask=torch.cat([latent_state.denoise_mask, denoise_mask], dim=1),
             positions=torch.cat([latent_state.positions, positions], dim=2),
             clean_latent=torch.cat([latent_state.clean_latent, tokens], dim=1),

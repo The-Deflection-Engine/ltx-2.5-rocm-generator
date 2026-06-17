@@ -24,7 +24,6 @@ from ltx_core.model.transformer.ops import (
 )
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.transformer_args import TransformerArgs
-from ltx_core.utils import rms_norm
 
 
 @dataclass
@@ -222,7 +221,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
     def _apply_text_cross_attention(
         self,
-        x: torch.Tensor,
+        x_normed: torch.Tensor,
         context: torch.Tensor,
         attn: AttentionCallable,
         scale_shift_table: torch.Tensor,
@@ -232,11 +231,14 @@ class BasicAVTransformerBlock(torch.nn.Module):
         context_mask: torch.Tensor | None,
         cross_attention_adaln: bool = False,
     ) -> torch.Tensor:
-        """Apply text cross-attention, with optional AdaLN modulation."""
+        """Apply text cross-attention, with optional AdaLN modulation.
+        ``x_normed`` is the RMS-normalized self-attention output produced by
+        ``post_sa_function`` -- this method does not normalize again.
+        """
         if cross_attention_adaln:
-            shift_q, scale_q, gate = self.get_ada_values(scale_shift_table, x.shape[0], timestep, slice(6, 9))
+            shift_q, scale_q, gate = self.get_ada_values(scale_shift_table, x_normed.shape[0], timestep, slice(6, 9))
             return apply_cross_attention_adaln(
-                x,
+                x_normed,
                 context,
                 attn,
                 shift_q,
@@ -245,9 +247,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 prompt_scale_shift_table,
                 prompt_timestep,
                 context_mask,
-                self.norm_eps,
             )
-        return attn(rms_norm(x, eps=self.norm_eps), context=context, mask=context_mask)
+        return attn(x_normed, context=context, mask=context_mask)
 
     def forward(  # noqa: PLR0915
         self,
@@ -280,10 +281,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 perturbation_mask=video.self_attn_perturbation_mask,
                 all_perturbed=video.self_attn_all_perturbed,
             )
-            vx = vx + vx_msa_out * vgate_msa
+            vx, vx_normed = self.post_sa_function(vx, vx_msa_out, None, self.norm_eps, vgate_msa)
             del vgate_msa, norm_vx, vx_msa_out
             vx = vx + self._apply_text_cross_attention(
-                vx,
+                vx_normed,
                 video.context,
                 self.attn2,
                 self.scale_shift_table,
@@ -293,6 +294,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 video.context_mask,
                 cross_attention_adaln=self.cross_attention_adaln,
             )
+            del vx_normed
 
         if run_ax:
             ashift_msa, ascale_msa, agate_msa = self.get_ada_values(
@@ -308,10 +310,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 perturbation_mask=audio.self_attn_perturbation_mask,
                 all_perturbed=audio.self_attn_all_perturbed,
             )
-            ax = ax + ax_msa_out * agate_msa
+            ax, ax_normed = self.post_sa_function(ax, ax_msa_out, None, self.norm_eps, agate_msa)
             del agate_msa, norm_ax, ax_msa_out
             ax = ax + self._apply_text_cross_attention(
-                ax,
+                ax_normed,
                 audio.context,
                 self.audio_attn2,
                 self.audio_scale_shift_table,
@@ -321,6 +323,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 audio.context_mask,
                 cross_attention_adaln=self.cross_attention_adaln,
             )
+            del ax_normed
 
         # Audio - Video cross attention.
         if run_a2v or run_v2a:
@@ -414,7 +417,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
 
 def apply_cross_attention_adaln(
-    x: torch.Tensor,
+    x_normed: torch.Tensor,
     context: torch.Tensor,
     attn: AttentionCallable,
     q_shift: torch.Tensor,
@@ -423,13 +426,17 @@ def apply_cross_attention_adaln(
     prompt_scale_shift_table: torch.Tensor,
     prompt_timestep: torch.Tensor,
     context_mask: torch.Tensor | None = None,
-    norm_eps: float = 1e-6,
 ) -> torch.Tensor:
-    batch_size = x.shape[0]
+    """Apply query/key AdaLN modulation then cross-attention.
+    ``x_normed`` is already RMS-normalized by ``post_sa_function``; this only
+    applies the affine (scale/shift) modulation, so the normalization is not
+    repeated here.
+    """
+    batch_size = x_normed.shape[0]
     shift_kv, scale_kv = (
-        prompt_scale_shift_table[None, None].to(device=x.device, dtype=x.dtype)
+        prompt_scale_shift_table[None, None].to(device=x_normed.device, dtype=x_normed.dtype)
         + prompt_timestep.reshape(batch_size, prompt_timestep.shape[1], 2, -1)
     ).unbind(dim=2)
-    attn_input = rms_norm(x, eps=norm_eps) * (1 + q_scale) + q_shift
+    attn_input = x_normed * (1 + q_scale) + q_shift
     encoder_hidden_states = context * (1 + scale_kv) + shift_kv
     return attn(attn_input, context=encoder_hidden_states, mask=context_mask) * q_gate

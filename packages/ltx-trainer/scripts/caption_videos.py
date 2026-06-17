@@ -2,29 +2,28 @@
 
 """
 Auto-caption videos with audio using multimodal models.
-This script provides a command-line interface for generating captions for videos
-(including audio) using multimodal models. It supports:
-- Qwen2.5-Omni: Local model for audio-visual captioning (default)
-- Gemini Flash: Cloud-based API for audio-visual captioning
-The paths to videos in the generated dataset/captions file will be RELATIVE to the
-directory where the output file is stored. This makes the dataset more portable and
-easier to use in different environments.
+Backends:
+- Qwen3-Omni-30B-A3B-Thinking via a local vLLM HTTP server (default,
+  ``qwen_omni``). Launch the server once with ``scripts/serve_captioner.py``.
+- Gemini Flash 3.5 via Google's API (``gemini_flash``).
+The paths in the output file are RELATIVE to the output file's directory,
+making the dataset portable.
 Basic usage:
-    # Caption a single video (includes audio by default)
-    caption_videos.py video.mp4 --output captions.json
-    # Caption all videos in a directory
-    caption_videos.py videos_dir/ --output captions.csv
-    # Caption with custom instruction
-    caption_videos.py video.mp4 --instruction "Describe what happens in this video in detail."
+    # Launch the captioner server once (separate terminal)
+    uv run python scripts/serve_captioner.py
+    # Caption a directory
+    caption_videos.py videos_dir/ --output captions.json
+    # Caption a single video with a custom prompt
+    caption_videos.py video.mp4 --output cap.json --instruction "Describe in detail."
 Advanced usage:
-    # Use Gemini Flash API (requires GEMINI_API_KEY or GOOGLE_API_KEY env var)
+    # Use Gemini Flash 3.5 (cloud, requires GEMINI_API_KEY)
     caption_videos.py videos_dir/ --captioner-type gemini_flash
-    # Use Gemini Flash with parallel workers (2-10 workers, cloud API only)
+    # Gemini with parallel workers
     caption_videos.py videos_dir/ --captioner-type gemini_flash --num-workers 5
-    # Disable audio processing (video-only captions)
-    caption_videos.py videos_dir/ --no-audio
-    # Process videos with specific extensions and save as JSON
-    caption_videos.py videos_dir/ --extensions mp4,mov,avi --output captions.json
+    # Talk to a remote vLLM server
+    caption_videos.py videos_dir/ --vllm-url http://192.168.1.10:8001/v1
+    # Enable Qwen3 chain-of-thought (slower, more detail)
+    caption_videos.py videos_dir/ --enable-thinking
 """
 
 import csv
@@ -33,7 +32,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
 from pathlib import Path
 
-import torch
 import typer
 from rich.console import Console
 from rich.progress import (
@@ -45,9 +43,14 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from transformers.utils.logging import disable_progress_bar
 
-from ltx_trainer.captioning import CaptionerType, MediaCaptioningModel, create_captioner
+from ltx_trainer.captioning import (
+    DEFAULT_QWEN_MODEL,
+    DEFAULT_VLLM_BASE_URL,
+    CaptionerType,
+    MediaCaptioningModel,
+    create_captioner,
+)
 
 VIDEO_EXTENSIONS = ["mp4", "avi", "mov", "mkv", "webm"]
 IMAGE_EXTENSIONS = ["jpg", "jpeg", "png"]
@@ -61,8 +64,6 @@ app = typer.Typer(
     help="Auto-caption videos with audio using multimodal models.",
 )
 
-disable_progress_bar()
-
 
 class OutputFormat(str, Enum):
     """Available output formats for captions."""
@@ -73,15 +74,13 @@ class OutputFormat(str, Enum):
     JSONL = "jsonl"  # JSON Lines file with one JSON object per line
 
 
-def caption_media(  # noqa: PLR0913
+def caption_media(
     input_path: Path,
     output_path: Path,
     captioner: MediaCaptioningModel,
     extensions: list[str],
     recursive: bool,
     fps: int,
-    include_audio: bool,
-    clean_caption: bool,
     output_format: OutputFormat,
     override: bool,
     num_workers: int = 1,
@@ -94,8 +93,6 @@ def caption_media(  # noqa: PLR0913
         extensions: List of media file extensions to include
         recursive: Whether to search subdirectories recursively
         fps: Frames per second to sample from videos (ignored for images)
-        include_audio: Whether to include audio in captioning
-        clean_caption: Whether to clean up captions
         output_format: Format to save the captions in
         override: Whether to override existing captions
         num_workers: Number of parallel workers (only for cloud-based captioners like Gemini)
@@ -149,10 +146,10 @@ def caption_media(  # noqa: PLR0913
         caption = captioner.caption(
             path=media_file,
             fps=fps,
-            include_audio=include_audio,
-            clean_caption=clean_caption,
         )
-        rel_path = str(media_file.resolve().relative_to(base_dir))
+        # Don't resolve the file itself, so a symlinked clip keeps its logical path under the
+        # dataset dir instead of jumping to its (possibly external) link target.
+        rel_path = str((media_file.parent.resolve() / media_file.name).relative_to(base_dir))
         return rel_path, caption
 
     with progress:
@@ -371,16 +368,31 @@ def main(  # noqa: PLR0913
         help="Type of captioner to use. Valid values: 'qwen_omni' (local), 'gemini_flash' (API)",
         case_sensitive=False,
     ),
-    device: str | None = typer.Option(
-        None,
-        "--device",
-        "-d",
-        help="Device to use for inference (e.g., 'cuda', 'cuda:0', 'cpu'). Only for local models.",
+    vllm_url: str = typer.Option(
+        DEFAULT_VLLM_BASE_URL,
+        "--vllm-url",
+        help=(
+            "Base URL of the vLLM OpenAI-compatible server (qwen_omni only). "
+            "Launch the server with `uv run python scripts/serve_captioner.py`."
+        ),
     ),
-    use_8bit: bool = typer.Option(
+    vllm_model: str = typer.Option(
+        DEFAULT_QWEN_MODEL,
+        "--vllm-model",
+        help="Served model identifier on the vLLM server (qwen_omni only).",
+    ),
+    enable_thinking: bool = typer.Option(
         False,
-        "--use-8bit",
-        help="Whether to use 8-bit precision for the captioning model (reduces memory usage)",
+        "--enable-thinking/--no-thinking",
+        help=(
+            "Let Qwen3-Omni produce a <think>...</think> chain-of-thought before the caption. "
+            "Off by default: ~5x slower with marginal quality benefit and occasional hallucinations."
+        ),
+    ),
+    max_tokens: int = typer.Option(
+        4096,
+        "--max-tokens",
+        help="Maximum new tokens to generate per caption (qwen_omni only).",
     ),
     instruction: str | None = typer.Option(
         None,
@@ -401,20 +413,14 @@ def main(  # noqa: PLR0913
         help="Search for media files in subdirectories recursively",
     ),
     fps: int = typer.Option(
-        3,
+        2,
         "--fps",
         "-f",
-        help="Frames per second to sample from videos (ignored for images)",
-    ),
-    include_audio: bool = typer.Option(
-        True,
-        "--audio/--no-audio",
-        help="Whether to include audio in captioning (for videos with audio tracks)",
-    ),
-    clean_caption: bool = typer.Option(
-        True,
-        "--clean-caption/--raw-caption",
-        help="Whether to clean up captions by removing common VLM patterns",
+        help=(
+            "Frames per second to sample from videos. 2 is a typical default; "
+            "lower values use less compute per video. Ignored for images and for the "
+            "Gemini backend (which decides its own sampling rate)."
+        ),
     ),
     override: bool = typer.Option(
         False,
@@ -441,34 +447,35 @@ def main(  # noqa: PLR0913
     ),
 ) -> None:
     """Auto-caption videos with audio using multimodal models.
-    This script supports audio-visual captioning using:
-    - Qwen2.5-Omni: Local model (default) - processes both video and audio
-    - Gemini Flash: Cloud API - requires GOOGLE_API_KEY environment variable
+    Backends:
+    - ``qwen_omni`` (default): Qwen3-Omni-30B-A3B-Thinking via a local vLLM
+      HTTP server. Launch the server once in a separate terminal with
+      ``uv run python scripts/serve_captioner.py``. The server stays loaded
+      across script invocations.
+    - ``gemini_flash``: Google Gemini (``gemini-3.5-flash``) via the google-genai SDK.
+      Auth is automatic -- ``GEMINI_API_KEY``/``GOOGLE_API_KEY`` for the Developer API,
+      or Google Cloud credentials (gcloud / service account) for Vertex AI with no env vars.
     The paths in the output file will be relative to the output file's directory.
     Examples:
-        # Caption videos with audio using Qwen2.5-Omni (default)
+        # Caption videos using the local vLLM server (default)
         caption_videos.py videos_dir/ -o captions.json
-        # Caption using Gemini Flash API
+        # Point at a remote vLLM server
+        caption_videos.py videos_dir/ -o captions.json --vllm-url http://other-host:8001/v1
+        # Caption using Gemini Flash 3.5
         caption_videos.py videos_dir/ -o captions.json -c gemini_flash
-        # Caption without audio (video-only)
-        caption_videos.py videos_dir/ -o captions.json --no-audio
         # Caption with custom instruction
         caption_videos.py video.mp4 -o captions.json -i "Describe this video in detail"
     """
 
-    # Parallel workers are only safe for cloud-based (stateless) captioners.
-    # Local models like Qwen-Omni hold GPU state and are not thread-safe.
+    # Parallel workers are only supported for the cloud Gemini backend; qwen_omni
+    # drives a single shared vLLM server and is captioned serially from here.
     if num_workers > 1 and captioner_type != CaptionerType.GEMINI_FLASH:
         console.print(
-            "[bold red]Error:[/] --num-workers > 1 is only supported with [bold]--captioner-type gemini_flash[/].\n"
-            "Local models (e.g. qwen_omni) run on GPU and are not thread-safe — "
-            "parallel calls would cause memory corruption or incorrect results.\n"
-            "Either set [bold]--num-workers 1[/] (default) or switch to [bold]--captioner-type gemini_flash[/]."
+            "[bold red]Error:[/] --num-workers > 1 is only supported with "
+            "[bold]--captioner-type gemini_flash[/]. Use --num-workers 1 (default) "
+            "for the qwen_omni backend."
         )
         raise typer.Exit(code=1)
-
-    # Determine device for local models
-    device_str = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     # Parse extensions
     ext_list = [ext.strip() for ext in extensions.split(",")]
@@ -490,14 +497,15 @@ def main(  # noqa: PLR0913
     output = Path(output).resolve()
     console.print(f"Output will be saved to [bold blue]{output}[/]")
 
-    # Initialize captioning model
-    with console.status("Loading captioning model...", spinner="dots"):
+    with console.status("Initializing captioner...", spinner="dots"):
         if captioner_type == CaptionerType.QWEN_OMNI:
             captioner = create_captioner(
                 captioner_type=captioner_type,
-                device=device_str,
-                use_8bit=use_8bit,
+                base_url=vllm_url,
+                model=vllm_model,
                 instruction=instruction,
+                max_tokens=max_tokens,
+                enable_thinking=enable_thinking,
             )
         elif captioner_type == CaptionerType.GEMINI_FLASH:
             captioner = create_captioner(
@@ -508,7 +516,7 @@ def main(  # noqa: PLR0913
         else:
             raise ValueError(f"Unsupported captioner type: {captioner_type}")
 
-        console.print(f"[bold green]✓[/] {captioner_type.value} captioning model loaded successfully")
+        console.print(f"[bold green]✓[/] {captioner_type.value} captioner ready")
 
     # Caption media files
     caption_media(
@@ -518,8 +526,6 @@ def main(  # noqa: PLR0913
         extensions=ext_list,
         recursive=recursive,
         fps=fps,
-        include_audio=include_audio,
-        clean_caption=clean_caption,
         output_format=output_format,
         override=override,
         num_workers=num_workers,

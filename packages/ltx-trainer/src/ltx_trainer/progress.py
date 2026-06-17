@@ -54,60 +54,6 @@ class SamplingContext:
         self._progress.update(self._task, visible=False)
 
 
-class StandaloneSamplingProgress:
-    """Standalone progress display for inference scripts.
-    Unlike SamplingContext (which integrates with TrainingProgress), this class
-    manages its own Rich Progress instance for use in standalone inference scripts.
-    Usage:
-        with StandaloneSamplingProgress(num_steps=30) as ctx:
-            for step in range(30):
-                # ... denoising step ...
-                ctx.advance_step()
-    """
-
-    def __init__(self, num_steps: int, description: str = "Generating"):
-        """Initialize standalone sampling progress.
-        Args:
-            num_steps: Total number of denoising steps
-            description: Description to show in progress bar
-        """
-        self._num_steps = num_steps
-        self._description = description
-        self._progress: Progress | None = None
-        self._task: TaskID | None = None
-
-    def __enter__(self) -> "StandaloneSamplingProgress":
-        """Start the progress display."""
-        self._progress = Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(bar_width=40, style="blue"),
-            TextColumn("{task.fields[info]}", style="cyan"),
-            TimeElapsedColumn(),
-            TextColumn("ETA:"),
-            TimeRemainingColumn(compact=True),
-        )
-        self._progress.__enter__()
-        self._task = self._progress.add_task(
-            self._description,
-            total=self._num_steps,
-            info=f"step 0/{self._num_steps}",
-        )
-        return self
-
-    def __exit__(self, *args) -> None:
-        """Stop the progress display."""
-        if self._progress is not None:
-            self._progress.__exit__(*args)
-
-    def advance_step(self) -> None:
-        """Advance the denoising step by one."""
-        if self._progress is None or self._task is None:
-            return
-        self._progress.advance(self._task)
-        completed = int(self._progress.tasks[self._task].completed)
-        self._progress.update(self._task, info=f"step {completed}/{self._num_steps}")
-
-
 class TrainingProgress:
     """Manages Rich progress display for training and validation.
     This class encapsulates all progress bar logic, providing a clean interface

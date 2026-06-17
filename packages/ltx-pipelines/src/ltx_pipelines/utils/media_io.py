@@ -391,6 +391,24 @@ def encode_video(
     logger.info(f"Video saved to {output_path}")
 
 
+def encode_audio(audio: Audio, output_path: str) -> None:
+    """Save an audio waveform as a 16-bit PCM ``.wav`` file at the source sampling rate.
+    Reuses :func:`_write_audio` (the same muxing path used by :func:`encode_video`);
+    the only difference is a PCM (``pcm_s16le``) stream in a WAV container instead of
+    the AAC stream used for muxed video.
+    """
+    container = av.open(output_path, mode="w")
+    audio_stream = container.add_stream("pcm_s16le", rate=audio.sampling_rate)
+    audio_stream.codec_context.sample_rate = audio.sampling_rate
+    audio_stream.codec_context.layout = "stereo"
+    audio_stream.codec_context.time_base = Fraction(1, audio.sampling_rate)
+    try:
+        _write_audio(container, audio_stream, audio)
+    finally:
+        container.close()
+    logger.info(f"Audio saved to {output_path}")
+
+
 def _encode_chunks_threaded(
     container: av.container.Container,
     stream: av.video.stream.VideoStream,
