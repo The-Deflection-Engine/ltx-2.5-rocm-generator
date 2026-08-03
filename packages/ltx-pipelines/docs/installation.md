@@ -47,7 +47,7 @@ python -m ltx_pipelines.ti2vid_two_stages --help
 - `ltx_pipelines.a2vid_two_stage` - Audio-to-video generation conditioned on an input audio. ([docs](pipelines.md#7-a2vidpipelinetwostage), [source](../src/ltx_pipelines/a2vid_two_stage.py))
 - `ltx_pipelines.retake` - Regenerate a time region of an existing video. ([docs](pipelines.md#8-retakepipeline), [source](../src/ltx_pipelines/retake.py))
 - `ltx_pipelines.hdr_ic_lora` - Video-to-video with HDR output (linear float via LogC3 inverse decode). ([docs](pipelines.md#9-hdriclorapipeline), [source](../src/ltx_pipelines/hdr_ic_lora.py))
-- `ltx_pipelines.lipdub` - Lip dubbing / re-voicing with IC-LoRA and audio reference conditioning. ([docs](pipelines.md#10-lipdubpipeline), [source](../src/ltx_pipelines/lipdub.py))
+- `ltx_pipelines.dubit` - Dub-It / re-voicing with IC-LoRA and audio reference conditioning. ([docs](pipelines.md#10-dubitpipeline), [source](../src/ltx_pipelines/dubit.py))
 
 Use `--help` with any pipeline module to see all available options and parameters.
 

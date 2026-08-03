@@ -486,10 +486,10 @@ def video_editing_arg_parser(
     return parser
 
 
-def lipdub_arg_parser(
+def dubit_arg_parser(
     params: PipelineParams = LTX_2_3_PARAMS,
 ) -> argparse.ArgumentParser:
-    """Argument parser for the lip-dub pipeline.
+    """Argument parser for the Dub-It pipeline.
     Frame count and frame rate are derived from the reference video at runtime (the frame count
     is silently snapped down to the nearest 8k+1), so this parser intentionally omits
     --num-frames, --frame-rate, and --image. Distilled checkpoint only.
