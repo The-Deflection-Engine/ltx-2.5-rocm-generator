@@ -42,7 +42,7 @@ Do you need to condition on existing images/videos?
 | [**A2VidPipelineTwoStage**](pipelines.md#7-a2vidpipelinetwostage) | 2 | ✅ | ✅ | Audio + Image | Audio-driven video generation |
 | [**RetakePipeline**](pipelines.md#8-retakepipeline) | 1 | ✅ | ❌ | Source Video | Regenerating a time region of a video |
 | [**HDRICLoraPipeline**](pipelines.md#9-hdriclorapipeline) | 2 | ❌ | ✅ | Video | HDR video-to-video (linear float output for EXR) |
-| [**LipDubPipeline**](pipelines.md#10-lipdubpipeline) | 2 | ✅ | ✅ | Video + Audio | Lip dubbing with audio ref conditioning |
+| [**DubItPipeline**](pipelines.md#10-dubitpipeline) | 2 | ✅ | ✅ | Video + Audio | Dub-It with audio ref conditioning |
 | [**T2AOneStagePipeline**](pipelines.md#11-t2aonestagepipeline) | 1 | Audio only | ❌ | None (text) | Text-to-audio (audio-only output, no video) |
 
 See [Available Pipelines](pipelines.md) for a full description of each.

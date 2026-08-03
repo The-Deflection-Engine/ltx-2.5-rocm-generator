@@ -1,5 +1,5 @@
 """Shared IC-LoRA helpers: LoRA metadata, mask downsampling, reference-video conditioning.
-Used by ``ic_lora`` and ``lipdub`` (video reference path only). LipDub audio helpers live in ``lipdub.py``.
+Used by ``ic_lora`` and ``dubit`` (video reference path only). Dub-It audio helpers live in ``dubit.py``.
 """
 
 from __future__ import annotations

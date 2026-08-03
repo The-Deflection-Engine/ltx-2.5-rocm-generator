@@ -1,4 +1,4 @@
-"""Two-stage lip-dubbing pipeline with IC-LoRA and appended audio reference conditioning."""
+"""Two-stage Dub-It pipeline with IC-LoRA and appended audio reference conditioning."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from ltx_pipelines.iclora_utils import (
 from ltx_pipelines.utils.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_pipelines.utils.args import (
     ImageConditioningInput,
-    lipdub_arg_parser,
+    dubit_arg_parser,
     resolve_cli_params,
 )
 from ltx_pipelines.utils.blocks import (
@@ -49,8 +49,8 @@ def _snap_frames_to_8k1(frames: int) -> int:
     return ((frames - 1) // time_scale) * time_scale + 1
 
 
-class LipDubPipeline:
-    """Two-stage lip-dubbing with IC-LoRA video reference and appended audio reference tokens."""
+class DubItPipeline:
+    """Two-stage Dub-It with IC-LoRA video reference and appended audio reference tokens."""
 
     def __init__(
         self,
@@ -226,7 +226,7 @@ class LipDubPipeline:
             )
 
         def build_audio_ref_conditioning(audio_latent: torch.Tensor) -> AudioConditionByReferenceLatent:
-            ref_patch, ref_pos = patchify_lipdub_audio_reference_latent(
+            ref_patch, ref_pos = patchify_dubit_audio_reference_latent(
                 audio_latent,
                 negative_positions=True,
                 device=self.device,
@@ -294,7 +294,7 @@ class LipDubPipeline:
         return decoded_video, decoded_audio
 
 
-def patchify_lipdub_audio_reference_latent(
+def patchify_dubit_audio_reference_latent(
     vae_latents: torch.Tensor,
     *,
     negative_positions: bool,
@@ -320,13 +320,13 @@ def patchify_lipdub_audio_reference_latent(
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     params = resolve_cli_params(distilled=True)
-    parser = lipdub_arg_parser(params=params)
+    parser = dubit_arg_parser(params=params)
     args = parser.parse_args()
 
     if not args.lora or len(args.lora) != 1:
-        raise ValueError("LipDub requires exactly one --lora (the lip-dub IC-LoRA).")
+        raise ValueError("Dub-It requires exactly one --lora (the Dub-It IC-LoRA).")
 
-    pipeline = LipDubPipeline(
+    pipeline = DubItPipeline(
         distilled_checkpoint_path=args.distilled_checkpoint_path,
         spatial_upsampler_path=args.spatial_upsampler_path,
         gemma_root=args.gemma_root,
