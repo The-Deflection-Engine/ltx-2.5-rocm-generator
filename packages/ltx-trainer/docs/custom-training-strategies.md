@@ -374,8 +374,10 @@ Create an example config in `configs/`:
 # configs/custom_inpainting_lora.yaml
 
 model:
-  model_path: "/path/to/ltx2.safetensors"
-  text_encoder_path: "/path/to/gemma"
+  # Unified checkpoint shown here; a split pack also needs video_vae_path and
+  # audio_vae_path. See docs/configuration-reference.md#modelconfig.
+  model_path: "/path/to/ltx-checkpoint.safetensors"
+  text_encoder_path: "/path/to/gemma-root"
   training_mode: "lora"
 
 training_strategy:

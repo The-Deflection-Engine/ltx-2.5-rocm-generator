@@ -155,14 +155,19 @@ def apply_loras(
     lora_sd_and_strengths: list[LoraStateDictWithStrength],
     fuse_rule: FuseRule = bf16_fuse_rule,
     destination_sd: StateDict | None = None,
+    preserve_input_device: bool = True,
 ) -> StateDict:
     """Fuse LoRAs into ``model_sd`` and place the results in ``destination_sd``.
     When ``destination_sd`` is provided, the fused tensors are placed directly into it.
+    When omitted, a fresh SD is allocated; untouched keys may alias ``model_sd``.
+    Pass ``preserve_input_device=False`` to leave fused tensors on the fusion device (e.g. when
+    ``model_sd`` is a CPU-retained clean cache and the caller will H2D untouched keys later).
     """
     fused_iter = fuse_lora_weights(
         model_sd,
         lora_sd_and_strengths,
         fuse_rule=fuse_rule,
+        preserve_input_device=preserve_input_device,
     )
     if destination_sd is not None:
         for key, fused in fused_iter:
@@ -170,7 +175,8 @@ def apply_loras(
         return destination_sd
 
     fused = dict(fused_iter)
-    sd = {k: (fused[k] if k in fused else v.clone()) for k, v in model_sd.sd.items()}
+    # Untouched keys may alias ``model_sd`` (e.g. pinned retained cache); do not clone them.
+    sd = {k: fused.get(k, v) for k, v in model_sd.sd.items()}
     return StateDict(sd, model_sd.device, model_sd.size, model_sd.dtype)
 
 

@@ -1,10 +1,16 @@
 # Training Configs
 
-Example training configurations for the LTX-2 trainer. Each file is a ready-to-run config for one training mode,
+Example training configurations for the LTX Trainer. Each file is a ready-to-run config for one training mode,
 expressed through the unified **flexible** strategy (`name: "flexible"`). Pick the one closest to your use case and
 adjust paths, dataset, and hyperparameters.
 
 > 📖 For more information about using each training mode, see [Training Modes Guide](../docs/training-modes.md).
+>
+> These configs support LTX-2, LTX-2.3, and LTX 2.5. Checkpoint architecture is detected automatically, but the
+> `model:` block depends on how your model was published: a unified checkpoint needs `model_path` plus a Gemma
+> directory in `text_encoder_path`, while a split pack (LTX 2.5) additionally needs `video_vae_path` and
+> `audio_vae_path`. Every config below has both forms in its `model:` block — see
+> [ModelConfig](../docs/configuration-reference.md#modelconfig).
 
 ## Training Modes
 

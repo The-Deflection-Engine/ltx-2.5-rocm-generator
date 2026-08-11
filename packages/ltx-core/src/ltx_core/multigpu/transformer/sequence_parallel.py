@@ -82,6 +82,15 @@ def pad_modality_for_uniform_sharding(
     positions_pad = torch.zeros(positions_pad_shape, dtype=modality.positions.dtype, device=modality.positions.device)
     positions = torch.cat([modality.positions, positions_pad], dim=2)
 
+    # Padded tokens are not keyframes, so they pad with 0 and pick up no marker. Their outputs are
+    # sliced off after the gather anyway.
+    keyframes_mask = modality.keyframes_mask
+    if keyframes_mask is not None:
+        mask_pad_shape = list(keyframes_mask.shape)
+        mask_pad_shape[1] = pad
+        mask_pad = torch.zeros(mask_pad_shape, dtype=keyframes_mask.dtype, device=keyframes_mask.device)
+        keyframes_mask = torch.cat([keyframes_mask, mask_pad], dim=1)
+
     if modality.attention_mask is None:
         # Key-only padding mask in the canonical [0, 1] form: 1 on valid keys,
         # 0 on padded keys. Shape (1, 1, T_padded) broadcasts across batch and
@@ -107,6 +116,7 @@ def pad_modality_for_uniform_sharding(
         timesteps=timesteps,
         positions=positions,
         attention_mask=attention_mask,
+        keyframes_mask=keyframes_mask,
     )
     return padded, t_orig
 
@@ -154,11 +164,19 @@ def tile_modality_for_rank(
     # Tile positions: (B, 3, T, 2) -> (B, 3, T_local, 2)
     tiled_positions = modality.positions[:, :, start:end, :]
 
+    # Tile keyframes_mask: (B, T, 1) -> (B, T_local, 1). Sharding splits the sequence, so each
+    # rank must carry the marker for its own slice -- the embedding is applied per rank, before
+    # the all-to-all.
+    tiled_keyframes_mask = None
+    if modality.keyframes_mask is not None:
+        tiled_keyframes_mask = modality.keyframes_mask[:, start:end]
+
     tiled_modality = replace(
         modality,
         latent=tiled_latent,
         timesteps=tiled_timesteps,
         positions=tiled_positions,
+        keyframes_mask=tiled_keyframes_mask,
     )
 
     return tiled_modality, token_counts

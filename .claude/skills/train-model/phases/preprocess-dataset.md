@@ -36,6 +36,9 @@ If `<workspace>/<run-name>/dataset/.precomputed/` already exists:
    uv run python -c "import torch; t = torch.load('<path>'); print(t.shape if hasattr(t, 'shape') else {k: v.shape for k, v in t.items()})"
    ```
 3. Compare shapes against the target resolution from the plan.
+4. Confirm the data was produced with the same `model_path` and `text_encoder_path` in the approved plan. In
+   particular, never reuse `conditions/` produced with another LTX checkpoint or Gemma root; LTX 2.5 requires its
+   matching fine-tuned Gemma 4 root, and Google's vanilla Gemma 4 is not a substitute.
 
 **On any mismatch or missing subdirectory: STOP. Do not run `process_dataset.py`.** Ask the user via `AskUserQuestion`:
 - Reuse the existing data at its current resolution (update plan + config accordingly).
@@ -56,6 +59,8 @@ uv run python scripts/process_dataset.py \
   --output-dir "<workspace>/<run-name>/dataset/.precomputed" \
   --load-text-encoder-in-8bit         # on 32GB tier (low-VRAM config), per t2v_lora_low_vram.yaml
 ```
+
+For LTX 2.5, `<absolute-gemma-path>` must be the matching fine-tuned Gemma 4 root, not Google's vanilla Gemma 4.
 
 Add as needed:
 - `--skip-audio` — if mode doesn't use audio (T2V video-only variants).

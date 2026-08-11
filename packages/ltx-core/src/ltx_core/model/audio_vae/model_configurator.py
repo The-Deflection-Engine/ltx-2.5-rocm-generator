@@ -46,8 +46,8 @@ class VocoderConfigurator(ModelConfigurator[Vocoder]):
     """
 
     @classmethod
-    def from_config(cls: type[Vocoder], config: dict) -> Vocoder | VocoderWithBWE:
-        cfg = config.get("vocoder", {})
+    def from_metadata(cls, metadata: dict) -> Vocoder | VocoderWithBWE:
+        cfg = metadata.get("config", {}).get("vocoder", {})
 
         if "bwe" not in cfg:
             check_config_value(cfg, "resblock", "1")
@@ -107,8 +107,8 @@ VOCODER_COMFY_KEYS_FILTER = (
 
 class AudioDecoderConfigurator(ModelConfigurator[AudioDecoder]):
     @classmethod
-    def from_config(cls: type[AudioDecoder], config: dict) -> AudioDecoder:
-        audio_vae_cfg = config.get("audio_vae", {})
+    def from_metadata(cls, metadata: dict) -> AudioDecoder:
+        audio_vae_cfg = metadata.get("config", {}).get("audio_vae", {})
         model_cfg = audio_vae_cfg.get("model", {})
         model_params = model_cfg.get("params", {})
         ddconfig = model_params.get("ddconfig", {})
@@ -143,8 +143,8 @@ class AudioDecoderConfigurator(ModelConfigurator[AudioDecoder]):
 
 class AudioEncoderConfigurator(ModelConfigurator[AudioEncoder]):
     @classmethod
-    def from_config(cls: type[AudioEncoder], config: dict) -> AudioEncoder:
-        audio_vae_cfg = config.get("audio_vae", {})
+    def from_metadata(cls, metadata: dict) -> AudioEncoder:
+        audio_vae_cfg = metadata.get("config", {}).get("audio_vae", {})
         model_cfg = audio_vae_cfg.get("model", {})
         model_params = model_cfg.get("params", {})
         ddconfig = model_params.get("ddconfig", {})

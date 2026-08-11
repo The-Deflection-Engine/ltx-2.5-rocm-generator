@@ -5,13 +5,13 @@ The foundational library for the LTX-2 Audio-Video generation model. This packag
 ## 📦 What's Inside?
 
 - **`components/`**: Modular diffusion components (Schedulers, Guiders, Noisers, Patchifiers) following standard protocols
-- **`conditioning/`**: Tools for preparing latent states and applying conditioning (image, video, keyframes)
+- **`conditioning/`**: Tools for preparing latent states and applying conditioning (image, video, keyframes, generated keyframe slots)
 - **`guidance/`**: Perturbation system for fine-grained control over attention mechanisms
 - **`loader/`**: Utilities for loading weights from `.safetensors`, fusing LoRAs, and managing memory
 - **`block_streaming/`**: Memory-efficient inference that streams transformer blocks through the GPU one at a time (from pinned CPU buffers or directly from disk)
 - **`model/`**: PyTorch implementations of the LTX-2 Transformer, Video VAE, Audio VAE, Vocoder and Upscaler
 - **`text_encoders/gemma`**: Gemma text encoder implementation with tokenizers, feature extractors, and separate encoders for audio-video and video-only generation
-- **`quantization/`**: FP8 quantization backends (FP8 scaled MM, FP8 cast) for reduced memory footprint.
+- **`quantization/`**: FP8 (scaled MM, cast), blockwise FP8/FP6, and NVFP4 Linear (via `ltx-kernels`) for reduced memory / faster GEMM.
 
 ## 🚀 Quick Start
 
@@ -49,14 +49,15 @@ pip install -e packages/ltx-core
 
 ### Conditioning & Control
 
-- **Conditioning** ([`conditioning/`](src/ltx_core/conditioning/)): Tools for preparing and applying various conditioning types (image, video, keyframes)
+- **Conditioning** ([`conditioning/`](src/ltx_core/conditioning/)): Tools for preparing and applying various conditioning types (image, video, keyframes, and generated keyframe slots via `VideoGeneratedKeyframeSlots` -- extra model-generated frames at interior positions, requiring a checkpoint whose transformer config sets `use_keyframes_abs_pos_embedding`)
 - **Guidance** ([`guidance/`](src/ltx_core/guidance/)): Perturbation system for fine-grained control over attention mechanisms (e.g., skipping specific attention layers)
 
 ### Utilities
 
 - **Loader** ([`loader/`](src/ltx_core/loader/)): Model loading from `.safetensors`, LoRA fusion, weight remapping, and memory management
-- **Quantization** ([`quantization/`](src/ltx_core/quantization/)): FP8 quantization backends for reduced memory footprint and faster inference
+- **Quantization** ([`quantization/`](src/ltx_core/quantization/)): FP8, blockwise FP8/FP6, and NVFP4 Linear policies for reduced memory footprint and faster inference
 - **Block Streaming** ([`block_streaming/`](src/ltx_core/block_streaming/)): Streams transformer blocks through the GPU one block at a time, so the full model runs on machines without enough memory to hold all its weights at once
+- **Colour / HDR** ([`color/`](src/ltx_core/color/), [`hdr.py`](src/ltx_core/hdr.py)): Primaries matrices, YUV/HLG helpers, and working-space transfers used by pipeline EXR/`--hdr` I/O. Pipeline-level docs: [HDR Support](../ltx-pipelines/docs/hdr.md).
 
 ### Loader
 
@@ -334,6 +335,10 @@ The Video VAE ([`src/ltx_core/model/video_vae/`](src/ltx_core/model/video_vae/))
   - Where `F' = 1 + (F-1)*8`
   - Example: `[B, 128, 5, 16, 16]` → `[B, 3, 33, 512, 512]`
 
+`ConvVideoDecoder` (above) is the default, single-forward-pass decoder. `model/video_vae/` also has `DiffusionVideoDecoder` -- a neighborhood-attention decoder (for best performance requires the `natten` extra: `uv sync --package ltx-core --extra natten`; without it, Triton or eager fallbacks are used) that iteratively denoises pixels via Euler steps (`default_num_inference_steps=2` for distilled) instead of a single deterministic pass. `VideoDecoderConfigurator.from_config` picks between the two based on the checkpoint's own `vae._class_name`. `DIFFUSION_VAE_DECODER_COMFY_KEYS_FILTER` is its checkpoint key-remapping `SDOps`. Pipeline-side DiffVAE presets live in `DiffVAEMode` / `apply_diffvae_mode` (default `CHUNKED_EAGER`; CLI `--diffvae-optimization`). See `ltx-pipelines` docs for relative compile/runtime/VRAM tradeoffs between modes.
+
+> **DiffVAE + CUDA illegal memory access:** the `natten` extra pins `natten==0.21.7+torch2130cu132` with `torch==2.13.0` (cu132). Older PyTorch/NVIDIA stacks can IMA inside NATTEN TokPerm on large stage-5 volumes. If that happens, upgrade CUDA / PyTorch / natten to those pins (see also [pipelines optimization docs](../ltx-pipelines/docs/optimization.md#diffusion-vae-decoder)).
+
 The Video VAE is used internally by pipelines for encoding video pixels to latents and decoding latents back to pixels. For usage examples, see the [`ltx-pipelines`](../ltx-pipelines/) package.
 
 ---
@@ -361,7 +366,18 @@ The Audio VAE is used internally by pipelines for encoding mel spectrograms to l
 
 ## Text Encoding (Gemma)
 
-LTX-2 uses **Gemma 3** (Gemma 3-12B) as the multilingual text encoder backbone, located in [`src/ltx_core/text_encoders/gemma/`](src/ltx_core/text_encoders/gemma/). Advanced text understanding is critical not only for global language support but for the phonetic and semantic accuracy of generated speech.
+LTX-2 uses Gemma as the multilingual text encoder backbone, located in [`src/ltx_core/text_encoders/gemma/`](src/ltx_core/text_encoders/gemma/). LTX-2.3 uses stock **Gemma 3** (12B), downloaded separately; LTX-2.5 uses a **Gemma 4** (unified) fine-tuned for LTX and shipped with the model. Advanced text understanding is critical not only for global language support but for the phonetic and semantic accuracy of generated speech.
+
+### Tokenization and BOS
+
+Encoding goes through [`LTXGemmaTokenizer`](src/ltx_core/text_encoders/gemma/tokenizer.py), which always ensures a leading `<bos>`:
+
+| Family | Tokenizer assets prepend `<bos>`? | Encode path |
+|--------|-----------------------------------|-------------|
+| Gemma 3 | Yes (`tokenizer.json` post_processor) | Leading `<bos>` already from assets |
+| Gemma 4 | No | We prepend `<bos>` so both families match |
+
+EOS is not appended on the encode path.
 
 ### Text Encoder Architecture
 

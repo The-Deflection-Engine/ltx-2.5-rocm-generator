@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ltx_core.model.audio_vae.resnet import LRELU_SLOPE, ResBlock1
+from ltx_core.model.disposable import Disposable
 
 
 def get_padding(kernel_size: int, dilation: int = 1) -> int:
@@ -289,7 +290,7 @@ class AMPBlock1(nn.Module):
         return x
 
 
-class Vocoder(torch.nn.Module):
+class Vocoder(torch.nn.Module, Disposable):
     """
     Vocoder model for synthesizing audio from Mel spectrograms.
     Args:
@@ -515,7 +516,7 @@ class MelSTFT(nn.Module):
         return log_mel, magnitude, phase, energy
 
 
-class VocoderWithBWE(nn.Module):
+class VocoderWithBWE(nn.Module, Disposable):
     """Vocoder with bandwidth extension (BWE) upsampling.
     Chains a mel-to-wav vocoder with a BWE module that upsamples the output
     to a higher sample rate. The BWE computes a mel spectrogram from the

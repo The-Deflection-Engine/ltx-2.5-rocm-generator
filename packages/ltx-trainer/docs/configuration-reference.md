@@ -47,29 +47,82 @@ Check out our example configurations in the `configs` directory:
 > The YAML snippets below show **recommended starting values**, not necessarily the code defaults.
 > Fields you omit from your config file will use the code defaults from [`config.py`](../src/ltx_trainer/config.py).
 
+## Supported Checkpoints and Text Encoders
+
+The same configuration schema supports LTX-2, LTX-2.3, and **LTX 2.5**.
+The trainer detects the architecture from checkpoint metadata; no model-version field is needed.
+
+All model paths must be local. Always use the text encoder that the checkpoint's own metadata asks for: LTX 2.5
+requires the LTX-specific fine-tuned Gemma 4 (for example `gemma4-12b-ltx-v1`), not Google's vanilla Gemma 4, and
+older checkpoints require their matching Gemma 3.
+
 ### ModelConfig
 
 Controls the base model and training mode settings.
 
+#### Choosing your checkpoint layout
+
+LTX models are published in two layouts, and which fields you set depends on which one you downloaded. Look at what
+you have on disk:
+
+**A single `.safetensors` file plus a Gemma folder** — this is the *unified* layout, used by LTX-2, LTX-2.3, and
+LTX-2.5. One file holds the transformer, both VAEs, and the vocoder together.
+
 ```yaml
 model:
-  model_path: "/path/to/ltx-2-model.safetensors"  # Local path to model checkpoint
-  text_encoder_path: "/path/to/gemma-model"       # Path to Gemma text encoder directory
-  training_mode: "lora"                           # "lora" or "full"
-  load_checkpoint: null                           # Path to checkpoint to resume from
+  # The one big checkpoint file. Everything except the text encoder lives inside it.
+  model_path: "/models/checkpoints/ltx-2.3-22b-dev.safetensors"
+  # The folder holding the matching Gemma model (config.json, tokenizer, weights).
+  text_encoder_path: "/models/text_encoders/gemma-3-12b-it/"
+  training_mode: "lora"
+  load_checkpoint: null
 ```
 
-**Key parameters:**
+Leave `video_vae_path` and `audio_vae_path` unset — the trainer reads both VAEs out of `model_path`.
 
-| Parameter           | Description                                                                                                                                                    |
-|---------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `model_path`        | **Required.** Local path to the LTX-2 model checkpoint (`.safetensors` file). URLs are not supported.                                                          |
-| `text_encoder_path` | **Required.** Path to the Gemma text encoder model directory. Download from [HuggingFace](https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized/). |
-| `training_mode`     | Training approach - `"lora"` for LoRA training or `"full"` for full-rank fine-tuning.                                                                          |
-| `load_checkpoint`   | Optional path to resume training from a checkpoint file or directory.                                                                                          |
+**A folder tree with one file per component** — this is the *split* layout, used by LTX 2.5. It matches the ComfyUI
+directory structure (`diffusion_models/`, `text_encoders/`, `vae/`), and every component must be named
+individually because no single file contains them all:
+
+```yaml
+model:
+  # The transformer only. It holds no VAE and no text encoder.
+  model_path: "/models/ltx-2.5/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors"
+  # One file containing the Gemma weights, its tokenizer/config, and the text projections.
+  text_encoder_path: "/models/ltx-2.5/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"
+  # Required: the transformer above carries no VAE weights.
+  video_vae_path: "/models/ltx-2.5/vae/ltx-2.5-video-vae-bf16.safetensors"
+  audio_vae_path: "/models/ltx-2.5/vae/ltx-2.5-audio-vae-bf16.safetensors"
+  training_mode: "lora"
+  load_checkpoint: null
+```
+
+If you point `model_path` at a split transformer and forget a VAE path, training stops with an error naming the field
+to set. Each component is only demanded when it is actually loaded, so a video-only run never asks for the audio VAE.
+
+#### Key parameters
+
+Path fields, which differ per layout:
+
+| Parameter | Unified layout | Split layout |
+|---|---|---|
+| `model_path` | **Required.** The single checkpoint file. | **Required.** The transformer file. |
+| `text_encoder_path` | **Required.** The Gemma model directory. | **Required.** The packed text-encoder `.safetensors`. |
+| `video_vae_path` | Leave unset — read from `model_path`. | **Required.** The standalone video VAE. |
+| `audio_vae_path` | Leave unset — read from `model_path`. | **Required when the run touches audio** (audio latents, or validation that generates audio). The standalone audio VAE, which also holds the vocoder. A video-only run may omit it. |
+
+URLs are not supported for any of them.
+
+The remaining fields are the same in both layouts:
+
+| Parameter | Description |
+|---|---|
+| `training_mode` | `"lora"` for LoRA training, `"full"` for full-rank fine-tuning. |
+| `load_checkpoint` | Optional path to resume training from a checkpoint file or directory. |
 
 > [!NOTE]
-> LTX-2 requires both a model checkpoint and a Gemma text encoder. Both must be local paths.
+> The same distinction applies to the preprocessing scripts, which accept `--video-vae-path` and `--audio-vae-path`
+> alongside `--model-path` and `--text-encoder-path`.
 
 ### LoraConfig
 
@@ -266,7 +319,7 @@ acceleration:
 |---------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `mixed_precision_mode`                | Precision mode - `"bf16"` recommended for modern GPUs                                                                                                                                    |
 | `quantization`                        | Model quantization: `null`, `"int8-quanto"`, `"int4-quanto"`, `"int2-quanto"`, `"fp8-quanto"`, or `"fp8uz-quanto"`                                                                       |
-| `load_text_encoder_in_8bit`           | Load the Gemma text encoder in 8-bit to save GPU memory                                                                                                                                  |
+| `load_text_encoder_in_8bit`           | Quantize the Gemma text encoder to 8-bit, saving ~8 GiB of VRAM while caption embeddings are computed. Works with both checkpoint layouts. Requires `bitsandbytes` and a CUDA device, and materializes the full-precision weights in host RAM first (~26 GB for LTX 2.5). **This can potentially degrade the cached caption features.** |
 | `offload_optimizer_during_validation` | Move optimizer state to CPU before validation video sampling and back afterwards. Useful when validation OOMs because VAE decoder + transformer + optimizer state can't coexist on the GPU (full fine-tune, high-rank LoRA). No effect for FSDP. |
 
 ### DataConfig
@@ -299,16 +352,20 @@ validation:
         - type: first_frame
           image_or_video: "/path/to/image.png"
     - prompt: "A dog running in a field"
-  video_dims: [576, 576, 89]                # Output dimensions: [width, height, frames]
-  negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"  # Negative prompt for all samples
-  frame_rate: 25.0                          # Output video frame rate (fps)
+  video_dims: [960, 544, 89]                # Output dimensions: [width, height, frames]
+  negative_prompt: "..."                    # Negative prompt for all samples (defaults to ltx-pipelines DEFAULT_NEGATIVE_PROMPT)
+  frame_rate: 24.0                          # Output video frame rate (fps)
   seed: 42                                  # Random seed for reproducibility
   inference_steps: 30                       # Number of denoising steps
   interval: 100                             # Run validation every N steps (null to disable)
-  guidance_scale: 4.0                       # CFG scale (higher = stronger prompt adherence)
-  stg_scale: 1.0                            # STG scale (0.0 to disable)
-  stg_blocks: [29]                          # Transformer blocks to apply STG perturbation
-  stg_mode: "stg_av"                        # STG mode: "stg_av" (audio+video) or "stg_v" (video only)
+  video_cfg_scale: 3.0                      # Video CFG scale
+  audio_cfg_scale: 7.0                      # Audio CFG scale
+  video_stg_scale: 1.0                      # Video STG scale (0.0 to disable)
+  audio_stg_scale: 1.0                      # Audio STG scale (0.0 to disable)
+  stg_blocks: [28]                          # Transformer blocks to apply STG perturbation
+  guidance_rescale: 0.7                     # Guidance variance rescale factor (0.0 disables)
+  video_modality_guidance_scale: 3.0        # Video modality guidance scale
+  audio_modality_guidance_scale: 3.0        # Audio modality guidance scale
   generate_audio: true                      # Whether to generate audio during validation
   generate_video: true                      # Whether to generate video during validation
   skip_initial_validation: false            # Skip validation at step 0
@@ -319,12 +376,16 @@ validation:
 | Parameter                | Description                                                                                                              |
 |--------------------------|--------------------------------------------------------------------------------------------------------------------------|
 | `samples`                | List of `ValidationSample` objects (see below). Replaces the legacy `prompts`/`images`/`reference_videos` fields.        |
-| `video_dims`             | Output dimensions `[width, height, frames]`. Width/height must be divisible by 32, frames must satisfy `frames % 8 == 1` |
+| `video_dims`             | Output dimensions `[width, height, frames]`. Width/height must be divisible by the VAE spatial factor (32 by default), frames must satisfy `frames % T == 1` where `T` is the VAE temporal factor (8 by default) |
 | `interval`               | Steps between validation runs (set to `null` to disable)                                                                 |
-| `guidance_scale`         | CFG (Classifier-Free Guidance) scale. Recommended: 4.0                                                                   |
-| `stg_scale`              | STG (Spatio-Temporal Guidance) scale. 0.0 disables STG. Recommended: 1.0                                                 |
-| `stg_blocks`             | Transformer blocks to perturb for STG. Recommended: `[29]` (single block)                                                |
-| `stg_mode`               | STG mode: `"stg_av"` perturbs both audio and video, `"stg_v"` perturbs video only                                        |
+| `video_cfg_scale`        | Video CFG (Classifier-Free Guidance) scale. LTX 2.5 default: `3.0` |
+| `audio_cfg_scale`        | Audio CFG (Classifier-Free Guidance) scale. LTX 2.5 default: `7.0` |
+| `video_stg_scale`        | Video STG (Spatio-Temporal Guidance) scale. LTX 2.5 default: `1.0`; `0.0` disables STG |
+| `audio_stg_scale`        | Audio STG (Spatio-Temporal Guidance) scale. LTX 2.5 default: `1.0`; `0.0` disables STG |
+| `stg_blocks`             | Transformer blocks to perturb for STG. LTX 2.5 default: `[28]`; `None` perturbs all blocks |
+| `guidance_rescale`       | Guidance variance rescale factor. LTX 2.5 default: `0.7`; `0.0` disables rescaling |
+| `video_modality_guidance_scale` | Video modality guidance scale for audio-to-video isolation guidance. LTX 2.5 default: `3.0` |
+| `audio_modality_guidance_scale` | Audio modality guidance scale for video-to-audio isolation guidance. LTX 2.5 default: `3.0` |
 | `generate_audio`         | Whether to generate audio in validation samples                                                                          |
 | `generate_video`         | Whether to generate video in validation samples. Set to `false` for V2A (video-to-audio) validation. Default: `true`     |
 | `skip_initial_validation`| Skip validation video sampling at step 0 (beginning of training)                                                         |

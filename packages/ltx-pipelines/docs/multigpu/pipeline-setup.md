@@ -12,7 +12,7 @@ This is performed inside a runner's `setup()` (which runs on every rank — see
 [Controller](controller.md)).
 
 ```python
-from ltx_core.loader.registry import StateDictRegistry
+from ltx_core.loader.registry import ModelRegistry
 from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 from ltx_pipelines.multigpu.sp_builder import SequenceParallelBuilder
 from ltx_pipelines.multigpu.tdp_builder import TiledDataParallelBuilder
@@ -22,12 +22,12 @@ from ltx_pipelines.multigpu.weight_tracker import TransformerWeightTracker
 from ltx_core.multigpu.transformer.attention import AttentionManager
 
 # 1. ONE shared registry for every builder in this process.
-registry = StateDictRegistry()
+registry = ModelRegistry()
 
 # 2. Build the normal pipeline, handing it the registry.
 pipeline = TI2VidTwoStagesPipeline(
-    checkpoint_path=..., distilled_lora=..., spatial_upsampler_path=...,
-    gemma_root=..., loras=[], registry=registry, quantization=...,
+    model_paths=..., distilled_lora=..., spatial_upsampler_path=...,
+    loras=[], registry=registry, quantization=...,
 )
 
 # 3. One weight tracker per transformer process group (shared by the stages).
@@ -56,15 +56,24 @@ constructor.
 > runners assign `stage._transformer_builder = ...` directly because they mutate the
 > pipeline once, in place, during `setup()`. Both reach the same builder slot.
 
-## The shared weights registry
+## The shared model registry
 
-`StateDictRegistry` is an in-process cache of loaded state dicts, keyed by
-`(resolved paths, sd_ops name)`. Passing **one** registry to every builder means:
+`ModelRegistry` is an in-process cache with two independent stores, toggled via
+`cache_weights` / `cache_models` on construction (both default `True`):
 
-- The transformer checkpoint is read from disk **once per process**, even though
-  stage 1 (SP) and stage 2 (TDP) are separate builders on the same file.
-- Gemma and the VAE cache their weights the same way (rebuild the module tree from
-  the cached tensors, skip disk I/O).
+- **Weights** — state dicts keyed by `(resolved paths, sd_ops name)`. Passing
+  **one** registry to every builder means the transformer checkpoint is read from
+  disk **once per process**, even though stage 1 (SP) and stage 2 (TDP) are
+  separate builders on the same file. Gemma and the VAE cache their weights the
+  same way.
+- **Module shells** — `nn.Module` instances keyed by `module_registry_key`
+  (configurator + init config + module ops). A hit reuses the shell; callers
+  always reassign weights onto it. Non-persistent buffers installed by module ops
+  stay on the shell across `dispose` and are not stored in the weight map.
+
+Retained weights are treated as immutable clean cache: LoRA fusion allocates a
+fresh destination SD when `registry.get(...)` hits, so in-place fuse never
+corrupts the registry.
 
 The registry is **per process** — it is not shared across ranks. Each worker loads
 its own copy, so the full checkpoint is resident on every GPU (see the

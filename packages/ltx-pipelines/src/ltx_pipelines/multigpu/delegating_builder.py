@@ -68,6 +68,10 @@ class DelegatingBuilder(Generic[InnerModelT]):
     def registry(self) -> Registry:
         return self._inner.registry
 
+    @property
+    def keeps_gpu_resident_weights(self) -> bool:
+        return self._inner.keeps_gpu_resident_weights
+
     def with_registry(self, registry: Registry) -> Self:
         clone = copy.copy(self)
         clone._inner = self._inner.with_registry(registry)

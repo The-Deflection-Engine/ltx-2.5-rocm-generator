@@ -35,13 +35,42 @@ python -m ltx_pipelines.ti2vid_two_stages \
 python -m ltx_pipelines.ti2vid_two_stages --help
 ```
 
+### Checkpoint layouts: monolith vs split
+
+Every pipeline CLI accepts one of two mutually exclusive path sets.
+
+**Monolith** (legacy) -- one fat `.safetensors` plus a HuggingFace Gemma directory:
+
+```bash
+--checkpoint-path path/to/checkpoint.safetensors --gemma-root path/to/gemma
+```
+
+**Split** (Comfy-aligned) -- one file per component. Pass the subset this pipeline needs
+(unused flags may be omitted; the pipeline validates required slots on `ModelPaths`):
+
+```bash
+python -m ltx_pipelines.distilled \
+    --transformer-path      path/to/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors \
+    --text-encoder-path   path/to/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors \
+    --video-vae-path      path/to/vae/ltx-2.5-video-vae-bf16.safetensors \
+    --audio-vae-path      path/to/vae/ltx-2.5-audio-vae-bf16.safetensors \
+    --duration-head-path  path/to/duration_head/ltx-2.5-duration-head-bf16.safetensors \
+    ...
+```
+
+Mixing the two sets is an error. In split mode `--text-encoder-path` is a single file -- the
+HuggingFace sidecars (config, tokenizer, processor) are embedded in it and loaded in memory,
+so no `--gemma-root` is needed. Both layouts resolve to the same `ModelPaths` object, which is
+what pipeline constructors take.
+
 ### Available pipeline modules
 
-- `ltx_pipelines.ti2vid_two_stages` - Two-stage text/image-to-video (recommended). ([docs](pipelines.md#1-ti2vidtwostagespipeline), [source](../src/ltx_pipelines/ti2vid_two_stages.py))
+- `ltx_pipelines.distilled` - Fast text/image-to-video pipeline using only the distilled model (recommended). ([docs](pipelines.md#4-distilledpipeline), [source](../src/ltx_pipelines/distilled.py))
+- `ltx_pipelines.dfr_pipeline` - Detail-fidelity rendering: generated keyframes, spatial detailing, optional temporal 2x/4x. ([docs](pipelines.md#12-dfrpipeline), [source](../src/ltx_pipelines/dfr_pipeline.py))
+- `ltx_pipelines.ti2vid_two_stages` - Two-stage text/image-to-video. ([docs](pipelines.md#1-ti2vidtwostagespipeline), [source](../src/ltx_pipelines/ti2vid_two_stages.py))
 - `ltx_pipelines.ti2vid_two_stages_hq` - Two-stage text/image-to-video (different sampler, better quality). ([docs](pipelines.md#2-ti2vidtwostageshqpipeline), [source](../src/ltx_pipelines/ti2vid_two_stages_hq.py))
 - `ltx_pipelines.ti2vid_one_stage` - Single-stage text/image-to-video. ([docs](pipelines.md#3-ti2vidonestagepipeline), [source](../src/ltx_pipelines/ti2vid_one_stage.py))
 - `ltx_pipelines.t2a_one_stage` - Single-stage text-to-audio (audio-only output). ([docs](pipelines.md#11-t2aonestagepipeline), [source](../src/ltx_pipelines/t2a_one_stage.py))
-- `ltx_pipelines.distilled` - Fast text/image-to-video pipeline using only the distilled model. ([docs](pipelines.md#4-distilledpipeline), [source](../src/ltx_pipelines/distilled.py))
 - `ltx_pipelines.ic_lora` - Video-to-video with IC-LoRA. ([docs](pipelines.md#5-iclorapipeline), [source](../src/ltx_pipelines/ic_lora.py))
 - `ltx_pipelines.keyframe_interpolation` - Keyframe interpolation. ([docs](pipelines.md#6-keyframeinterpolationpipeline), [source](../src/ltx_pipelines/keyframe_interpolation.py))
 - `ltx_pipelines.a2vid_two_stage` - Audio-to-video generation conditioned on an input audio. ([docs](pipelines.md#7-a2vidpipelinetwostage), [source](../src/ltx_pipelines/a2vid_two_stage.py))
@@ -50,6 +79,8 @@ python -m ltx_pipelines.ti2vid_two_stages --help
 - `ltx_pipelines.dubit` - Dub-It / re-voicing with IC-LoRA and audio reference conditioning. ([docs](pipelines.md#10-dubitpipeline), [source](../src/ltx_pipelines/dubit.py))
 
 Use `--help` with any pipeline module to see all available options and parameters.
+
+For native EXR conditioning and HDR encode on the standard pipelines, see [HDR Support](hdr.md).
 
 ## Common CLI flags
 
@@ -62,3 +93,6 @@ These flags are shared across the pipeline CLIs (they come from a common base pa
 - `--compile [key=value ...]` - enable `torch.compile`, optionally overriding the compilation config.
 - `--lora <path> [strength]` - apply a LoRA (repeatable; default strength 1.0).
 - `--enhance-prompt` - rewrite the prompt with the built-in enhancer before generation.
+- `--hdr {SRGB_LINEAR,ACESCG,ACESCCT}` - on pipelines that accept image / video conditioning (not Dub-It, HDR IC-LoRA, or T2A): declare the source colour space for EXR stills / EXR-frame folders. Required whenever any EXR input is passed; omit for SDR. With `--hdr` set, encode writes half EXR frames plus a BT.2020/HLG master. See [HDR Support](hdr.md).
+- `--video-vae-path <path>` - video VAE `.safetensors` (encoder + decoder). Split: the `vae/` component. Monolith: optional override of the VAE bundled in `--checkpoint-path`/`--distilled-checkpoint-path`. When it is a diffusion VAE, decoding builds a `DiffusionVideoDecoder`, which for best performance requires the `natten` extra. See [Optimization Tips](optimization.md#diffusion-vae-decoder).
+- `--diffvae-optimization {chunked_eager,chunked_compile,combined_compile}` - DiffVAE decode preset (ignored for convolutional VAEs).

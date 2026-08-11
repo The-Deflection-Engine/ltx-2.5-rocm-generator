@@ -19,15 +19,27 @@ from all four optimizations.  Causal mode benefits from optimizations 1, 3,
 and 4; in-place conv (2) is skipped because the asymmetric causal padding
 layout prevents clean in-place overwrites.
 Usage via the ``ModuleOps`` pattern (preferred)::
-    from ltx_core.model.video_vae import MEMORY_EFFICIENT_DECODE
+    from ltx_core.loader.sd_ops import SDOps
+    from ltx_core.model.video_vae import (
+        CHANNELS_LAST_3D_WEIGHTS,
+        MEMORY_EFFICIENT_DECODE,
+        VAE_DECODER_COMFY_KEYS_FILTER,
+    )
+    sd_ops = SDOps(
+        name=f"sd_ops_chain_{VAE_DECODER_COMFY_KEYS_FILTER.name}+{CHANNELS_LAST_3D_WEIGHTS.name}",
+        mapping=(*VAE_DECODER_COMFY_KEYS_FILTER.mapping, *CHANNELS_LAST_3D_WEIGHTS.mapping),
+    )
     builder = decoder_builder.with_module_ops(
         (*decoder_builder.module_ops, MEMORY_EFFICIENT_DECODE)
-    )
+    ).with_sd_ops(sd_ops)
 Or applied directly to an existing decoder::
     from ltx_core.model.video_vae.memory_efficient_decode import (
         enable_memory_efficient_decode,
     )
     enable_memory_efficient_decode(decoder)
+Weights must be loaded with :data:`CHANNELS_LAST_3D_WEIGHTS` chained into sd_ops
+(or equivalent ``channels_last_3d`` layout) so the registry caches NHWC; the
+module op only formats activations and installs the workspace forward.
 """
 
 from __future__ import annotations
@@ -41,6 +53,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from ltx_core.loader.module_ops import ModuleOps
+from ltx_core.loader.sd_ops import KeyValueOperationResult, SDOps
 from ltx_core.model.common.normalization import PixelNorm
 from ltx_core.model.video_vae.convolution import CausalConv3d
 from ltx_core.model.video_vae.ops import unpatchify
@@ -48,7 +61,7 @@ from ltx_core.model.video_vae.resnet import ResnetBlock3D, UNetMidBlock3D
 from ltx_core.model.video_vae.sampling import DepthToSpaceUpsample
 
 if TYPE_CHECKING:
-    from ltx_core.model.video_vae.video_vae import VideoDecoder
+    from ltx_core.model.video_vae.video_vae import ConvVideoDecoder
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +468,7 @@ def _upsample_forward_efficient(
 
 
 def _final_norm_and_conv_out(
-    decoder: VideoDecoder,
+    decoder: ConvVideoDecoder,
     sample: torch.Tensor,
     causal: bool,
     scaled_timestep: torch.Tensor | None,
@@ -526,19 +539,20 @@ def _final_norm_and_conv_out(
 
 
 def _memory_efficient_forward(
-    decoder: VideoDecoder,
+    decoder: ConvVideoDecoder,
     sample: torch.Tensor,
     timestep: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Full memory-efficient ``VideoDecoder.forward`` replacement.
+    """Full memory-efficient ``ConvVideoDecoder.forward`` replacement.
     Orchestrates the entire decode through workspace-based operations:
     ``UNetMidBlock3D`` and ``DepthToSpaceUpsample`` blocks use efficient
     paths; standalone ``ResnetBlock3D`` blocks fall back to the standard
     forward.  The final norm + ada + SiLU + conv_out is also workspace-based.
     All workspaces are allocated ``channels_last_3d`` so cuDNN's NHWC 3D
-    conv kernels run end-to-end. The caller (:func:`enable_memory_efficient_decode`)
-    is responsible for converting the input sample and decoder weights to NHWC.
+    conv kernels run end-to-end. Weights must already be NHWC (via
+    :data:`CHANNELS_LAST_3D_WEIGHTS` chained at load); this path only formats the
+    input sample.
     """
     causal = decoder.causal
     batch_size = sample.shape[0]
@@ -600,38 +614,45 @@ def _memory_efficient_forward(
 # ---------------------------------------------------------------------------
 
 
+def _to_channels_last_3d(key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
+    """Store 5D conv weights in NHWC so the mem-efficient path never reformats them."""
+    if value.dim() == 5:
+        value = value.to(memory_format=torch.channels_last_3d)
+    return [KeyValueOperationResult(key, value)]
+
+
+# Load-time NHWC for 5D weights. Chain onto the VAE decoder filter at the builder
+# (same pattern as QuantizationPolicy.sd_ops) so the registry caches this layout
+# under a distinct sd_ops name.
+CHANNELS_LAST_3D_WEIGHTS = SDOps("channels_last_3d_weights").with_kv_operation(operation=_to_channels_last_3d)
+
+
 def enable_memory_efficient_decode(decoder: nn.Module) -> nn.Module:
-    """Patch a ``VideoDecoder`` to use the memory-efficient forward path.
+    """Patch a ``ConvVideoDecoder`` to use the memory-efficient forward path.
     The mem-efficient path runs the decoder in ``channels_last_3d`` memory
-    format: weights and inputs are converted on first call so cuDNN's NHWC
-    3D conv kernels are used (~2x faster, avoids the large vol2col scratch
-    buffer of the NCHW path).
+    format. **Weights** must already be NHWC — chain :data:`CHANNELS_LAST_3D_WEIGHTS`
+    into the builder's sd_ops at load so the registry stores that layout. This
+    patch only formats the **activation** and swaps in the workspace-based forward.
     The original ``forward`` is saved as ``decoder._original_forward`` so
     that it can be restored later with :func:`disable_memory_efficient_decode`.
     """
     # Import here to avoid circular dependency at module level.
-    from ltx_core.model.video_vae.video_vae import VideoDecoder  # noqa: PLC0415
+    from ltx_core.model.video_vae.video_vae import ConvVideoDecoder  # noqa: PLC0415
 
-    if not isinstance(decoder, VideoDecoder):
-        raise TypeError(f"Expected VideoDecoder, got {type(decoder).__name__}")
+    if not isinstance(decoder, ConvVideoDecoder):
+        raise TypeError(f"Expected ConvVideoDecoder, got {type(decoder).__name__}")
 
     if hasattr(decoder, "_original_forward"):
         return decoder
 
     original_forward = decoder.forward
-    weights_converted = False
 
     def efficient_forward(
         sample: torch.Tensor,
         timestep: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
-        nonlocal weights_converted
         if sample.dim() == 5:
-            if not weights_converted:
-                # Lazy: weights are real by first-call time (meta -> loader -> here).
-                decoder.to(memory_format=torch.channels_last_3d)
-                weights_converted = True
             sample = sample.to(memory_format=torch.channels_last_3d)
         return _memory_efficient_forward(decoder, sample, timestep, generator)
 
@@ -641,7 +662,7 @@ def enable_memory_efficient_decode(decoder: nn.Module) -> nn.Module:
 
 
 def disable_memory_efficient_decode(decoder: nn.Module) -> nn.Module:
-    """Restore the original ``forward`` method on a patched ``VideoDecoder``."""
+    """Restore the original ``forward`` method on a patched ``ConvVideoDecoder``."""
     if hasattr(decoder, "_original_forward"):
         decoder.forward = decoder._original_forward  # type: ignore[attr-defined]
         del decoder._original_forward  # type: ignore[attr-defined]
@@ -650,9 +671,9 @@ def disable_memory_efficient_decode(decoder: nn.Module) -> nn.Module:
 
 def _is_video_decoder(model: nn.Module) -> bool:
     """Matcher for the ``MEMORY_EFFICIENT_DECODE`` module op."""
-    from ltx_core.model.video_vae.video_vae import VideoDecoder  # noqa: PLC0415
+    from ltx_core.model.video_vae.video_vae import ConvVideoDecoder  # noqa: PLC0415
 
-    return isinstance(model, VideoDecoder)
+    return isinstance(model, ConvVideoDecoder)
 
 
 MEMORY_EFFICIENT_DECODE = ModuleOps(

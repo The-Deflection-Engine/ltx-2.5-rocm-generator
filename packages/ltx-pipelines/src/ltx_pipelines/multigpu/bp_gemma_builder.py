@@ -1,12 +1,13 @@
 """Batch-parallel Gemma text encoder builder.
-Each rank materialises a full :class:`GemmaTextEncoder` on its own local
+Each rank materialises a full :class:`LTXGemmaTextEncoder` on its own local
 CUDA device via the standard :class:`SingleGPUModelBuilder` pipeline (the
 same code path used by the non-MGPU pipelines). No Accelerate, no
 ``device_map``, no per-layer dispatch hooks.
 Every ``build()`` reconstructs the encoder through
 :class:`SingleGPUModelBuilder`: a fresh meta module is created, the
-``GEMMA_MODEL_OPS`` chain re-runs (recomputing the rotary / position
-buffers that live outside the safetensors file), and the trained weights
+family-specific model-ops chain from :func:`get_gemma_ops` re-runs
+(recomputing the rotary / position buffers that live outside the
+safetensors file), and the trained weights
 are bound from the provided :class:`Registry`. The registry caches the
 loaded state dict so subsequent calls skip disk I/O while still rebuilding
 the module tree -- mirroring the rebuild logic of
@@ -30,12 +31,10 @@ from ltx_core.loader.registry import Registry
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
 from ltx_core.multigpu.gemma.batch_parallel_wrapper import BatchParallelGemmaWrapper
 from ltx_core.text_encoders.gemma import (
-    GEMMA_LLM_KEY_OPS,
-    GEMMA_MODEL_OPS,
     GemmaTextEncoderConfigurator,
-    module_ops_from_gemma_root,
+    get_gemma_ops,
+    resolve_gemma_weight_paths,
 )
-from ltx_core.utils import find_matching_file
 
 logger = logging.getLogger(__name__)
 
@@ -59,13 +58,13 @@ class BatchParallelGemmaBuilder(BuilderProtocol):
         src_rank: int,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
-        model_folder = find_matching_file(gemma_root_path, "model*.safetensors").parent
-        weight_paths = tuple(str(p) for p in model_folder.rglob("*.safetensors"))
+        weight_paths = resolve_gemma_weight_paths(gemma_root_path)
+        gemma_sd_ops, gemma_module_ops = get_gemma_ops(gemma_root_path)
         self._inner = Builder(
             model_path=weight_paths,
-            model_class_configurator=GemmaTextEncoderConfigurator,
-            model_sd_ops=GEMMA_LLM_KEY_OPS,
-            module_ops=(GEMMA_MODEL_OPS, *module_ops_from_gemma_root(gemma_root_path)),
+            model_class_configurator=GemmaTextEncoderConfigurator.with_gemma_model_path(gemma_root_path),
+            model_sd_ops=gemma_sd_ops,
+            module_ops=gemma_module_ops,
             registry=registry,
         )
         self._broadcast_group = broadcast_group

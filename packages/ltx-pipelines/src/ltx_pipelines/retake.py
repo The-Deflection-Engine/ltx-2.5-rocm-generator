@@ -5,6 +5,7 @@ from collections.abc import Iterator
 
 import torch
 
+from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.schedulers import LTX2Scheduler
@@ -12,12 +13,13 @@ from ltx_core.conditioning.types.noise_mask_cond import TemporalRegionMask
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
 from ltx_core.model.transformer.compiling import CompilationConfig
-from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
+from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, get_video_chunks_number
+from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import (
     SpatioTemporalScaleFactors,
+    VideoPixelShape,
 )
-from ltx_pipelines.utils.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_pipelines.utils.args import video_editing_arg_parser
 from ltx_pipelines.utils.blocks import (
     AudioConditioner,
@@ -31,13 +33,20 @@ from ltx_pipelines.utils.constants import DISTILLED_SIGMAS, detect_params
 from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
     audio_latent_from_file,
+    ensure_tiling_config,
     get_device,
+    tiling_scale_factors_for_vae,
     video_latent_from_file,
 )
 from ltx_pipelines.utils.media_io import (
+    HDRColorSpace,
     encode_video,
     get_videostream_metadata,
+    is_exr_dir,
+    resolve_hdr_color_space,
+    vae_dtype_for_hdr,
 )
+from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
 
 
@@ -66,10 +75,9 @@ class RetakePipeline:
         function will be used during ``__call__``.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
-        checkpoint_path: str,
-        gemma_root: str,
+        model_paths: ModelPaths,
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
@@ -78,6 +86,8 @@ class RetakePipeline:
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
+        prompt_enhancer_gemma_root: str | None = None,
+        diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
@@ -85,30 +95,30 @@ class RetakePipeline:
         if not distilled:
             self._scheduler = LTX2Scheduler()
         self.prompt_encoder = PromptEncoder(
-            checkpoint_path=checkpoint_path,
-            gemma_root=gemma_root,
+            model_paths,
             dtype=self.dtype,
             device=self.device,
             registry=registry,
             offload_mode=offload_mode,
             alloc_trim_strategy=alloc_trim_strategy,
+            prompt_enhancer_gemma_root=prompt_enhancer_gemma_root,
         )
         self.image_conditioner = ImageConditioner(
-            checkpoint_path=checkpoint_path,
+            model_paths.video_vae(),
             dtype=self.dtype,
             device=self.device,
             registry=registry,
             alloc_trim_strategy=alloc_trim_strategy,
         )
         self.audio_conditioner = AudioConditioner(
-            checkpoint_path=checkpoint_path,
+            model_paths.audio_vae(),
             dtype=self.dtype,
             device=self.device,
             registry=registry,
             alloc_trim_strategy=alloc_trim_strategy,
         )
         self.stage = DiffusionStage.from_checkpoint(
-            checkpoint_path=checkpoint_path,
+            model_paths.transformer(),
             dtype=self.dtype,
             device=self.device,
             loras=tuple(loras),
@@ -119,14 +129,15 @@ class RetakePipeline:
             alloc_trim_strategy=alloc_trim_strategy,
         )
         self.video_decoder = VideoDecoder(
-            checkpoint_path=checkpoint_path,
+            model_paths.video_vae(),
             dtype=self.dtype,
             device=self.device,
             registry=registry,
             alloc_trim_strategy=alloc_trim_strategy,
+            diffvae_optimization=diffvae_optimization,
         )
         self.audio_decoder = AudioDecoder(
-            checkpoint_path=checkpoint_path,
+            model_paths.audio_vae(),
             dtype=self.dtype,
             device=self.device,
             registry=registry,
@@ -145,6 +156,7 @@ class RetakePipeline:
         end_time: float,
         seed: int,
         *,
+        fps: float | None = None,
         negative_prompt: str = "",
         num_inference_steps: int = 40,
         video_guider_params: MultiModalGuiderParams | None = None,
@@ -152,21 +164,29 @@ class RetakePipeline:
         regenerate_video: bool = True,
         regenerate_audio: bool = True,
         enhance_prompt: bool = False,
-        tiling_config: TilingConfig | None = None,
+        enhance_static_cache: bool = False,
+        vae_dtype: torch.dtype | None = None,
+        tiling_config: TilingConfig | AutoTiling | None = AUTO_TILING,
         max_batch_size: int = 1,
         sigmas: torch.Tensor | None = None,
-    ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
+        color_space: HDRColorSpace | None = None,
+    ) -> tuple[Iterator[torch.Tensor], torch.Tensor, TilingConfig | None]:
         """Regenerate ``[start_time, end_time]`` of the source video (retake).
         Parameters
         ----------
         video_path : str
-            Path to the source video file (must contain video; audio is optional).
+            Path to the source video file, or a directory of scene-linear ``*.exr``
+            frames (native HDR). Audio is optional for video files and absent for
+            EXR folders.
         prompt : str
             Text prompt describing the *regenerated* section.
         start_time, end_time : float
             Time window (in seconds) of the section to regenerate.
         seed : int
             Random seed for reproducibility.
+        fps : float | None
+            Frame rate when *video_path* is an EXR-frame folder (required then).
+            Ignored for regular video files.
         negative_prompt : str
             Negative prompt for CFG guidance (ignored in distilled mode).
         num_inference_steps : int
@@ -185,8 +205,8 @@ class RetakePipeline:
             Whether to enhance the prompt via the text encoder.
         Returns
         -------
-        tuple[Iterator[torch.Tensor], torch.Tensor]
-            ``(video_frames_iterator, audio_waveform)``
+        tuple[Iterator[torch.Tensor], torch.Tensor, TilingConfig]
+            ``(video_frames_iterator, audio_waveform, tiling_config)``
         """
         if start_time >= end_time:
             raise ValueError(f"start_time ({start_time}) must be less than end_time ({end_time})")
@@ -194,8 +214,27 @@ class RetakePipeline:
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
         dtype = self.dtype
+        if vae_dtype is None:
+            vae_dtype = dtype
 
-        output_shape = get_videostream_metadata(video_path)
+        output_shape = get_videostream_metadata(video_path, fps=fps)
+
+        scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
+        tiling_config = ensure_tiling_config(
+            tiling_config,
+            scale_factors=scale_factors,
+            vae_checkpoint_path=self.video_decoder.checkpoint_path,
+            video_shape=VideoPixelShape(
+                batch=1,
+                frames=output_shape.frames,
+                height=output_shape.height,
+                width=output_shape.width,
+                fps=output_shape.fps,
+            ),
+            diffvae_optimization=self.video_decoder.diffvae_optimization,
+            device=self.device,
+        )
+
         initial_video_latent = self.image_conditioner(
             lambda enc: video_latent_from_file(
                 video_encoder=enc,
@@ -203,6 +242,7 @@ class RetakePipeline:
                 output_shape=output_shape,
                 dtype=dtype,
                 device=self.device,
+                color_space=color_space,
             )
         )
 
@@ -220,6 +260,7 @@ class RetakePipeline:
         contexts = self.prompt_encoder(
             prompts_to_encode,
             enhance_first_prompt=enhance_prompt,
+            enhance_static_cache=enhance_static_cache,
             enhance_prompt_seed=seed,
         )
 
@@ -282,11 +323,10 @@ class RetakePipeline:
             max_batch_size=max_batch_size,
         )
 
-        # Decode
-        decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
+        decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
         decoded_audio = self.audio_decoder(audio_state.latent)
 
-        return decoded_video, decoded_audio
+        return decoded_video, decoded_audio, tiling_config
 
 
 @torch.inference_mode()
@@ -302,7 +342,8 @@ def main() -> None:
 
     # Validate frame count (8k+1) and resolution (multiples of 32) at CLI stage
     video_scale = SpatioTemporalScaleFactors.default()
-    src = get_videostream_metadata(args.video_path)
+    exr_input = is_exr_dir(args.video_path)
+    src = get_videostream_metadata(args.video_path, fps=args.frame_rate if exr_input else None)
     if (src.frames - 1) % video_scale.time != 0:
         snapped = ((src.frames - 1) // video_scale.time) * video_scale.time + 1
         raise ValueError(
@@ -312,27 +353,35 @@ def main() -> None:
         raise ValueError(f"Video width and height must be multiples of 32. Got {src.width}x{src.height}.")
 
     pipeline = RetakePipeline(
-        checkpoint_path=args.distilled_checkpoint_path,
-        gemma_root=args.gemma_root,
+        model_paths=args.model_paths,
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
         distilled=True,
         compilation_config=args.compile,
         offload_mode=args.offload_mode,
+        prompt_enhancer_gemma_root=args.prompt_enhancer_gemma_root,
+        diffvae_optimization=args.diffvae_optimization,
     )
-    params = detect_params(args.distilled_checkpoint_path)
-    tiling_config = TilingConfig.default()
-    video_iter, audio = pipeline(
+    params = detect_params(args.model_paths.transformer())
+    hdr = resolve_hdr_color_space(video_paths=[args.video_path], hdr=args.hdr)
+    vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
+    video_iter, audio, tiling_config = pipeline(
         video_path=args.video_path,
         prompt=args.prompt,
         start_time=args.start_time,
         end_time=args.end_time,
         seed=args.seed,
+        fps=args.frame_rate if exr_input else None,
+        enhance_prompt=args.enhance_prompt,
+        enhance_static_cache=args.enhance_static_cache,
         video_guider_params=params.video_guider_params,
         audio_guider_params=params.audio_guider_params,
-        tiling_config=tiling_config,
+        vae_dtype=vae_dtype,
+        color_space=hdr,
+        tiling_config=AUTO_TILING,
         max_batch_size=args.max_batch_size,
     )
+
     video_chunks_number = get_video_chunks_number(src.frames, tiling_config)
     encode_video(
         video=video_iter,
@@ -340,6 +389,7 @@ def main() -> None:
         audio=audio,
         output_path=args.output_path,
         video_chunks_number=video_chunks_number,
+        color_space=hdr,
     )
 
 

@@ -1,17 +1,18 @@
 # Quick Start Guide
 
-Get up and running with LTX-2 training in just a few steps!
+Get up and running with LTX family training in just a few steps.
 
 ## 📋 Prerequisites
 
 Before you begin, ensure you have:
 
-1. **LTX-2 Model Checkpoint** - A local `.safetensors` file containing the LTX-2 model weights.
-   Download `ltx-2.3-22b-dev.safetensors` from: [HuggingFace Hub](https://huggingface.co/Lightricks/LTX-2.3)
-   The trainer supports LTX-2 and LTX-2.3 checkpoints through the same configuration API; version-specific components
-   are detected from the checkpoint.
-2. **Gemma Text Encoder** - A local directory containing the Gemma model (required for LTX-2).
-   Download from: [HuggingFace Hub](https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized/)
+1. **LTX Model Checkpoint** - A local `.safetensors` file containing the model weights.
+   The trainer supports LTX-2, LTX-2.3, and **LTX 2.5** through the same configuration API;
+   version-specific components are detected from checkpoint metadata.
+2. **Matching Gemma Text Encoder** - A local directory containing the Gemma model.
+   LTX 2.5 requires the LTX-specific fine-tuned Gemma 4 root (for example, `gemma4-12b-ltx-v1`), not Google's
+   vanilla Gemma 4 model. Older LTX-2 and LTX-2.3 checkpoints use the Gemma version they declare; do not substitute
+   Gemma 3 for an LTX 2.5 checkpoint.
 3. **Linux with CUDA** - The trainer requires `triton` which is Linux-only; CUDA 13+ is recommended
 4. **GPU with sufficient VRAM** - 80GB recommended for the standard config. For GPUs with 32GB VRAM (e.g., RTX 5090),
    use the [low VRAM config](../configs/t2v_lora_low_vram.yaml) which enables INT8 quantization and other
@@ -66,12 +67,17 @@ uv run python scripts/caption_videos.py scenes_output_dir/ --output dataset.json
 # Preprocess the dataset (compute latents and embeddings)
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
-    --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model
+    --model-path /path/to/ltx-2.x-checkpoint.safetensors \
+    --text-encoder-path /path/to/gemma-root
 ```
 
 By default, preprocessing writes to `.precomputed/`. Use that directory as `data.preprocessed_data_root`
 in your training config.
+
+> [!IMPORTANT]
+> Precomputed text features are specific to the checkpoint and Gemma pair. When switching from LTX-2.3 to
+> LTX 2.5, preprocess into a fresh output directory or add `--overwrite`; existing `.pt` files are skipped by
+> default. Use the checkpoint metadata supplied with the model; no version flag is required.
 
 See [Dataset Preparation](dataset-preparation.md) for detailed instructions.
 
@@ -85,15 +91,27 @@ Create or modify a configuration YAML file. Start with one of the example config
 
 Key settings to update:
 
+A unified (single-file) checkpoint needs two paths:
+
 ```yaml
 model:
-  model_path: "/path/to/ltx-2-model.safetensors"
-  text_encoder_path: "/path/to/gemma-model"
+  model_path: "/path/to/ltx-2.x-checkpoint.safetensors"
+  text_encoder_path: "/path/to/gemma-root"
 
 data:
   preprocessed_data_root: "/path/to/preprocessed/data"
 
 output_dir: "outputs/my_training_run"
+```
+
+A split pack ships one file per component, so name each of them instead:
+
+```yaml
+model:
+  model_path: "/path/to/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors"
+  text_encoder_path: "/path/to/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"
+  video_vae_path: "/path/to/vae/ltx-2.5-video-vae-bf16.safetensors"
+  audio_vae_path: "/path/to/vae/ltx-2.5-audio-vae-bf16.safetensors"
 ```
 
 See [Configuration Reference](configuration-reference.md) for all available options.

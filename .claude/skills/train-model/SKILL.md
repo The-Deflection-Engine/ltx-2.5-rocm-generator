@@ -1,6 +1,6 @@
 ---
 name: train-model
-description: End-to-end agent for training LTX-2 models. Probes filesystem and GPU, picks the right conditioning mode from the user's intent, prepares the dataset (scenes, captions, references), preprocesses, autotunes, launches, and monitors training. Use when the user wants to train, fine-tune, LoRA, or otherwise produce a custom LTX-2 model.
+description: End-to-end agent for training LTX models. Probes filesystem and GPU, picks the right conditioning mode from the user's intent, prepares the dataset (scenes, captions, references), preprocesses, autotunes, launches, and monitors training. Use when the user wants to train, fine-tune, LoRA, or otherwise produce a custom LTX model.
 argument-hint: [optional source path or run name]
 user-invocable: true
 allowed-tools: Bash, Read, Grep, Glob, Edit, Write, Agent, AskUserQuestion, TodoWrite
@@ -104,7 +104,8 @@ No questions in this phase. Inspect what's already there. Use `references/onboar
 ### Prerequisite probe (first-run sanity)
 - `uv` installed (`command -v uv`).
 - Workspace synced (lockfile present + `ltx-trainer` import works).
-- LTX-2 `.safetensors` and Gemma text encoder dir present in `/models/`, `~/models/`, or `$LTX_MODELS_DIR`.
+- LTX `.safetensors` checkpoint and matching Gemma text encoder dir present in `/models/`, `~/models/`, or `$LTX_MODELS_DIR`.
+- For LTX 2.5, `text_encoder_path` must point to the LTX-specific fine-tuned Gemma 4 root, not Google's vanilla Gemma 4 model.
 - Captioner availability: Gemini auth (`GEMINI_API_KEY`/`GOOGLE_API_KEY` or gcloud/Vertex) OR a ≥40 GiB GPU to host the Qwen3-Omni-30B vLLM server (FP8; bf16 needs ≥66 GiB). On typical consumer GPUs (24/32 GB), Gemini is effectively the only local-free option — see `references/onboarding.md`.
 
 For any missing prerequisite, **do not silently fail in a later phase**. Present the finding in chat with the specific next step from `references/onboarding.md`. The skill may offer to auto-install / auto-download missing pieces — but only ever after asking the user explicitly, one item at a time (model downloads are tens of GB each). Never auto-modify shell rc files or system config without consent.
@@ -125,7 +126,7 @@ Principle: only ask when reuse-vs-regenerate is a genuine judgment call with cos
 
 Ask only what cannot be inferred. Use `AskUserQuestion` with multiple-choice when possible. Typical questions:
 
-- **Target resolution / frame count** — propose a default per mode (e.g., `768x512x49` for T2V LoRA on consumer GPUs); offer overrides.
+- **Target resolution / frame count** — propose a default per mode (e.g., `960x544x49` from the T2V LoRA config); offer overrides.
 - **Training steps** — if dataset size doesn't pin it, propose a default (e.g., 2000 for small LoRA datasets).
 - **LoRA trigger word / concept name** — only for style/concept LoRAs. Ask **only** for the word itself (or whether they want one). **Never** ask or mention *how* it's injected — it's always the `--lora-trigger` flag (passed to `process_dataset.py`, which forwards it to `process_captions.py` where the prepend happens); this is a fixed implementation detail. Presenting caption-injection as an option creates unnecessary confusion.
 - **Captioner backend** — only if more than one path is viable (e.g. a ≥40 GiB GPU can host the Qwen3-Omni-30B server *and* Gemini auth is available). On typical consumer GPUs, default to `gemini_flash` and surface that Gemini auth is required rather than asking.

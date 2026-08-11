@@ -11,7 +11,6 @@ import warnings
 from ltx_trainer import logger
 from ltx_trainer.training_strategies.base_strategy import (
     DEFAULT_FPS,
-    VIDEO_SCALE_FACTORS,
     ModelInputs,
     TrainingStrategy,
     TrainingStrategyConfigBase,
@@ -25,7 +24,6 @@ TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | FlexibleStrate
 
 __all__ = [
     "DEFAULT_FPS",
-    "VIDEO_SCALE_FACTORS",
     "FlexibleStrategy",
     "FlexibleStrategyConfig",
     "ModelInputs",

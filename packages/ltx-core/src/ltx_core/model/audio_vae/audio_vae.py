@@ -13,6 +13,7 @@ from ltx_core.model.audio_vae.resnet import ResnetBlock
 from ltx_core.model.audio_vae.upsample import build_upsampling_path
 from ltx_core.model.audio_vae.vocoder import Vocoder
 from ltx_core.model.common.normalization import NormType, build_normalization_layer
+from ltx_core.model.disposable import Disposable
 from ltx_core.types import Audio, AudioLatentShape
 
 LATENT_DOWNSAMPLE_FACTOR = 4
@@ -56,7 +57,7 @@ def run_mid_block(mid: torch.nn.Module, features: torch.Tensor) -> torch.Tensor:
     return mid.block_2(features, temb=None)
 
 
-class AudioEncoder(torch.nn.Module):
+class AudioEncoder(torch.nn.Module, Disposable):
     """
     Encoder that compresses audio spectrograms into latent representations.
     The encoder uses a series of downsampling blocks with residual connections,
@@ -273,7 +274,7 @@ def encode_audio(
     return latent
 
 
-class AudioDecoder(torch.nn.Module):
+class AudioDecoder(torch.nn.Module, Disposable):
     """
     Symmetric decoder that reconstructs audio spectrograms from latent features.
     The decoder mirrors the encoder structure with configurable channel multipliers,

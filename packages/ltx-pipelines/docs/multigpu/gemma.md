@@ -14,15 +14,17 @@ lightweight `AccelerateGemmaWrapper` stub that receives the encoded embeddings o
 NCCL. The source rank fuses all prompts into one Gemma call, then broadcasts each
 output.
 
-The first `build()` loads via HuggingFace `from_pretrained` and caches the full
-state dict (including non-persistent buffers) in the registry; later builds recreate
-the model from cache and reinstall the dispatch hooks — no disk I/O.
+The first `build()` loads Gemma via `load_gemma_with_device_map` (directory
+`from_pretrained(device_map="auto")`, or single-file TE with the same balanced
+placement) and caches the full state dict (including non-persistent buffers) in
+the registry; later builds recreate the model from cache and reinstall the
+dispatch hooks — no disk I/O.
 
 ```python
 from ltx_pipelines.multigpu.gemma_builders import AccelerateGemmaBuilder
 
 AccelerateGemmaBuilder(
-    gemma_root_path: str,
+    gemma_root_path: str,                       # HF gemma dir OR split TE .safetensors
     gemma_group: dist.ProcessGroup | None,      # self.groups.gemma_group
     broadcast_group: dist.ProcessGroup | None,  # self.groups.transformer_group
     registry: Registry,
@@ -34,18 +36,44 @@ AccelerateGemmaBuilder(
 
 Usage (in `runner.setup()`):
 
+Shipped runners take a resolved `ModelPaths` and pass
+`model_paths.text_encoder()` as `gemma_root_path` — that is either the monolith
+`--gemma-root` directory or the split `--text-encoder-path` single-file TE. A
+separate enhancer still comes from `--prompt-enhancer-gemma-root` when set (may
+be `None` when enhance shares the encode checkpoint).
+
 ```python
-pipeline.prompt_encoder._text_encoder_builder = AccelerateGemmaBuilder(
-    gemma_root_path=gemma_root,
+from ltx_pipelines.multigpu.gemma_builders import AccelerateGemmaBuilder
+
+pe = pipeline.prompt_encoder
+# Shared enhance aliases the encode builder; capture that before replacing encode.
+separate_enhancer = pe._enhancer_text_encoder_builder is not pe._text_encoder_builder
+pe._text_encoder_builder = AccelerateGemmaBuilder(
+    gemma_root_path=model_paths.text_encoder(),
     gemma_group=self.groups.gemma_group,
     broadcast_group=self.groups.transformer_group,
     registry=registry,
     src_rank=0,
     dtype=pipeline.dtype,
 )
+if separate_enhancer:
+    pe._enhancer_text_encoder_builder = AccelerateGemmaBuilder(
+        gemma_root_path=prompt_enhancer_gemma_root,
+        gemma_group=self.groups.gemma_group,
+        broadcast_group=self.groups.transformer_group,
+        registry=registry,
+        src_rank=0,
+        dtype=pipeline.dtype,
+    )
+else:
+    pe._enhancer_text_encoder_builder = pe._text_encoder_builder
 ```
 
-The shipped runners (`ti2vid_two_stages_mgpu`, `ti2vid_two_stages_hq_mgpu`, `distilled_mgpu`) use this builder.
+When a separate enhancer is configured (`--prompt-enhancer-gemma-root` different
+from the encode root), patch a second `AccelerateGemmaBuilder` onto
+`_enhancer_text_encoder_builder`. Otherwise re-alias it to the encode builder so
+shared enhance stays one residency. Enhance goes through `AccelerateGemmaWrapper`
+(src generate + string broadcast), same as encode.
 
 ## `BatchParallelGemmaBuilder` (replicated — data-parallel over prompts)
 
@@ -60,7 +88,7 @@ concurrently on different GPUs. Non-deterministic prompt enhancement
 from ltx_pipelines.multigpu.bp_gemma_builder import BatchParallelGemmaBuilder
 
 BatchParallelGemmaBuilder(
-    gemma_root_path: str,
+    gemma_root_path: str,  # HF gemma dir OR split TE .safetensors (same as Accelerate path)
     broadcast_group: dist.ProcessGroup | None,
     registry: Registry,
     *,

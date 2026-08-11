@@ -64,12 +64,14 @@ class PerChannelStatistics(nn.Module):
     """
     Per-channel statistics for normalizing and denormalizing the latent representation.
     This statics is computed over the entire dataset and stored in model's checkpoint under VAE state_dict.
+    Defaults are identity (std=1, mean=0) so models constructed without a checkpoint
+    do not inherit allocator garbage / NaNs from ``torch.empty``.
     """
 
     def __init__(self, latent_channels: int = 128):
         super().__init__()
-        self.register_buffer("std-of-means", torch.empty(latent_channels))
-        self.register_buffer("mean-of-means", torch.empty(latent_channels))
+        self.register_buffer("std-of-means", torch.ones(latent_channels))
+        self.register_buffer("mean-of-means", torch.zeros(latent_channels))
 
     def un_normalize(self, x: torch.Tensor) -> torch.Tensor:
         return (x * self.get_buffer("std-of-means").view(1, -1, 1, 1, 1).to(x)) + self.get_buffer("mean-of-means").view(

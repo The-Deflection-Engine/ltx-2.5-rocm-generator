@@ -13,7 +13,7 @@ from dataclasses import dataclass, replace
 import torch
 
 from ltx_core.model.transformer.modality import Modality
-from ltx_core.tiling import Tile, TileCountConfig, create_tiles, identity_mapping_operation, split_by_count
+from ltx_core.tiling import Tile, TileCountConfig, create_tiles, identity_mapping_operation
 from ltx_core.tools import VideoLatentTools
 from ltx_core.types import VideoLatentShape
 
@@ -55,11 +55,7 @@ class VideoModalityTilingHelper:
         self._num_generated_tokens = self._patchifier.get_token_count(self._latent_shape)
         self._tiles = create_tiles(
             torch.Size([self._latent_shape.frames, self._latent_shape.height, self._latent_shape.width]),
-            splitters=[
-                split_by_count(tiling.frames.num_tiles, tiling.frames.overlap),
-                split_by_count(tiling.height.num_tiles, tiling.height.overlap),
-                split_by_count(tiling.width.num_tiles, tiling.width.overlap),
-            ],
+            splitters=list(tiling.to_splitters(video_tools.scale_factors, causal_temporal=False)),
             mappers=[identity_mapping_operation] * 3,
         )
 
@@ -109,6 +105,13 @@ class VideoModalityTilingHelper:
         if modality.attention_mask is not None:
             tile_attention_mask = modality.attention_mask[:, keep_indices, :][:, :, keep_indices]
 
+        # Sliced, not recomputed: the marker must survive `normalize_positions`, which shifts every
+        # tile's generated tokens to start at zero and so destroys the "temporal start == 0" and
+        # "temporal extent == 1" signals the mask could otherwise be derived from.
+        tile_keyframes_mask = None
+        if modality.keyframes_mask is not None:
+            tile_keyframes_mask = modality.keyframes_mask[:, keep_indices]
+
         positions = modality.positions[:, :, keep_indices, :]
         if normalize_positions:
             num_tile_gen = self._tile_generated_token_count(tile)
@@ -122,6 +125,7 @@ class VideoModalityTilingHelper:
             timesteps=modality.timesteps[:, keep_indices],
             positions=positions,
             attention_mask=tile_attention_mask,
+            keyframes_mask=tile_keyframes_mask,
         )
 
         return tiled, TilingContext(

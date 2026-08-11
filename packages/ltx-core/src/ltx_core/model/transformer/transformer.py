@@ -34,6 +34,7 @@ class TransformerConfig:
     context_dim: int
     apply_gated_attention: bool = False
     cross_attention_adaln: bool = False
+    ff_bias: bool = True
 
 
 @dataclass(frozen=True)
@@ -119,7 +120,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 ops=ops.attention_ops,
                 apply_gated_attention=video.apply_gated_attention,
             )
-            self.ff = FeedForward(video.dim, dim_out=video.dim)
+            self.ff = FeedForward(video.dim, dim_out=video.dim, bias=video.ff_bias)
             video_sst_size = adaln_embedding_coefficient(video.cross_attention_adaln)
             self.scale_shift_table = torch.nn.Parameter(torch.empty(video_sst_size, video.dim))
 
@@ -144,7 +145,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 ops=ops.attention_ops,
                 apply_gated_attention=audio.apply_gated_attention,
             )
-            self.audio_ff = FeedForward(audio.dim, dim_out=audio.dim)
+            self.audio_ff = FeedForward(audio.dim, dim_out=audio.dim, bias=audio.ff_bias)
             audio_sst_size = adaln_embedding_coefficient(audio.cross_attention_adaln)
             self.audio_scale_shift_table = torch.nn.Parameter(torch.empty(audio_sst_size, audio.dim))
 
@@ -424,7 +425,7 @@ def apply_cross_attention_adaln(
     q_scale: torch.Tensor,
     q_gate: torch.Tensor,
     prompt_scale_shift_table: torch.Tensor,
-    prompt_timestep: torch.Tensor,
+    prompt_timestep: torch.Tensor | None,
     context_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply query/key AdaLN modulation then cross-attention.
@@ -433,10 +434,14 @@ def apply_cross_attention_adaln(
     repeated here.
     """
     batch_size = x_normed.shape[0]
-    shift_kv, scale_kv = (
-        prompt_scale_shift_table[None, None].to(device=x_normed.device, dtype=x_normed.dtype)
-        + prompt_timestep.reshape(batch_size, prompt_timestep.shape[1], 2, -1)
-    ).unbind(dim=2)
+    # K/V modulation. With the prompt-side AdaLN MLP disabled (use_prompt_adaln_single=False),
+    # prompt_timestep is None and only the static per-block table applies, so K/V are
+    # timestep-independent and cacheable across denoising/AR steps. Otherwise the timestep-
+    # conditioned MLP output is added on top. 
+    kv_modulation = prompt_scale_shift_table[None, None].to(device=x_normed.device, dtype=x_normed.dtype)
+    if prompt_timestep is not None:
+        kv_modulation = kv_modulation + prompt_timestep.reshape(batch_size, prompt_timestep.shape[1], 2, -1)
+    shift_kv, scale_kv = kv_modulation.unbind(dim=2)
     attn_input = x_normed * (1 + q_scale) + q_shift
     encoder_hidden_states = context * (1 + scale_kv) + shift_kv
     return attn(attn_input, context=encoder_hidden_states, mask=context_mask) * q_gate

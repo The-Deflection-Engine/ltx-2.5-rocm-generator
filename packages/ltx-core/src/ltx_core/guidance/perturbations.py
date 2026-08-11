@@ -98,6 +98,16 @@ class BatchedPerturbationConfig:
         obj._block_masks_cpu = block_masks_cpu
         return obj
 
+    @property
+    def block_masks(self) -> torch.Tensor:
+        """Keep-mask on the compute device (1 = keep, 0 = perturbed), indexed [type, block, sample]."""
+        return self._block_masks
+
+    @property
+    def block_masks_cpu(self) -> torch.Tensor | None:
+        """Host mirror of the keep-mask, or None for compiled-only configs (see ``from_masks``)."""
+        return self._block_masks_cpu
+
     def batch_slice(self, start: int, end: int) -> "BatchedPerturbationConfig":
         """A view over samples ``[start:end]`` of the batch, by slicing the mask tensors.
         Slicing (never rebuilding) keeps the host mask build outside any compiled / capture region.

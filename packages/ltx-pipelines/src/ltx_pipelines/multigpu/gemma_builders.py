@@ -4,31 +4,64 @@ Replaces the text encoder builder on the ``PromptEncoder`` block with an
 source rank and a broadcast stub elsewhere.
 On the source rank the first ``build()`` loads via HuggingFace
 ``from_pretrained`` and caches the full state dict (including non-persistent
-buffers) in the provided :class:`Registry`.  Subsequent calls recreate the
-model from cache and reinstall accelerate dispatch hooks — no disk I/O.
+buffers) in the provided :class:`Registry`. Model shells are reused from the
+registry when the structural key matches: weights are reassigned from the SD,
+while non-persistent buffers are left on the shell (``dispose`` does not meta
+them). A weights-only hit (no shell) rebuilds a meta model from the cached SD,
+assigns both persistent and non-persistent tensors, then reinstalls accelerate
+dispatch hooks. The outer wrapper is not cached.
 """
 
 from __future__ import annotations
 
 import copy
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
 from accelerate import dispatch_model
-from transformers import Gemma3ForConditionalGeneration
+from transformers import AutoModelForImageTextToText
 
 from ltx_core.loader.primitives import BuilderProtocol, StateDict
-from ltx_core.loader.registry import Registry
+from ltx_core.loader.registry import Registry, module_registry_key
 from ltx_core.multigpu.gemma.accelerate_wrapper import AccelerateGemmaWrapper
 from ltx_core.multigpu.gemma.loader import load_gemma_with_device_map
-from ltx_core.text_encoders.gemma.encoders.base_encoder import GemmaTextEncoder
+from ltx_core.text_encoders.gemma import gemma_model_config
+from ltx_core.text_encoders.gemma.encoders.base_encoder import LTXGemmaTextEncoder
 
 if TYPE_CHECKING:
     from typing_extensions import Self
 
 logger = logging.getLogger(__name__)
+
+
+def _assign_non_persistent(model: torch.nn.Module, non_persistent_sd: dict[str, torch.Tensor]) -> None:
+    for name, tensor in non_persistent_sd.items():
+        parent_path, attr = name.rsplit(".", 1)
+        module = model
+        for part in parent_path.split("."):
+            module = getattr(module, part)
+        setattr(module, attr, tensor)
+
+
+def _split_persistent(
+    model: torch.nn.Module, sd: dict[str, torch.Tensor]
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    expected_keys = set(model.state_dict().keys())
+    persistent = {k: v for k, v in sd.items() if k in expected_keys}
+    non_persistent = {k: v for k, v in sd.items() if k not in expected_keys}
+    return persistent, non_persistent
+
+
+def _state_dict_with_non_persistent(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """``state_dict()`` plus non-persistent buffers (needed for weights-only rebuild)."""
+    sd = model.state_dict()
+    for name, buf in model.named_buffers():
+        if name not in sd:
+            sd[name] = buf
+    return sd
 
 
 class AccelerateGemmaBuilder(BuilderProtocol):
@@ -70,8 +103,19 @@ class AccelerateGemmaBuilder(BuilderProtocol):
         clone._registry = registry
         return clone
 
+    def model_metadata(self) -> dict:
+        """Full metadata with a ``config`` sub-dict (same shape as safetensors loaders)."""
+        return {"config": gemma_model_config(self._gemma_root_path)}
+
     def model_config(self) -> dict:
-        return {}
+        return self.model_metadata().get("config", {})
+
+    def _module_registry_key(self) -> str:
+        return module_registry_key(
+            configurator=AccelerateGemmaBuilder,
+            config={"accelerate_gemma": str(Path(self._gemma_root_path).resolve())},
+            module_ops_names=(),
+        )
 
     def build(
         self,
@@ -91,58 +135,63 @@ class AccelerateGemmaBuilder(BuilderProtocol):
             device=device,
         )
 
-    # -- src-rank helpers ---------------------------------------------------
+    def _build_encoder(self, dtype: torch.dtype) -> LTXGemmaTextEncoder:
+        struct = self._module_registry_key()
+        cached_sd = self._registry.get([self._gemma_root_path], None)
+        cached_model = self._registry.get_model(struct)
 
-    def _build_encoder(self, dtype: torch.dtype) -> GemmaTextEncoder:
-        cached = self._registry.get([self._gemma_root_path], None)
-        if cached is not None:
+        if cached_model is not None:
+            if cached_sd is None:
+                raise RuntimeError(
+                    "Gemma state dict missing from registry but cached encoder is set; "
+                    "registry must outlive the builder."
+                )
+            encoder = cached_model  # type: ignore[assignment]
+            encoder.model.load_state_dict(cached_sd.sd, strict=False, assign=True)
+            encoder.dtype = dtype
+            return encoder
+
+        if cached_sd is not None:
+            if self._config is None or self._hf_device_map is None:
+                raise RuntimeError(
+                    "Gemma state dict is in the registry but this builder has no HF config/"
+                    "device_map/tokenizer/processor. Rebuild requires a builder that previously "
+                    "loaded from disk, or use cache_models=True so the encoder shell is reused."
+                )
             logger.info("Rebuilding Gemma from cached state dict (no disk I/O).")
-            return self._rebuild_from_cache(cached, dtype)
+            encoder = self._rebuild_from_cache(cached_sd, dtype)
+        else:
+            encoder = load_gemma_with_device_map(self._gemma_root_path, dtype)
 
-        encoder = load_gemma_with_device_map(self._gemma_root_path, dtype)
+            self._config = encoder.model.config
+            self._hf_device_map = encoder.model.hf_device_map
+            self._tokenizer = encoder.tokenizer
+            self._processor = encoder.processor
 
-        # Cache non-tensor objects on the builder instance.
-        self._config = encoder.model.config
-        self._hf_device_map = encoder.model.hf_device_map
-        self._tokenizer = encoder.tokenizer
-        self._processor = encoder.processor
+            # Include non-persistent buffers so weights-only rebuild can restore them
+            # onto a fresh meta model (there is no shell to keep them on).
+            sd = _state_dict_with_non_persistent(encoder.model)
+            total_size = sum(t.nelement() * t.element_size() for t in sd.values())
+            dtypes = {t.dtype for t in sd.values()}
+            self._registry.add(
+                [self._gemma_root_path],
+                None,
+                StateDict(sd=sd, device=torch.device("meta"), size=total_size, dtype=dtypes),
+            )
+            logger.info("Cached Gemma state dict in registry (%d entries).", len(sd))
 
-        # Cache full state dict including non-persistent buffers.
-        sd = encoder.model.state_dict()
-        for name, buf in encoder.model.named_buffers():
-            if name not in sd:
-                sd[name] = buf
-        total_size = sum(t.nelement() * t.element_size() for t in sd.values())
-        dtypes = {t.dtype for t in sd.values()}
-        self._registry.add(
-            [self._gemma_root_path],
-            None,
-            StateDict(sd=sd, device=torch.device("meta"), size=total_size, dtype=dtypes),
-        )
-        logger.info("Cached Gemma state dict in registry (%d entries).", len(sd))
+        return self._registry.add_model(struct, encoder)  # type: ignore[return-value]
 
-        return encoder
-
-    def _rebuild_from_cache(self, cached: StateDict, dtype: torch.dtype) -> GemmaTextEncoder:
+    def _rebuild_from_cache(self, cached: StateDict, dtype: torch.dtype) -> LTXGemmaTextEncoder:
         with torch.device("meta"):
-            model = Gemma3ForConditionalGeneration(self._config)
+            model = AutoModelForImageTextToText.from_config(self._config)
 
-        # Split into persistent (load_state_dict) and non-persistent (manual assign).
-        expected_keys = set(model.state_dict().keys())
-        persistent_sd = {k: v for k, v in cached.sd.items() if k in expected_keys}
-        non_persistent_sd = {k: v for k, v in cached.sd.items() if k not in expected_keys}
-
+        persistent_sd, non_persistent_sd = _split_persistent(model, cached.sd)
         model.load_state_dict(persistent_sd, strict=True, assign=True)
-        for name, tensor in non_persistent_sd.items():
-            parent_path, attr = name.rsplit(".", 1)
-            module = model
-            for part in parent_path.split("."):
-                module = getattr(module, part)
-            setattr(module, attr, tensor)
-
+        _assign_non_persistent(model, non_persistent_sd)
         dispatch_model(model, self._hf_device_map)
 
-        return GemmaTextEncoder(
+        return LTXGemmaTextEncoder(
             model=model,
             tokenizer=self._tokenizer,
             processor=self._processor,

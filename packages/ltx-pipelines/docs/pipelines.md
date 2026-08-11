@@ -6,7 +6,7 @@ Full reference for each pipeline. See the [Pipeline Selection Guide](pipeline-se
 
 ## 1. TI2VidTwoStagesPipeline
 
-**Best for:** High-quality text/image-to-video generation with upsampling. **Recommended for production use.**
+**Best for:** High-quality text/image-to-video generation with upsampling.
 
 **Source**: [`src/ltx_pipelines/ti2vid_two_stages.py`](../src/ltx_pipelines/ti2vid_two_stages.py)
 
@@ -44,7 +44,7 @@ Single-stage generation (no upsampling) with [multimodal guidance](multimodal-gu
 
 ## 4. DistilledPipeline
 
-**Best for:** Fastest inference with good quality using a distilled model with predefined sigma schedule.
+**Best for:** Fastest inference with good quality using a distilled model with predefined sigma schedule. **Recommended default.**
 
 **Source**: [`src/ltx_pipelines/distilled.py`](../src/ltx_pipelines/distilled.py)
 
@@ -116,7 +116,9 @@ Single-stage generation that encodes the source video and audio into latents, ap
 
 **Source**: [`src/ltx_pipelines/hdr_ic_lora.py`](../src/ltx_pipelines/hdr_ic_lora.py)
 
-Two-stage video-to-video on the distilled model with an HDR IC-LoRA. Decoded latents pass through an HDR inverse transform (ARRI LogC3, auto-detected from LoRA metadata) to produce a **linear HDR float** tensor `[f, h, w, c]`. Video-only (audio skipped). Text embeddings are pre-computed externally and loaded from a `.safetensors` file. Tonemapping and EXR saving are the caller's responsibility. LoRA and embeddings: [`Lightricks/LTX-2.3-22b-IC-LoRA-HDR`](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-HDR).
+Two-stage video-to-video on the distilled model with an HDR IC-LoRA. Decoded latents pass through an HDR inverse transform (ARRI LogC3) to produce a **linear HDR float** tensor `[f, h, w, c]`. Video-only (audio skipped). Text embeddings are pre-computed externally and loaded from a `.safetensors` file. Tonemapping and EXR saving are the caller's responsibility. LoRA and embeddings: [`Lightricks/LTX-2.3-22b-IC-LoRA-HDR`](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-HDR).
+
+This path is separate from native EXR/`--hdr` support on the other pipelines (see [HDR Support](hdr.md)). Prefer `--hdr` + distilled / retake / TI2V when you already have EXR plates and want first-class EXR+HLG I/O without an HDR IC-LoRA.
 
 **Extra CLI arguments:** `--input` (mp4 or directory, required), `--output-dir` (required), `--hdr-lora` (required), `--text-embeddings` (pre-computed `.safetensors`, required), `--num-frames`, `--spatial-tile` (tiled VAE decode tile size; reduce on lower-VRAM GPUs), `--skip-mp4` (EXR only, no H.264 preview), `--exr-half` (float16 EXR), `--high-quality` (generates 2x frames internally for smoother output, ~2x slower), `--offload {none,cpu,disk}` (weight offloading; disables FP8 quantization when not `none`).
 
@@ -149,3 +151,33 @@ Single-stage, **audio-only** generation: the video branch is absent (`video=None
 **Extra CLI arguments (all optional, with sensible defaults):** `--num-frames`, `--frame-rate`, `--negative-prompt`, `--audio-cfg-guidance-scale`, `--audio-stg-guidance-scale`, `--audio-stg-blocks`, `--audio-rescale-scale`, `--audio-skip-step`. No `--height/--width/--image` (audio has no spatial dimensions).
 
 **Use when:** You need speech/audio from text alone, or to evaluate an audio-only LoRA (accent, voice style) without generating video.
+
+---
+
+## 12. DFRPipeline
+
+**Best for:** Maximum detail fidelity — generating at half resolution with extra generated keyframes, then re-rendering at full resolution with a spatial detailing LoRA, optionally densifying time by 2x or 4x.
+
+**Source**: [`src/ltx_pipelines/dfr_pipeline.py`](../src/ltx_pipelines/dfr_pipeline.py)
+
+Diffusion Fidelity Rendering runs the distilled sigma schedule on a full checkpoint with a distilled LoRA. Stage 1 generates video **and [generated keyframe slots](conditioning.md#generated-keyframe-slots)** at half resolution, placing slots on an 8-frame-border segment grid; the half-resolution result is kept as a reference while video and keyframes are upsampled in latent space. Stage 2 re-denoises at full resolution with the distilled LoRA plus an optional 2x spatial detailing IC-LoRA, conditioned on the stage-1 reference.
+
+Audio comes from **stage 1**. Stage 2 still runs an audio pass, because the video branch needs the cross-modal attention, but nothing refines audio after stage 1.
+
+**Temporal refinement (optional).** `--temporal-upsample-rounds {0,1,2}` adds rounds that each double the frame rate: the canvas is upsampled temporally, split into `2**round` tiles that meet at shared keyframes, given fresh mid-segment slots, and densified with ancestral Euler. Whatever padding the canvas needs internally, you always get `(num_frames - 1) * 2**rounds + 1` frames back.
+
+**Extra CLI arguments:** `--detailing-lora PATH [STRENGTH]` (optional, off by default), `--temporal-upsampler-path` (required when rounds > 0), `--temporal-upsample-rounds {0,1,2}`. Unlike the other keyframe-capable pipelines, DFR does **not** take `--num-generated-keyframes` — it derives slot positions from its own segment grid.
+
+```bash
+uv run python -m ltx_pipelines.dfr_pipeline \
+    --checkpoint-path         models/ltx-2.5/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors \
+    --distilled-lora          models/ltx-2.5/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors \
+    --spatial-upsampler-path  models/ltx-2.5/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
+    --temporal-upsampler-path models/ltx-2.5/latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors \
+    --temporal-upsample-rounds 1 \
+    --num-frames 121 --output-path output.mp4 --prompt "..."
+```
+
+**Note:** Requires a checkpoint that supports generated keyframe slots (LTX-2.5 and later) and a distilled LoRA.
+
+**Use when:** Detail fidelity matters more than wall-clock time, or you want a higher effective frame rate than the base model produces.

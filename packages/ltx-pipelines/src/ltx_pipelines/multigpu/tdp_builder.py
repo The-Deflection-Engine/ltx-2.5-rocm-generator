@@ -50,6 +50,11 @@ class TiledDataParallelBuilder(DelegatingBuilder[InnerModelT], Generic[InnerMode
         self._tiling = tiling
         self._normalize_positions = normalize_positions
 
+    @property
+    def keeps_gpu_resident_weights(self) -> bool:
+        # Weight tracker keeps registry tensors GPU-resident and rebinds them across builds.
+        return True
+
     def build(
         self,
         device: torch.device | None = None,

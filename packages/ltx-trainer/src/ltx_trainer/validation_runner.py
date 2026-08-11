@@ -9,7 +9,7 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 import torch
 from einops import rearrange
@@ -19,23 +19,33 @@ from torchvision.transforms import functional as TF  # noqa: N812
 from torchvision.transforms.functional import to_tensor
 
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
-from ltx_core.components.guiders import CFGGuider, STGGuider
+from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
 from ltx_core.components.schedulers import LTX2Scheduler
+from ltx_core.conditioning.mask_utils import extend_keyframes_mask
 from ltx_core.conditioning.types.latent_cond import VideoConditionByLatentIndex
 from ltx_core.conditioning.types.mask_cond import VideoConditionByMask
 from ltx_core.conditioning.types.reference_video_cond import VideoConditionByReferenceLatent
+from ltx_core.devices import cuda_activation_budget_bytes
 from ltx_core.guidance.perturbations import (
     BatchedPerturbationConfig,
     Perturbation,
     PerturbationConfig,
     PerturbationType,
 )
+from ltx_core.loader import SafetensorsModelStateDictLoader
 from ltx_core.model.audio_vae.audio_vae import encode_audio as ltx_encode_audio
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.model import X0Model
-from ltx_core.model.video_vae import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
+from ltx_core.model.video_vae import DimensionSizeConfig, TileSizeConfig
+from ltx_core.model.video_vae.diffusion_tiling import recommended_decode_tiling_config
+from ltx_core.model.video_vae.diffusion_video_decoder import DiffusionVideoDecoder
+from ltx_core.model.video_vae.model_configurator import (
+    diffvae_tiling_geometry_from_vae_config,
+    estimate_diffusion_decoder_weight_bytes,
+)
+from ltx_core.model.video_vae.transformer.config import DiffVAEMode
 from ltx_core.tools import AudioLatentTools, VideoLatentTools
 from ltx_core.types import (
     Audio,
@@ -49,6 +59,7 @@ from ltx_trainer import logger
 from ltx_trainer.config import ValidationConfig, ValidationSample
 from ltx_trainer.gpu_utils import free_gpu_memory_context
 from ltx_trainer.model_loader import (
+    embedding_weight_paths,
     load_audio_vae_decoder,
     load_audio_vae_encoder,
     load_embeddings_processor,
@@ -56,6 +67,9 @@ from ltx_trainer.model_loader import (
     load_video_vae_decoder,
     load_video_vae_encoder,
     load_vocoder,
+    read_video_scale_factors,
+    resolve_audio_vae_path,
+    resolve_video_vae_path,
 )
 from ltx_trainer.progress import SamplingContext, TrainingProgress
 from ltx_trainer.utils import open_image_as_srgb, save_image
@@ -64,10 +78,13 @@ from ltx_trainer.video_utils import read_video, save_video
 if TYPE_CHECKING:
     from ltx_core.model.transformer import LTXModel
 
-VIDEO_SCALE_FACTORS = SpatioTemporalScaleFactors.default()
-_DEFAULT_TILING = TilingConfig(
-    spatial_config=SpatialTilingConfig(tile_size_in_pixels=192, tile_overlap_in_pixels=64),
-    temporal_config=TemporalTilingConfig(tile_size_in_frames=48, tile_overlap_in_frames=24),
+# Convolutional decoder only; the diffusion decoder recommends its own layout (see
+# ``ValidationRunner._decode_tiling_config``). These overlaps sit below the decoder's recommended
+# receptive-field halo, so tile edges can diverge slightly from an untiled decode.
+_DEFAULT_TILING = TileSizeConfig(
+    height=DimensionSizeConfig(tile_size=384, overlap=192),
+    width=DimensionSizeConfig(tile_size=384, overlap=192),
+    frames=DimensionSizeConfig(tile_size=48, overlap=24),
 )
 
 
@@ -135,10 +152,23 @@ class ValidationRunner:
         config: ValidationConfig,
         model_path: str | Path,
         text_encoder_path: str | Path | None,
+        video_vae_path: str | Path | None = None,
+        audio_vae_path: str | Path | None = None,
         load_text_encoder_in_8bit: bool = False,
     ):
         self._config = config
         self._model_path = Path(model_path)
+        self._video_vae_path = Path(resolve_video_vae_path(self._model_path, video_vae_path))
+        # Resolved on demand: a video-only validation never touches the audio VAE, and on a
+        # split pack resolving it eagerly would demand an audio_vae_path that is never used.
+        self._audio_vae_path_override = audio_vae_path
+        # Video VAE compression factors, derived from the checkpoint's embedded VAE config
+        # (defaults to 32x32x8 when absent), used for frame/resolution snapping and the
+        # latent/pixel coordinate math below.
+        self._video_scale_factors = read_video_scale_factors(self._video_vae_path)
+        # The config-level dim validators are VAE-agnostic (they can't know the compression
+        # factors), so the geometry is checked here, once the factors are known.
+        self._validate_sample_geometry()
 
         self._video_patchifier = VideoLatentPatchifier(patch_size=1)
         self._audio_patchifier = AudioPatchifier(patch_size=1)
@@ -146,6 +176,47 @@ class ValidationRunner:
         self._cached_embeddings = self._cache_prompt_embeddings(text_encoder_path, load_text_encoder_in_8bit)
         self._cached_media = self._encode_conditioning_media()
         self._load_decoder_components()
+
+    def _audio_vae_path(self) -> str:
+        """Resolve the file holding the audio VAE and vocoder, at the point one is needed."""
+        return resolve_audio_vae_path(self._model_path, self._audio_vae_path_override)
+
+    def _validate_sample_geometry(self) -> None:
+        """Assert every validation sample's geometry is compatible with the VAE compression.
+        This replaces the config-level dim validators, which run before the checkpoint (and
+        therefore its scale factors) is known and so had to assume the default 32x32x8 layout.
+        Width/height must be divisible by the spatial factors and frame counts must be
+        VAE-aligned; otherwise the generated geometry would be silently cropped to fit.
+        """
+        sf = self._video_scale_factors
+        for i, sample in enumerate(self._config.samples):
+            width, height, frames = sample.video_dims or self._config.video_dims
+            if width % sf.width != 0 or height % sf.height != 0:
+                raise ValueError(
+                    f"Validation sample {i}: dimensions {width}x{height} must be divisible by the VAE "
+                    f"spatial factors ({sf.width}x{sf.height})."
+                )
+            if (frames - 1) % sf.time != 0:
+                raise ValueError(
+                    f"Validation sample {i}: frames ({frames}) must satisfy (frames - 1) % {sf.time} == 0 "
+                    "for the VAE temporal factor."
+                )
+            for cond in sample.conditions:
+                if getattr(cond, "video", None) is None:
+                    continue  # audio prefix/suffix use duration, not num_frames
+                num_frames = getattr(cond, "num_frames", None)
+                if num_frames is None:
+                    continue
+                if cond.type == "prefix" and (num_frames - 1) % sf.time != 0:
+                    raise ValueError(
+                        f"Validation sample {i}: prefix num_frames ({num_frames}) must satisfy "
+                        f"(num_frames - 1) % {sf.time} == 0 for the VAE temporal factor."
+                    )
+                if cond.type == "suffix" and num_frames % sf.time != 0:
+                    raise ValueError(
+                        f"Validation sample {i}: suffix num_frames ({num_frames}) must satisfy "
+                        f"num_frames % {sf.time} == 0 for the VAE temporal factor."
+                    )
 
     # ------------------------------------------------------------------
     # Public API
@@ -266,7 +337,10 @@ class ValidationRunner:
 
         logger.debug("Loading embeddings processor for validation embedding caching...")
         embeddings_processor = load_embeddings_processor(
-            checkpoint_path=self._model_path, device=init_device, dtype=torch.bfloat16
+            checkpoint_path=embedding_weight_paths(self._model_path, text_encoder_path),
+            gemma_model_path=text_encoder_path,
+            device=init_device,
+            dtype=torch.bfloat16,
         )
 
         logger.info(f"Pre-computing embeddings for {len(prompts)} validation prompts...")
@@ -325,10 +399,10 @@ class ValidationRunner:
 
         if needs_video_encoder:
             logger.debug("Loading VAE encoder for validation media encoding...")
-            vae_encoder = load_video_vae_encoder(self._model_path, device="cpu", dtype=torch.bfloat16)
+            vae_encoder = load_video_vae_encoder(self._video_vae_path, device="cpu", dtype=torch.bfloat16)
         if needs_audio_encoder:
             logger.debug("Loading audio VAE encoder for validation media encoding...")
-            audio_encoder = load_audio_vae_encoder(self._model_path, device="cpu", dtype=torch.bfloat16)
+            audio_encoder = load_audio_vae_encoder(self._audio_vae_path(), device="cpu", dtype=torch.bfloat16)
 
         logger.info(f"Pre-encoding conditioning media for {len(samples)} validation samples...")
         cached: list[CachedSampleMedia] = []
@@ -362,7 +436,12 @@ class ValidationRunner:
             elif cond.type == "reference" and cond.video is not None:
                 ref_video, _ = read_video(cond.video, max_frames=s_num_frames)
                 preprocessed, pixels = self._preprocess_reference(
-                    ref_video, s_height, s_width, cond.downscale_factor, cond.temporal_scale_factor
+                    ref_video,
+                    s_height,
+                    s_width,
+                    self._video_scale_factors,
+                    cond.downscale_factor,
+                    cond.temporal_scale_factor,
                 )
                 latent = self._encode_video(preprocessed, vae_encoder, device)
                 sample_media.conditions[cond_idx] = CachedConditionMedia(
@@ -403,14 +482,25 @@ class ValidationRunner:
     def _load_decoder_components(self) -> None:
         """Load VAE decoder, audio decoder, and vocoder. Kept on CPU until generation."""
         self._vae_decoder = None
+        # Resolved once here rather than per decode, since it comes from the checkpoint header.
+        # None marks a convolutional decoder, which uses the static _DEFAULT_TILING instead.
+        self._diffvae_tiling_kwargs: dict | None = None
         needs_video_decoder = self._config.generate_video or any(
             c.type == "video_to_audio" for s in self._config.samples for c in s.conditions
         )
         if needs_video_decoder:
             logger.debug("Loading video VAE decoder for validation...")
-            self._vae_decoder = load_video_vae_decoder(self._model_path, device="cpu", dtype=torch.bfloat16)
+            self._vae_decoder = load_video_vae_decoder(self._video_vae_path, device="cpu", dtype=torch.bfloat16)
             if self._vae_decoder is not None:
                 self._vae_decoder.requires_grad_(False)
+            # Keyed off the built decoder rather than the checkpoint, so this stays quiet for
+            # the convolutional decoder and for tests that supply a stand-in.
+            if isinstance(self._vae_decoder, DiffusionVideoDecoder):
+                metadata = SafetensorsModelStateDictLoader().metadata(str(self._video_vae_path))
+                self._diffvae_tiling_kwargs = {
+                    **diffvae_tiling_geometry_from_vae_config(metadata.get("config", {}).get("vae", {})),
+                    "model_bytes": estimate_diffusion_decoder_weight_bytes(str(self._video_vae_path)),
+                }
 
         self._audio_decoder = None
         self._vocoder = None
@@ -419,10 +509,11 @@ class ValidationRunner:
         )
         if needs_audio_decoder:
             logger.debug("Loading audio decoder and vocoder for validation...")
-            self._audio_decoder = load_audio_vae_decoder(self._model_path, device="cpu", dtype=torch.bfloat16)
+            audio_vae_path = self._audio_vae_path()
+            self._audio_decoder = load_audio_vae_decoder(audio_vae_path, device="cpu", dtype=torch.bfloat16)
             if self._audio_decoder is not None:
                 self._audio_decoder.requires_grad_(False)
-            self._vocoder = load_vocoder(self._model_path, device="cpu", dtype=torch.bfloat16)
+            self._vocoder = load_vocoder(audio_vae_path, device="cpu", dtype=torch.bfloat16)
             if self._vocoder is not None:
                 self._vocoder.requires_grad_(False)
 
@@ -458,22 +549,23 @@ class ValidationRunner:
         video = self._resize_and_center_crop(video, target_height, target_width)
         requested_frames = getattr(cond, "num_frames", None)
 
+        temporal_factor = self._video_scale_factors.time
         if cond.type == "suffix" and requested_frames is not None:
             # The VAE encoder has temporal receptive fields, so encoding a short
             # suffix clip independently produces different latents than encoding the
             # full video. Encode the full clip and extract the last N latent frames.
             video = rearrange(video, "f c h w -> 1 c f h w")
-            valid_frames = (video.shape[2] - 1) // 8 * 8 + 1
+            valid_frames = (video.shape[2] - 1) // temporal_factor * temporal_factor + 1
             video = video[:, :, :valid_frames]
             latent = self._encode_video(video * 2.0 - 1.0, vae_encoder, device)
-            num_suffix_latent_frames = requested_frames // 8
+            num_suffix_latent_frames = requested_frames // temporal_factor
             return latent[:, :, -num_suffix_latent_frames:]
 
         if requested_frames is not None:
             requested_frames = min(requested_frames, video.shape[0])
             video = video[:requested_frames]
         video = rearrange(video, "f c h w -> 1 c f h w")
-        valid_frames = (video.shape[2] - 1) // 8 * 8 + 1
+        valid_frames = (video.shape[2] - 1) // temporal_factor * temporal_factor + 1
         video = video[:, :, :valid_frames]
         return self._encode_video(video * 2.0 - 1.0, vae_encoder, device)
 
@@ -520,7 +612,11 @@ class ValidationRunner:
                 video_state = video_tools.create_initial_state(
                     device=device, dtype=torch.bfloat16, initial_latent=frozen_media.latent.to(device)
                 )
-                video_state = replace(video_state, denoise_mask=torch.zeros_like(video_state.denoise_mask))
+                video_state = replace(
+                    video_state,
+                    denoise_mask=torch.zeros_like(video_state.denoise_mask),
+                    frozen=True,
+                )
                 video_clean = video_state
             else:
                 video_state = video_tools.create_initial_state(device=device, dtype=torch.bfloat16)
@@ -544,7 +640,11 @@ class ValidationRunner:
                 audio_state = audio_tools.create_initial_state(
                     device=device, dtype=torch.bfloat16, initial_latent=frozen_latent
                 )
-                audio_state = replace(audio_state, denoise_mask=torch.zeros_like(audio_state.denoise_mask))
+                audio_state = replace(
+                    audio_state,
+                    denoise_mask=torch.zeros_like(audio_state.denoise_mask),
+                    frozen=True,
+                )
                 audio_clean = audio_state
             else:
                 audio_tools = self._create_audio_tools(num_frames, self._config.frame_rate)
@@ -624,7 +724,7 @@ class ValidationRunner:
                 state = VideoConditionByMask(latent=latent, mask=mask, strength=1.0).apply_to(state, tools)
 
             elif cond.type == "spatial_crop":
-                mask = _build_spatial_crop_mask(cond.spatial_region, tools.target_shape, device)
+                mask = _build_spatial_crop_mask(cond.spatial_region, tools.target_shape, device, tools.scale_factors)
                 state = VideoConditionByMask(latent=latent, mask=mask, strength=1.0).apply_to(state, tools)
 
         return state
@@ -678,6 +778,9 @@ class ValidationRunner:
                     positions=torch.cat([state.positions, positions], dim=2),
                     clean_latent=torch.cat([state.clean_latent, tokens], dim=1),
                     attention_mask=None,
+                    # Appended reference tokens are not keyframes; extending rather than dropping
+                    # keeps the per-token marker aligned with the sequence for keyframe checkpoints.
+                    keyframes_mask=extend_keyframes_mask(state, tokens.shape[1], marked=False),
                 )
 
             elif cond.type == "mask" and getattr(cond, "audio", None) is not None:
@@ -703,6 +806,7 @@ class ValidationRunner:
                     positions=state.positions,
                     clean_latent=state.clean_latent * inv + tokens * m,
                     attention_mask=state.attention_mask,
+                    keyframes_mask=state.keyframes_mask,
                 )
 
         return state
@@ -770,16 +874,23 @@ class ValidationRunner:
         scheduler = LTX2Scheduler()
         sigmas = scheduler.execute(steps=cfg.inference_steps).to(device).float()
         stepper = EulerDiffusionStep()
-        cfg_guider = CFGGuider(cfg.guidance_scale)
-        stg_guider = STGGuider(cfg.stg_scale)
-
-        stg_perturbation_config = (
-            self._build_stg_perturbation_config(
-                cfg.stg_blocks, cfg.stg_mode, transformer.num_blocks, device, next(transformer.parameters()).dtype
+        video_present = video_state is not None
+        audio_present = audio_state is not None
+        video_guider = MultiModalGuider(
+            self._resolve_video_guider_params(
+                cfg,
+                video_frozen=video_frozen,
+                audio_present=audio_present,
             )
-            if stg_guider.enabled()
-            else None
         )
+        audio_guider = MultiModalGuider(
+            self._resolve_audio_guider_params(
+                cfg,
+                audio_frozen=audio_frozen,
+                video_present=video_present,
+            )
+        )
+        transformer_dtype = next(transformer.parameters()).dtype
 
         x0_model = X0Model(transformer)
 
@@ -799,26 +910,46 @@ class ValidationRunner:
             )
 
             pos_video, pos_audio = x0_model(video=video, audio=audio, perturbations=None)
-            denoised_video, denoised_audio = pos_video, pos_audio
+            neg_video, neg_audio = 0.0, 0.0
+            ptb_video, ptb_audio = 0.0, 0.0
+            mod_video, mod_audio = 0.0, 0.0
 
             # CFG
-            if cfg_guider.enabled() and v_ctx_neg is not None:
-                video_neg = replace(video, context=v_ctx_neg) if video is not None else None
-                audio_neg = replace(audio, context=a_ctx_neg) if audio is not None else None
+            video_needs_neg = video is not None and video_guider.do_unconditional_generation()
+            audio_needs_neg = audio is not None and audio_guider.do_unconditional_generation()
+            if video_needs_neg or audio_needs_neg:
+                video_neg_ctx = v_ctx_neg if video_needs_neg and v_ctx_neg is not None else v_ctx_pos
+                audio_neg_ctx = a_ctx_neg if audio_needs_neg and a_ctx_neg is not None else a_ctx_pos
+                video_neg = replace(video, context=video_neg_ctx) if video is not None else None
+                audio_neg = replace(audio, context=audio_neg_ctx) if audio is not None else None
                 neg_video, neg_audio = x0_model(video=video_neg, audio=audio_neg, perturbations=None)
 
-                if not video_frozen and denoised_video is not None:
-                    denoised_video = denoised_video + cfg_guider.delta(pos_video, neg_video)
-                if not audio_frozen and denoised_audio is not None:
-                    denoised_audio = denoised_audio + cfg_guider.delta(pos_audio, neg_audio)
-
             # STG
+            stg_perturbation_config = self._build_stg_perturbation_config(
+                video_enabled=video is not None and video_guider.do_perturbed_generation(),
+                audio_enabled=audio is not None and audio_guider.do_perturbed_generation(),
+                stg_blocks=cfg.stg_blocks,
+                num_blocks=transformer.num_blocks,
+                device=device,
+                dtype=transformer_dtype,
+            )
             if stg_perturbation_config is not None:
                 ptb_video, ptb_audio = x0_model(video=video, audio=audio, perturbations=stg_perturbation_config)
-                if not video_frozen and denoised_video is not None:
-                    denoised_video = denoised_video + stg_guider.delta(pos_video, ptb_video)
-                if not audio_frozen and denoised_audio is not None and ptb_audio is not None:
-                    denoised_audio = denoised_audio + stg_guider.delta(pos_audio, ptb_audio)
+
+            # Modality guidance
+            if (video is not None and video_guider.do_isolated_modality_generation()) or (
+                audio is not None and audio_guider.do_isolated_modality_generation()
+            ):
+                mod_perturbation_config = self._build_modality_perturbation_config(
+                    transformer.num_blocks, device, transformer_dtype
+                )
+                mod_video, mod_audio = x0_model(video=video, audio=audio, perturbations=mod_perturbation_config)
+
+            denoised_video, denoised_audio = pos_video, pos_audio
+            if not video_frozen and pos_video is not None:
+                denoised_video = video_guider.calculate(pos_video, neg_video, ptb_video, mod_video)
+            if not audio_frozen and pos_audio is not None:
+                denoised_audio = audio_guider.calculate(pos_audio, neg_audio, ptb_audio, mod_audio)
 
             # Re-apply conditioning mask
             if denoised_video is not None and video_clean is not None:
@@ -871,12 +1002,35 @@ class ValidationRunner:
         self._vae_decoder.to(device)
         latent = video_state.latent.to(dtype=torch.bfloat16)
 
-        chunks = list(self._vae_decoder.tiled_decode(latent, tiling_config=_DEFAULT_TILING))
+        tiling_config = self._decode_tiling_config(latent, device)
+        chunks = list(self._vae_decoder.tiled_decode(latent, tiling_config=tiling_config))
         decoded_video = torch.cat(chunks, dim=2)
 
         decoded_video = ((decoded_video + 1.0) / 2.0).clamp(0.0, 1.0)
         self._vae_decoder.to("cpu")
         return decoded_video[0].float().cpu()
+
+    def _decode_tiling_config(self, latent: Tensor, device: torch.device) -> TileSizeConfig:
+        """Pick the tile layout for decoding ``latent``; the decoder family decides how.
+        The diffusion decoder derives its overlaps from its stage-4/5 receptive fields and sizes
+        tiles against free VRAM, and it *rejects* any config whose overlaps fall below that halo.
+        ``_DEFAULT_TILING``'s do, so it only applies to the convolutional decoder. This mirrors
+        what the inference pipelines do, so validation decodes the way inference will.
+        """
+        if self._diffvae_tiling_kwargs is None:
+            return _DEFAULT_TILING
+
+        scale = self._video_scale_factors
+        _, _, latent_frames, latent_height, latent_width = latent.shape
+        return recommended_decode_tiling_config(
+            **self._diffvae_tiling_kwargs,
+            height=latent_height * scale.height,
+            width=latent_width * scale.width,
+            num_frames=(latent_frames - 1) * scale.time + 1,
+            # Matches the ModuleOps that load_video_vae_decoder applies to the diffusion decoder.
+            mode=DiffVAEMode.CHUNKED_EAGER,
+            free_bytes=cuda_activation_budget_bytes(device) if device.type == "cuda" else 0,
+        )
 
     def _decode_audio(self, audio_state: LatentState, device: torch.device) -> Tensor:
         """Decode audio latents to waveform via audio VAE + vocoder."""
@@ -932,8 +1086,8 @@ class ValidationRunner:
         audio_encoder.to("cpu")
         return latent.cpu()
 
-    @staticmethod
     def _load_and_downsample_mask(
+        self,
         mask_path: str | Path,
         target_width: int,
         target_height: int,
@@ -943,9 +1097,7 @@ class ValidationRunner:
         Returns a binary float tensor of shape [1, F', H', W'] where F', H', W' are
         the latent-space dimensions corresponding to the target video dims.
         """
-        from ltx_core.types import SpatioTemporalScaleFactors  # noqa: PLC0415
-
-        sf = SpatioTemporalScaleFactors.default()
+        sf = self._video_scale_factors
         latent_f = (target_num_frames - 1) // sf.time + 1
 
         mask_path = Path(mask_path)
@@ -1015,9 +1167,9 @@ class ValidationRunner:
         )
         return VideoLatentTools(
             patchifier=self._video_patchifier,
-            target_shape=VideoLatentShape.from_pixel_shape(shape=pixel_shape),
+            target_shape=VideoLatentShape.from_pixel_shape(shape=pixel_shape, scale_factors=self._video_scale_factors),
             fps=self._config.frame_rate,
-            scale_factors=VIDEO_SCALE_FACTORS,
+            scale_factors=self._video_scale_factors,
             causal_fix=True,
         )
 
@@ -1062,8 +1214,54 @@ class ValidationRunner:
         return (denoised * denoise_mask + clean_latent.float() * (1 - denoise_mask)).to(denoised.dtype)
 
     @staticmethod
+    def _resolve_video_guider_params(
+        cfg: ValidationConfig,
+        *,
+        video_frozen: bool,
+        audio_present: bool,
+    ) -> MultiModalGuiderParams:
+        """Resolve video guider params for the current validation sample.
+        Frozen conditioning video (V2A) and video-only runs without an audio branch use a
+        neutral guider, matching ``a2vid_two_stage`` / ``t2a_one_stage`` pipeline call-site patterns.
+        """
+        if video_frozen:
+            return MultiModalGuiderParams()
+        modality_scale = cfg.video_modality_guidance_scale if audio_present else 1.0
+        return MultiModalGuiderParams(
+            cfg_scale=cfg.video_cfg_scale,
+            stg_scale=cfg.video_stg_scale,
+            stg_blocks=cfg.stg_blocks,
+            rescale_scale=cfg.guidance_rescale,
+            modality_scale=modality_scale,
+        )
+
+    @staticmethod
+    def _resolve_audio_guider_params(
+        cfg: ValidationConfig,
+        *,
+        audio_frozen: bool,
+        video_present: bool,
+    ) -> MultiModalGuiderParams:
+        """Resolve audio guider params for the current validation sample.
+        Frozen conditioning audio (A2V) uses a neutral guider, matching ``a2vid_two_stage``.
+        Audio-only runs without a video branch disable cross-modal guidance (``t2a_one_stage``).
+        """
+        if audio_frozen:
+            return MultiModalGuiderParams()
+        modality_scale = cfg.audio_modality_guidance_scale if video_present else 1.0
+        return MultiModalGuiderParams(
+            cfg_scale=cfg.audio_cfg_scale,
+            stg_scale=cfg.audio_stg_scale,
+            stg_blocks=cfg.stg_blocks,
+            rescale_scale=cfg.guidance_rescale,
+            modality_scale=modality_scale,
+        )
+
+    @staticmethod
     def _modality_from_latent_state(state: LatentState, context: Tensor, sigma: Tensor) -> Modality:
         """Build a Modality object from a LatentState, text context, and sigma."""
+        if state.frozen:
+            sigma = torch.zeros_like(sigma)
         return Modality(
             enabled=True,
             latent=state.latent,
@@ -1072,22 +1270,39 @@ class ValidationRunner:
             positions=state.positions,
             context=context,
             context_mask=None,
+            keyframes_mask=state.keyframes_mask,
         )
 
     @staticmethod
     def _build_stg_perturbation_config(
+        video_enabled: bool,
+        audio_enabled: bool,
         stg_blocks: list[int] | None,
-        stg_mode: Literal["stg_av", "stg_v"],
+        num_blocks: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> BatchedPerturbationConfig | None:
+        """Build STG perturbation config that skips self-attention in the specified blocks."""
+        perturbations: list[Perturbation] = []
+        if video_enabled:
+            perturbations.append(Perturbation(type=PerturbationType.SKIP_VIDEO_SELF_ATTN, blocks=stg_blocks))
+        if audio_enabled:
+            perturbations.append(Perturbation(type=PerturbationType.SKIP_AUDIO_SELF_ATTN, blocks=stg_blocks))
+        if not perturbations:
+            return None
+        return BatchedPerturbationConfig([PerturbationConfig(perturbations=perturbations)], num_blocks, device, dtype)
+
+    @staticmethod
+    def _build_modality_perturbation_config(
         num_blocks: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> BatchedPerturbationConfig:
-        """Build STG perturbation config that skips self-attention in the specified blocks."""
+        """Build modality guidance perturbations that isolate cross-modal attention."""
         perturbations: list[Perturbation] = [
-            Perturbation(type=PerturbationType.SKIP_VIDEO_SELF_ATTN, blocks=stg_blocks)
+            Perturbation(type=PerturbationType.SKIP_A2V_CROSS_ATTN, blocks=None),
+            Perturbation(type=PerturbationType.SKIP_V2A_CROSS_ATTN, blocks=None),
         ]
-        if stg_mode == "stg_av":
-            perturbations.append(Perturbation(type=PerturbationType.SKIP_AUDIO_SELF_ATTN, blocks=stg_blocks))
         return BatchedPerturbationConfig([PerturbationConfig(perturbations=perturbations)], num_blocks, device, dtype)
 
     @staticmethod
@@ -1138,21 +1353,28 @@ class ValidationRunner:
         video: Tensor,
         target_height: int,
         target_width: int,
+        scale_factors: SpatioTemporalScaleFactors,
         downscale_factor: int = 1,
         temporal_scale_factor: int = 1,
     ) -> tuple[Tensor, Tensor]:
         """Preprocess reference video. Returns (preprocessed [-1,1], pixels [0,1])."""
+        if target_height % downscale_factor != 0 or target_width % downscale_factor != 0:
+            raise ValueError(
+                f"Reference target dimensions ({target_height}x{target_width}) must be evenly divisible by "
+                f"downscale_factor ({downscale_factor})."
+            )
         ref_height = target_height // downscale_factor
         ref_width = target_width // downscale_factor
-        if ref_height % 32 != 0 or ref_width % 32 != 0:
+        if ref_height % scale_factors.height != 0 or ref_width % scale_factors.width != 0:
             raise ValueError(
-                f"Scaled reference dimensions ({ref_height}x{ref_width}) must be divisible by 32. "
-                f"Original: {target_height}x{target_width}, downscale_factor: {downscale_factor}"
+                f"Scaled reference dimensions ({ref_height}x{ref_width}) must be divisible by the VAE "
+                f"spatial factor ({scale_factors.height}). Original: {target_height}x{target_width}, "
+                f"downscale_factor: {downscale_factor}"
             )
 
         video = ValidationRunner._resize_and_center_crop(video, ref_height, ref_width)
         video = rearrange(video, "f c h w -> 1 c f h w")
-        valid_frames = (video.shape[2] - 1) // 8 * 8 + 1
+        valid_frames = (video.shape[2] - 1) // scale_factors.time * scale_factors.time + 1
         video = video[:, :, :valid_frames]
 
         # VAE-aligned temporal subsampling: keep frame 0, then every Nth frame
@@ -1168,13 +1390,16 @@ class ValidationRunner:
     def _encode_video(video: Tensor, vae_encoder: torch.nn.Module, device: torch.device) -> Tensor:
         """Encode a [B, C, F, H, W] video tensor through the VAE. Returns latent on CPU."""
         vae_encoder.to(device)
-        latent = vae_encoder.tiled_encode(video.to(dtype=torch.bfloat16), TilingConfig.default())
+        latent = vae_encoder.tiled_encode(video.to(dtype=torch.bfloat16), TileSizeConfig.default())
         vae_encoder.to("cpu")
         return latent.cpu()
 
 
 def _build_spatial_crop_mask(
-    region: tuple[int, int, int, int], target_shape: VideoLatentShape, device: torch.device
+    region: tuple[int, int, int, int],
+    target_shape: VideoLatentShape,
+    device: torch.device,
+    scale_factors: SpatioTemporalScaleFactors,
 ) -> Tensor:
     """Build a binary mask from a pixel-space spatial region (y1, x1, y2, x2)."""
     y1, x1, y2, x2 = region
@@ -1183,10 +1408,10 @@ def _build_spatial_crop_mask(
     def to_latent(v: int, scale: int, max_v: int) -> int:
         return max(0, min(v // scale, max_v))
 
-    ly1 = to_latent(y1, VIDEO_SCALE_FACTORS.height, height)
-    ly2 = to_latent(y2, VIDEO_SCALE_FACTORS.height, height)
-    lx1 = to_latent(x1, VIDEO_SCALE_FACTORS.width, width)
-    lx2 = to_latent(x2, VIDEO_SCALE_FACTORS.width, width)
+    ly1 = to_latent(y1, scale_factors.height, height)
+    ly2 = to_latent(y2, scale_factors.height, height)
+    lx1 = to_latent(x1, scale_factors.width, width)
+    lx2 = to_latent(x2, scale_factors.width, width)
 
     spatial_mask = torch.zeros(height, width, dtype=torch.float32, device=device)
     spatial_mask[ly1:ly2, lx1:lx2] = 1.0

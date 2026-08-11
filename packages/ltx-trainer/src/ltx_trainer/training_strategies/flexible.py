@@ -16,10 +16,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from torch import Tensor
 
 from ltx_core.model.transformer.modality import Modality
+from ltx_core.types import SpatioTemporalScaleFactors
 from ltx_trainer.timestep_samplers import TimestepSampler
 from ltx_trainer.training_strategies.base_strategy import (
     DEFAULT_FPS,
-    VIDEO_SCALE_FACTORS,
     ModelInputs,
     TrainingStrategy,
     TrainingStrategyConfigBase,
@@ -499,7 +499,9 @@ class FlexibleStrategy(TrainingStrategy):
                 batch_size, seq_len, height, width, config.temporal_boundary, True, device
             )
         elif isinstance(config, SpatialCropConditionConfig):
-            mask = self._compute_spatial_crop_mask(batch_size, seq_len, height, width, config.spatial_region, device)
+            mask = self._compute_spatial_crop_mask(
+                batch_size, seq_len, height, width, config.spatial_region, device, self.video_scale_factors
+            )
         elif isinstance(config, MaskConditionConfig):
             # Binarize to match inference, which thresholds masks at load time
             # (validation_runner._load_and_downsample_mask / _load_audio_mask).
@@ -546,6 +548,7 @@ class FlexibleStrategy(TrainingStrategy):
         width: int,
         region: tuple[int, int, int, int],
         device: torch.device,
+        scale_factors: SpatioTemporalScaleFactors,
     ) -> Tensor:
         """Compute float mask for spatial crop region (y1, x1, y2, x2) in pixel coords.
         Returns [B, seq_len] in {0, 1}.
@@ -557,10 +560,10 @@ class FlexibleStrategy(TrainingStrategy):
         def to_latent(v: int, scale: int, max_v: int) -> int:
             return max(0, min(v // scale, max_v))
 
-        ly1 = to_latent(y1, VIDEO_SCALE_FACTORS.height, height)
-        ly2 = to_latent(y2, VIDEO_SCALE_FACTORS.height, height)
-        lx1 = to_latent(x1, VIDEO_SCALE_FACTORS.width, width)
-        lx2 = to_latent(x2, VIDEO_SCALE_FACTORS.width, width)
+        ly1 = to_latent(y1, scale_factors.height, height)
+        ly2 = to_latent(y2, scale_factors.height, height)
+        lx1 = to_latent(x1, scale_factors.width, width)
+        lx2 = to_latent(x2, scale_factors.width, width)
 
         # Create spatial mask and tile across frames
         spatial_mask = torch.zeros(height, width, device=device)

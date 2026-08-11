@@ -154,19 +154,16 @@ class TransformerWeightTracker:
         **kwargs: object,
     ) -> ModelType:
         """Build the transformer model with distributed LoRA hot-swap.
-        Populates the registry with clean weights on first call, then applies
-        LoRAs in-place and broadcasts to all ranks. Assumes the builder carries
-        a non-dummy :class:`Registry` so that weights can be cached and reused
-        across calls.
+        Builds (or reuses a registry-cached shell with rebound clean weights) via
+        ``clean_builder.build``. LoRAs are then fused in-place into the registry
+        tensors and broadcast. Assumes a non-dummy :class:`Registry`.
         """
         loras = builder.loras
         clean_builder = builder.with_loras(())
 
         model_paths = list(builder.model_path) if isinstance(builder.model_path, tuple) else [builder.model_path]
 
-        # First call: populate the registry with clean weights.
-        if clean_builder.registry.get(model_paths, clean_builder.model_sd_ops) is None:
-            clean_builder.build(device=device, dtype=dtype, **kwargs)
+        model = clean_builder.build(device=device, dtype=dtype, **kwargs)
 
         cached_sd = clean_builder.registry.get(model_paths, clean_builder.model_sd_ops)
         if cached_sd is None:
@@ -181,4 +178,4 @@ class TransformerWeightTracker:
         else:
             self.reset_loras(cached_sd.sd)
 
-        return clean_builder.build(device=device, dtype=dtype, **kwargs)
+        return model

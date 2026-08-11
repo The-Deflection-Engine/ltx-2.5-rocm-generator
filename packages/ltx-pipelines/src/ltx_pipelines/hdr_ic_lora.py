@@ -33,6 +33,7 @@ import torch
 from einops import rearrange
 from safetensors import safe_open
 
+from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.patchifiers import VideoLatentPatchifier
 from ltx_core.conditioning import (
@@ -40,17 +41,17 @@ from ltx_core.conditioning import (
     VideoConditionByReferenceLatent,
 )
 from ltx_core.devices import empty_device_cache
-from ltx_core.hdr import apply_hdr_decode_postprocess
+from ltx_core.hdr import HDRTransfer, to_hdr_linear
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.loader.registry import Registry
+from ltx_core.loader.registry import ModelRegistry, Registry
 from ltx_core.loader.sd_ops import LTXV_LORA_COMFY_RENAMING_MAP
 from ltx_core.modality_tiling import VideoModalityTilingHelper
-from ltx_core.model.video_vae import TilingConfig, VideoEncoder
+from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, VideoEncoder
+from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.tiling import DimensionTilingConfig, TileCountConfig
+from ltx_core.tiling import DimensionSizeConfig, DimensionTilingConfig, TileCountConfig, TileSizeConfig
 from ltx_core.tools import VideoLatentTools
 from ltx_core.types import VideoLatentShape, VideoPixelShape
-from ltx_pipelines.utils.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_pipelines.utils.blocks import (
     DiffusionStage,
     ImageConditioner,
@@ -59,8 +60,14 @@ from ltx_pipelines.utils.blocks import (
 )
 from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
 from ltx_pipelines.utils.denoisers import SimpleDenoiser
-from ltx_pipelines.utils.helpers import get_device, modality_from_latent_state
+from ltx_pipelines.utils.helpers import (
+    ensure_tiling_config,
+    get_device,
+    modality_from_latent_state,
+    tiling_scale_factors_for_vae,
+)
 from ltx_pipelines.utils.media_io import ResizeMode, align_resolution, load_video_conditioning_hdr
+from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_pipelines.utils.quantization_factory import QuantizationKind
 from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
 
@@ -95,6 +102,20 @@ _TILED_2F2H2W_OV8_6 = TileCountConfig(
 STAGE2_TILINGS = [_TILED_2F2H2W_OV8_6]
 STAGE2_SIGMAS = [[_S2[0], _S2[1], 0.0]]
 STAGE2_USE_IC_LORA = [True]
+
+
+def _encode_tiling_config(tiling_config: TilingConfig) -> TilingConfig:
+    if not isinstance(tiling_config, TileSizeConfig):
+        return tiling_config
+    if not tiling_config.height.is_tiled() and not tiling_config.width.is_tiled():
+        return tiling_config
+    long = max(tiling_config.height.tile_size, tiling_config.width.tile_size)
+    overlap = tiling_config.height.overlap if tiling_config.height.is_tiled() else tiling_config.width.overlap
+    return TileSizeConfig(
+        frames=tiling_config.frames,
+        height=DimensionSizeConfig(tile_size=long, overlap=overlap),
+        width=DimensionSizeConfig(tile_size=long, overlap=overlap),
+    )
 
 
 def _clamp_dim_tiling(cfg: DimensionTilingConfig, dim_size: int, axis: str) -> DimensionTilingConfig:
@@ -150,7 +171,6 @@ DEFAULT_SPATIAL_OVERLAP = 256
 DEFAULT_TEMPORAL_TILE = 32
 DEFAULT_TEMPORAL_OVERLAP = 16
 
-
 # ---------------------------------------------------------------------------
 # HDR LoRA config
 # ---------------------------------------------------------------------------
@@ -163,7 +183,7 @@ class HdrLoraConfig:
     constructed manually for testing.
     """
 
-    hdr_transform: str = "logc3"
+    hdr_transform: HDRTransfer = HDRTransfer.LOGC3
     reference_downscale_factor: int = 1
 
 
@@ -178,14 +198,15 @@ def read_hdr_lora_config(lora_path: str) -> HdrLoraConfig | None:
         logger.warning("Failed to read metadata from LoRA file '%s': %s", lora_path, e)
         return None
 
-    hdr_transform = metadata.get("hdr_transform", "")
-    has_hdr = bool(hdr_transform or metadata.get("use_hdr_transform"))
+    raw_transform = metadata.get("hdr_transform", "")
+    has_hdr = bool(raw_transform or metadata.get("use_hdr_transform"))
     if not has_hdr:
         return None
 
-    transform = hdr_transform if hdr_transform and hdr_transform != "true" else "logc3"
+    # Metadata may store a bare flag ("true") or a transfer name ("logc3").
+    transfer = HDRTransfer(raw_transform) if raw_transform and raw_transform != "true" else HDRTransfer.LOGC3
     scale = int(metadata.get("reference_downscale_factor", 1))
-    return HdrLoraConfig(hdr_transform=transform, reference_downscale_factor=scale)
+    return HdrLoraConfig(hdr_transform=transfer, reference_downscale_factor=scale)
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +224,7 @@ class HDRICLoraPipeline:
 
     def __init__(  # noqa: PLR0913
         self,
-        distilled_checkpoint_path: str,
+        model_paths: ModelPaths,
         spatial_upsampler_path: str,
         hdr_lora: str | Path,
         text_embeddings_path: str | Path,
@@ -214,10 +235,11 @@ class HDRICLoraPipeline:
         tiled_vae_encode_pixel_threshold: int = TILED_VAE_ENCODE_PIXEL_THRESHOLD,
         offload_mode: OffloadMode = OffloadMode.NONE,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
+        diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
     ):
         """
         Args:
-            distilled_checkpoint_path: Path to the distilled model checkpoint.
+            model_paths: Resolved component paths (diffusion + video VAE at minimum).
             spatial_upsampler_path: Path to the spatial upsampler checkpoint.
             hdr_lora: Path to the HDR IC-LoRA ``.safetensors`` file.
             text_embeddings_path: Path to pre-computed text embeddings
@@ -225,7 +247,10 @@ class HDRICLoraPipeline:
                 ``audio_context`` tensors).
             device: Target device. Auto-detected when ``None``.
             quantization: Quantization policy. Defaults to ``fp8_cast``.
-            registry: Optional model registry for caching loaded components.
+            registry: Optional registry for non-diffusion blocks (VAE encode/decode,
+                upsampler). Diffusion stages always use a dedicated full
+                :class:`ModelRegistry` that is cleared before decode so
+                transformer weights do not pin VRAM.
             hdr_lora_config: Explicit HDR LoRA config override. When ``None``,
                 auto-detected from LoRA safetensors metadata.
             tiled_vae_encode_pixel_threshold: Conditioning videos whose spatial
@@ -237,7 +262,7 @@ class HDRICLoraPipeline:
         self.device = device or get_device()
         self._tiled_vae_encode_threshold = tiled_vae_encode_pixel_threshold
         if isinstance(quantization, QuantizationKind):
-            quantization = quantization.to_policy(checkpoint_path=distilled_checkpoint_path)
+            quantization = quantization.to_policy(checkpoint_path=model_paths.transformer())
         if offload_mode != OffloadMode.NONE and quantization is not None:
             logger.info("Offload mode enabled — disabling quantization (not supported with layer streaming).")
             quantization = None
@@ -256,34 +281,37 @@ class HDRICLoraPipeline:
             )
 
         self.image_conditioner = ImageConditioner(
-            distilled_checkpoint_path,
+            model_paths.video_vae(),
             self.dtype,
             self.device,
             registry=registry,
             alloc_trim_strategy=alloc_trim_strategy,
         )
+        # Full cache for diffusion only: cheap per-tile stage_2 rebuilds. Cleared
+        # before decode so transformer SDs are not still pinning VRAM.
+        self._diffusion_registry = ModelRegistry()
         self.stage_1 = DiffusionStage.from_checkpoint(
-            distilled_checkpoint_path,
+            model_paths.transformer(),
             self.dtype,
             self.device,
             loras=loras,
             quantization=quantization,
-            registry=registry,
+            registry=self._diffusion_registry,
             offload_mode=offload_mode,
             alloc_trim_strategy=alloc_trim_strategy,
         )
         self.stage_2 = DiffusionStage.from_checkpoint(
-            distilled_checkpoint_path,
+            model_paths.transformer(),
             self.dtype,
             self.device,
             loras=loras,
             quantization=quantization,
-            registry=registry,
+            registry=self._diffusion_registry,
             offload_mode=offload_mode,
             alloc_trim_strategy=alloc_trim_strategy,
         )
         self.upsampler = VideoUpsampler(
-            distilled_checkpoint_path,
+            model_paths.video_vae(),
             spatial_upsampler_path,
             self.dtype,
             self.device,
@@ -291,11 +319,12 @@ class HDRICLoraPipeline:
             alloc_trim_strategy=alloc_trim_strategy,
         )
         self.video_decoder = VideoDecoder(
-            distilled_checkpoint_path,
+            model_paths.video_vae(),
             self.dtype,
             self.device,
             registry=registry,
             alloc_trim_strategy=alloc_trim_strategy,
+            diffvae_optimization=diffvae_optimization,
         )
 
         # HDR config: explicit override, or auto-detect from LoRA metadata.
@@ -305,12 +334,15 @@ class HDRICLoraPipeline:
             self._hdr_config = read_hdr_lora_config(lora_path)
 
         if self._hdr_config is not None:
-            logger.info("[HDR IC-LoRA] HDR mode enabled (%s decode)", self._hdr_config.hdr_transform)
+            logger.info(
+                "[HDR IC-LoRA] HDR mode enabled (%s decode)",
+                self._hdr_config.hdr_transform.value,
+            )
 
     @property
-    def hdr_transform(self) -> str:
-        """Active HDR transform name (defaults to 'logc3')."""
-        return self._hdr_config.hdr_transform if self._hdr_config is not None else "logc3"
+    def hdr_transform(self) -> HDRTransfer:
+        """Active HDR working-space transfer (defaults to LogC3)."""
+        return self._hdr_config.hdr_transform if self._hdr_config is not None else HDRTransfer.LOGC3
 
     @property
     def reference_downscale_factor(self) -> int:
@@ -325,7 +357,7 @@ class HDRICLoraPipeline:
         num_frames: int,
         frame_rate: float,
         video_conditioning: list[tuple[str, float]],
-        tiling_config: TilingConfig | None = None,
+        tiling_config: TilingConfig | AutoTiling | None = AUTO_TILING,
         high_quality_hdr: bool = False,
         stage2_tilings: list[TileCountConfig] | None = None,
         stage2_sigmas: list[list[float]] | None = None,
@@ -377,6 +409,16 @@ class HDRICLoraPipeline:
                 crop_h,
             )
 
+        scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
+        tiling_config = ensure_tiling_config(
+            tiling_config,
+            scale_factors=scale_factors,
+            vae_checkpoint_path=self.video_decoder.checkpoint_path,
+            video_shape=VideoPixelShape(batch=1, frames=gen_num_frames, height=gen_h, width=gen_w, fps=frame_rate),
+            diffvae_optimization=self.video_decoder.diffvae_optimization,
+            device=self.device,
+        )
+
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
 
@@ -399,60 +441,46 @@ class HDRICLoraPipeline:
 
         stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
 
-        # HDR is video-only: skip the audio stream to avoid denoising 5B audio params.
-        video_state, _ = self.stage_1(
-            denoiser=SimpleDenoiser(video_context, None),
-            sigmas=stage_1_sigmas,
-            noiser=noiser,
-            width=s1_w,
-            height=s1_h,
-            frames=gen_num_frames,
-            fps=frame_rate,
-            video=ModalitySpec(
-                context=video_context,
-                conditionings=stage_1_conditionings,
-            ),
-        )
-
-        if stage2_tilings is None:
-            stage2_tilings = list(STAGE2_TILINGS)
-        if stage2_sigmas is None:
-            stage2_sigmas = [list(s) for s in STAGE2_SIGMAS]
-        if stage2_use_ic_lora is None:
-            stage2_use_ic_lora = list(STAGE2_USE_IC_LORA)
-        if not (len(stage2_tilings) == len(stage2_sigmas) == len(stage2_use_ic_lora)):
-            raise ValueError("stage2_tilings, stage2_sigmas, and stage2_use_ic_lora must have equal length")
-
-        # Stage 2: Upsample and refine at full resolution.
-        upscaled_video_latent = self.upsampler(video_state.latent[:1])
-
-        stage_2_conditionings = self.image_conditioner(
-            lambda enc: self._create_conditionings(
-                video_conditioning=video_conditioning,
-                height=gen_h,
-                width=gen_w,
-                video_encoder=enc,
-                num_frames=gen_num_frames,
-                tiling_config=tiling_config,
-                high_quality_hdr=high_quality_hdr,
+        try:
+            # HDR is video-only: skip the audio stream to avoid denoising 5B audio params.
+            video_state, _ = self.stage_1(
+                denoiser=SimpleDenoiser(video_context, None),
+                sigmas=stage_1_sigmas,
+                noiser=noiser,
+                width=s1_w,
+                height=s1_h,
+                frames=gen_num_frames,
+                fps=frame_rate,
+                video=ModalitySpec(
+                    context=video_context,
+                    conditionings=stage_1_conditionings,
+                ),
             )
-        )
-        # video_tools is required by TiledDataParallelBuilder when stage_2 is
-        # wrapped for multi-GPU
-        stage2_video_tools = VideoLatentTools(
-            VideoLatentPatchifier(patch_size=1),
-            VideoLatentShape.from_pixel_shape(
-                VideoPixelShape(
-                    batch=1,
-                    frames=gen_num_frames,
+
+            if stage2_tilings is None:
+                stage2_tilings = list(STAGE2_TILINGS)
+            if stage2_sigmas is None:
+                stage2_sigmas = [list(s) for s in STAGE2_SIGMAS]
+            if stage2_use_ic_lora is None:
+                stage2_use_ic_lora = list(STAGE2_USE_IC_LORA)
+            if not (len(stage2_tilings) == len(stage2_sigmas) == len(stage2_use_ic_lora)):
+                raise ValueError("stage2_tilings, stage2_sigmas, and stage2_use_ic_lora must have equal length")
+
+            # Stage 2: Upsample and refine at full resolution.
+            upscaled_video_latent = self.upsampler(video_state.latent[:1])
+
+            stage_2_conditionings = self.image_conditioner(
+                lambda enc: self._create_conditionings(
+                    video_conditioning=video_conditioning,
                     height=gen_h,
                     width=gen_w,
-                    fps=frame_rate,
+                    video_encoder=enc,
+                    num_frames=gen_num_frames,
+                    tiling_config=tiling_config,
+                    high_quality_hdr=high_quality_hdr,
                 )
-            ),
-            frame_rate,
-        )
-        with self.stage_2.model_context(video_tools=stage2_video_tools) as transformer:
+            )
+            # Per-tile stage_2(...) rebuilds are cheap with shell caching.
             phase_latent = upscaled_video_latent
             for phase_idx, (tiling, sigmas_list, use_ic) in enumerate(
                 zip(stage2_tilings, stage2_sigmas, stage2_use_ic_lora, strict=True)
@@ -469,7 +497,6 @@ class HDRICLoraPipeline:
                     diffusion_tiling.width,
                 )
                 phase_latent = self._run_stage2_phase(
-                    transformer=transformer,
                     latent=phase_latent,
                     conditionings=conditionings,
                     tiling=diffusion_tiling,
@@ -478,8 +505,10 @@ class HDRICLoraPipeline:
                     frame_rate=frame_rate,
                     seed=seed,
                 )
-
-        final_video_latent = phase_latent
+            final_video_latent = phase_latent
+        finally:
+            # Drop cached transformer shells/weights so decode (or failure cleanup) can claim VRAM.
+            self._diffusion_registry.clear()
 
         crop_size = (crop_w, crop_h) if needs_crop else None
         return self._decode_video(
@@ -492,7 +521,6 @@ class HDRICLoraPipeline:
 
     def _run_stage2_phase(
         self,
-        transformer: object,
         latent: torch.Tensor,
         conditionings: list[ConditioningItem],
         tiling: TileCountConfig,
@@ -502,13 +530,18 @@ class HDRICLoraPipeline:
         seed: int,
     ) -> torch.Tensor:
         """Run one stage-2 denoising phase with optional IC-LoRA conditioning.
-        Each tile calls ``stage_2.run()`` with a tile-sized ``ModalitySpec`` for
-        video only (audio is omitted entirely for HDR). IC-LoRA conditionings
-        are sliced spatially to match each tile's extent.
+        Each tile calls ``stage_2(...)`` (build→denoise→dispose) with a tile-sized
+        ``ModalitySpec`` for video only (audio is omitted entirely for HDR).
+        IC-LoRA conditionings are sliced spatially to match each tile's extent.
         """
         batch, n_channels, n_frames, n_height, n_width = latent.shape
         full_shape = VideoLatentShape(batch=batch, channels=n_channels, frames=n_frames, height=n_height, width=n_width)
-        full_tools = VideoLatentTools(VideoLatentPatchifier(patch_size=1), full_shape, frame_rate)
+        full_tools = VideoLatentTools(
+            VideoLatentPatchifier(patch_size=1),
+            full_shape,
+            frame_rate,
+            scale_factors=self.stage_2.video_scale_factors,
+        )
         helper = VideoModalityTilingHelper(tiling, full_tools)
 
         ref_initial = full_tools.create_initial_state(device=self.device, dtype=self.dtype)
@@ -540,14 +573,14 @@ class HDRICLoraPipeline:
                 for cond in conditionings
             ]
 
-            tile_video_state, _ = self.stage_2.run(
-                transformer=transformer,
+            sf = self.stage_2.video_scale_factors
+            tile_video_state, _ = self.stage_2(
                 denoiser=SimpleDenoiser(v_ctx, None),
                 sigmas=sigmas,
                 noiser=GaussianNoiser(generator=torch.Generator(device=self.device).manual_seed(seed + tile_idx)),
-                width=tile_w * 32,
-                height=tile_h * 32,
-                frames=(tile_f - 1) * 8 + 1,
+                width=tile_w * sf.width,
+                height=tile_h * sf.height,
+                frames=(tile_f - 1) * sf.time + 1,
                 fps=frame_rate,
                 video=ModalitySpec(
                     context=v_ctx,
@@ -580,16 +613,15 @@ class HDRICLoraPipeline:
         Returns:
             Linear HDR float tensor ``[f, h, w, c]``.
         """
-        # Cast to float32 so tiled-decode accumulation buffers and blending
-        # masks run in full precision, avoiding bfloat16 seam artifacts.
-        # apply_hdr_decode_postprocess expects float32 [0, 1].
-        latent = latent.float()
+        # Always-HDR path: float32 weights + latent so compute/output/tiling stay fp32.
+        # to_hdr_linear expects float32 [0, 1] working-space codes.
+        latent = latent.to(dtype=torch.float32)
         decoded = torch.cat(
-            [chunk.float() for chunk in self.video_decoder(latent, tiling_config, generator)],
+            list(self.video_decoder(latent, tiling_config, generator, dtype=torch.float32)),
             dim=0,
         )
         decoded = rearrange(decoded, "f h w c -> 1 c f h w")
-        hdr = apply_hdr_decode_postprocess(decoded, transform=self.hdr_transform)
+        hdr = to_hdr_linear(decoded, transfer=self.hdr_transform)
         del decoded
         out = rearrange(hdr[0], "c f h w -> f h w c")
         if crop_size is not None:
@@ -632,7 +664,7 @@ class HDRICLoraPipeline:
                         frame_cap=load_frame_cap,
                         dtype=self.dtype,
                         device=self.device,
-                        hdr_transform=self.hdr_transform,
+                        transfer=self.hdr_transform,
                         resize_mode=ResizeMode.REFLECT_PAD,
                     )
                 ),
@@ -641,7 +673,7 @@ class HDRICLoraPipeline:
             if high_quality_hdr:
                 video = video.repeat_interleave(2, dim=2)[:, :, :num_frames, :, :]
             if tiling_config is not None and ref_height * ref_width > self._tiled_vae_encode_threshold:
-                encoded_video = video_encoder.tiled_encode(video, tiling_config)
+                encoded_video = video_encoder.tiled_encode(video, _encode_tiling_config(tiling_config))
             else:
                 encoded_video = video_encoder(video)
 
@@ -674,14 +706,12 @@ def _make_tiling_config(
     16 overlap) are suitable for H100-80 GB.  On GPUs with less VRAM,
     reduce the spatial tile size (e.g. ``spatial_tile=768``).
     """
-    from ltx_core.model.video_vae.tiling import SpatialTilingConfig, TemporalTilingConfig  # noqa: PLC0415
+    from ltx_core.tiling import DimensionSizeConfig, TileSizeConfig  # noqa: PLC0415
 
-    return TilingConfig(
-        spatial_config=SpatialTilingConfig(tile_size_in_pixels=spatial_tile, tile_overlap_in_pixels=spatial_overlap),
-        temporal_config=TemporalTilingConfig(
-            tile_size_in_frames=temporal_tile,
-            tile_overlap_in_frames=temporal_overlap,
-        ),
+    return TileSizeConfig(
+        height=DimensionSizeConfig(tile_size=spatial_tile, overlap=spatial_overlap),
+        width=DimensionSizeConfig(tile_size=spatial_tile, overlap=spatial_overlap),
+        frames=DimensionSizeConfig(tile_size=temporal_tile, overlap=temporal_overlap),
     )
 
 
@@ -709,7 +739,6 @@ def _process_single_video(  # noqa: PLR0913
     tiling_config: TilingConfig,
     seed: int,
     skip_mp4: bool,
-    exr_half: bool,
     exr_executor: "ThreadPoolExecutor",  # noqa: F821
     exr_futures: list,
     high_quality_hdr: bool = False,
@@ -739,7 +768,7 @@ def _process_single_video(  # noqa: PLR0913
     for j in range(hdr_video.shape[0]):
         frame_cpu = hdr_video[j].cpu().clone()
         path = exr_dir / f"frame_{j:05d}.exr"
-        exr_futures.append(exr_executor.submit(save_exr_tensor, frame_cpu, str(path), exr_half))
+        exr_futures.append(exr_executor.submit(save_exr_tensor, frame_cpu, str(path), True))
 
     del hdr_video
     gc.collect()
@@ -767,6 +796,8 @@ def _build_arg_parser() -> "argparse.ArgumentParser":  # noqa: F821
 
     parser = argparse.ArgumentParser(
         description="HDR IC-LoRA inference: EXR frames + tonemapped ProRes .mov.",
+        # Prevent ``--hdr`` from abbreviating to ``--hdr-lora`` (native HDR flag is not supported here).
+        allow_abbrev=False,
         epilog="""\
 Resolution & frame constraints
 ------------------------------
@@ -817,7 +848,6 @@ Max frames by resolution (fp8_cast, bfloat16 VAE, tiled decode)
         "Reduce on lower-VRAM GPUs (e.g. 768 for 48 GB).",
     )
     parser.add_argument("--skip-mp4", action="store_true", help="Skip H.264 MP4 encoding, only produce EXR.")
-    parser.add_argument("--exr-half", action="store_true", help="Save EXR as float16.")
     parser.add_argument("--seed", type=int, default=10, help="Random seed (default: 10).")
     parser.add_argument(
         "--offload",
@@ -838,6 +868,30 @@ Max frames by resolution (fp8_cast, bfloat16 VAE, tiled decode)
         action="store_true",
         help="High-quality HDR mode. Generates at 2x frame count internally "
         "and keeps every other frame for smoother output. ~2x slower.",
+    )
+    parser.add_argument(
+        "--video-vae-path",
+        default=None,
+        help=(
+            "Optional path to a separate video VAE checkpoint (.safetensors). "
+            "When set, encoding/decoding use this file instead of "
+            "--distilled-checkpoint-path. Decoder kind is selected from file metadata. "
+            "Diffusion VAEs require the natten extra "
+            "(uv sync --package ltx-core --extra natten)."
+        ),
+    )
+    parser.add_argument(
+        "--diffvae-optimization",
+        type=DiffVAEMode,
+        default=DiffVAEMode.CHUNKED_EAGER,
+        choices=list(DiffVAEMode),
+        help=(
+            "DiffVAE decode optimization preset. "
+            "'chunked_eager' (default): deferred stage-4, W-chunks=4, cutlass-fna. "
+            "'chunked_compile': same chunking with torch.compile (det stages off). "
+            "'combined_compile': combined context, full compile (highest VRAM, fastest warm). "
+            "Ignored for convolutional VAEs."
+        ),
     )
     return parser
 @torch.inference_mode()
@@ -867,12 +921,20 @@ def main() -> None:
     logger.info("Found %d video(s), generating %d frames each", len(videos), num_frames)
 
     logger.info("Loading pipeline...")
+    # HDR uses precomputed embeddings — no text encoder. CLI boundary builds ModelPaths; the
+    # pipeline only consumes that object (and non-path args like LoRA / embeddings file).
+    model_paths = ModelPaths.from_monolith(
+        args.distilled_checkpoint_path,
+        gemma_root=None,
+        video_vae_path=args.video_vae_path,
+    )
     pipeline = HDRICLoraPipeline(
-        distilled_checkpoint_path=args.distilled_checkpoint_path,
+        model_paths=model_paths,
         spatial_upsampler_path=args.spatial_upsampler_path,
         hdr_lora=args.hdr_lora,
         text_embeddings_path=args.text_embeddings,
         offload_mode=args.offload_mode,
+        diffvae_optimization=args.diffvae_optimization,
     )
     logger.info("Pipeline loaded.")
 
@@ -899,7 +961,6 @@ def main() -> None:
             tiling_config=tiling_config,
             seed=args.seed,
             skip_mp4=args.skip_mp4,
-            exr_half=args.exr_half,
             exr_executor=exr_executor,
             exr_futures=exr_futures,
             high_quality_hdr=high_quality,

@@ -1,5 +1,5 @@
 """Batch-parallel Gemma text encoder wrapper for multi-GPU inference.
-Each rank holds a full :class:`GemmaTextEncoder` replica resident on its
+Each rank holds a full :class:`LTXGemmaTextEncoder` replica resident on its
 own GPU.  ``encode`` partitions the prompt list across ranks (each rank
 encodes a disjoint slice) and broadcasts every prompt's outputs from its
 encoding rank to all other ranks, so all ranks end up with the full list
@@ -14,7 +14,7 @@ import torch
 import torch.distributed as dist
 
 from ltx_core.multigpu.gemma.broadcast_wrapper import BroadcastGemmaWrapper
-from ltx_core.text_encoders.gemma.encoders.base_encoder import GemmaTextEncoder
+from ltx_core.text_encoders.gemma.encoders.base_encoder import LTXGemmaTextEncoder
 
 
 def _partition(total: int, world_size: int) -> list[int]:
@@ -26,11 +26,11 @@ def _partition(total: int, world_size: int) -> list[int]:
 class BatchParallelGemmaWrapper(BroadcastGemmaWrapper):
     """Per-rank Gemma replica; ``encode`` parallelises a batch across ranks."""
 
-    _encoder: GemmaTextEncoder  # always resident on every rank, unlike the base's optional encoder
+    _encoder: LTXGemmaTextEncoder  # always resident on every rank, unlike the base's optional encoder
 
     def __init__(
         self,
-        encoder: GemmaTextEncoder,
+        encoder: LTXGemmaTextEncoder,
         broadcast_group: dist.ProcessGroup | None,
         src_rank: int,
         dtype: torch.dtype = torch.bfloat16,
@@ -49,11 +49,7 @@ class BatchParallelGemmaWrapper(BroadcastGemmaWrapper):
         super().__init__(encoder, broadcast_group, src_rank, dtype, device)
         self._world_size = dist.get_world_size(broadcast_group)
 
-    def encode(
-        self,
-        prompts: list[str],
-        padding_side: str = "left",
-    ) -> list[tuple[tuple[torch.Tensor, ...], torch.Tensor]]:
+    def encode(self, prompts: list[str]) -> list[tuple[tuple[torch.Tensor, ...], torch.Tensor]]:
         """Partition prompts across ranks, encode in parallel, broadcast per-prompt outputs.
         With B prompts on W ranks, each rank gets ``ceil(B/W)`` or ``floor(B/W)``
         prompts; the typical pos+neg case (B=2, W=2) gives one prompt per rank,
@@ -65,7 +61,7 @@ class BatchParallelGemmaWrapper(BroadcastGemmaWrapper):
         counts = _partition(n, self._world_size)
         start = sum(counts[: self._rank])
         local_prompts = prompts[start : start + counts[self._rank]]
-        local_outputs = self._encoder.encode(local_prompts, padding_side) if local_prompts else []
+        local_outputs = self._encoder.encode(local_prompts) if local_prompts else []
 
         all_outputs: list[tuple[tuple[torch.Tensor, ...], torch.Tensor]] = []
         for owner_rank, owner_count in enumerate(counts):
