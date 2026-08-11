@@ -80,6 +80,26 @@ def empty_device_cache(device: DeviceSpec = None) -> None:
         torch.mps.empty_cache()
 
 
+def cuda_activation_budget_bytes(device: DeviceSpec = None) -> int:
+    """Bytes still available for new CUDA allocations in this process.
+    Honors ``torch.cuda.set_per_process_memory_fraction``: ``mem_get_info`` reports
+    raw device free memory and does *not* shrink under a fraction cap, so we use
+    ``fraction * device_total - memory_reserved`` (also capped by raw free).
+    """
+    if not torch.cuda.is_available():
+        return 0
+    resolved = resolve_device(device)
+    if resolved.type != "cuda":
+        return 0
+    idx = resolved.index if resolved.index is not None else torch.cuda.current_device()
+    free_raw, _total_raw = torch.cuda.mem_get_info(idx)
+    props_total = torch.cuda.get_device_properties(idx).total_memory
+    fraction = torch.cuda.get_per_process_memory_fraction(idx)
+    reserved = torch.cuda.memory_reserved(idx)
+    under_fraction = max(0, int(fraction * props_total) - int(reserved))
+    return min(int(free_raw), under_fraction)
+
+
 def cleanup_accelerator_memory(device: DeviceSpec = None) -> None:
     """Run Python GC and release CUDA/MPS allocator caches."""
     gc.collect()

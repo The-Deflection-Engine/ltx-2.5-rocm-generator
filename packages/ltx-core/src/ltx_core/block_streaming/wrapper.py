@@ -10,9 +10,10 @@ from torch import nn
 
 from ltx_core.block_streaming.provider import WeightsProvider
 from ltx_core.block_streaming.utils import assign_tensor_to_module
+from ltx_core.model.disposable import Disposable
 
 
-class BlockStreamingWrapper(nn.Module):
+class BlockStreamingWrapper(nn.Module, Disposable):
     """Streams sequential model blocks through GPU buffer caches.
     The wrapper delegates all weight management to a :class:`WeightsProvider`
     which handles CPU-to-GPU copies, caching, LoRA fusion, and stream

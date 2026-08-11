@@ -35,8 +35,11 @@ try:
 except ImportError:
     flash_attn_interface = None
 try:
+    # FA4's cute path depends on a matching nvidia-cutlass-dsl; a newer cutlass
+    # can raise AttributeError (e.g. missing cute.core.ThrMma) rather than
+    # ImportError — treat any probe failure as "FA4 unavailable".
     from flash_attn.cute import flash_attn_func as flash_attn_4_func
-except ImportError:
+except Exception:
     flash_attn_4_func = None
 try:
     # macOS only: routes SDPA to Apple's prebuilt MPSGraph attention kernel.

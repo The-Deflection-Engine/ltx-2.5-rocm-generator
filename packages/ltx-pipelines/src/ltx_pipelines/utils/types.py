@@ -101,13 +101,29 @@ class ModalitySpec:
     Carries everything needed to build the initial noised latent state
     and run the denoising loop for a single modality (video or audio).
     Tools are created by ``DiffusionStage`` from pixel-space dimensions.
+    ``frozen=True`` zeros the denoise mask and marks the resulting ``LatentState``
+    so ``Modality.sigma`` is forced to 0 (not only per-token timesteps).
     """
 
-    context: torch.Tensor
+    context: torch.Tensor | None = None
     conditionings: list[ConditioningItem] = field(default_factory=list)
     noise_scale: float = 1.0
     frozen: bool = False
     initial_latent: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class AutoDuration:
+    """Request auto-predicted duration, clamped to ``[min_seconds, max_seconds]``.
+    The predicted duration is converted to a frame count snapped to the VAE's causal
+    temporal grid (``8k + 1``). Defaults: 1s and 20s.
+    """
+
+    min_seconds: float = 1.0
+    max_seconds: float = 20.0
+
+
+DEFAULT_AUTO_DURATION = AutoDuration()
 
 
 class OffloadMode(Enum):

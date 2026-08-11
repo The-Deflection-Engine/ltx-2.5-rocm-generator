@@ -190,10 +190,6 @@ class PrecomputedDataset(Dataset):
             raise ValueError(f"No data files found in {data_path}")
         data_files.sort()
 
-        # Log source sizes
-        for dir_name, (paths, _) in glob_results.items():
-            logger.debug(f"Source {dir_name}: {len(paths)} files")
-
         # Build path sets for non-primary sources
         other_path_sets = {
             dir_name: path_set for dir_name, (_, path_set) in glob_results.items() if dir_name != data_key
@@ -221,9 +217,7 @@ class PrecomputedDataset(Dataset):
 
         skipped = len(data_files) - valid_count
         if skipped > 0:
-            logger.info(f"Fast index: {valid_count} valid samples from {len(data_files)} total ({skipped} skipped)")
-        else:
-            logger.debug(f"Fast index: {valid_count} valid samples from {len(data_files)} total")
+            logger.info(f"Skipped {skipped} invalid samples from {len(data_files)} total")
 
         return sample_files
 

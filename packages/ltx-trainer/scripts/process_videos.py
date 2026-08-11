@@ -9,7 +9,7 @@ This module provides functionality for processing video and image files, includi
 - BucketSampler for grouping videos by resolution
 Can be used as a standalone script:
     python scripts/process_videos.py dataset.csv --resolution-buckets 768x768x25 \
-        --output-dir /path/to/output --model-source /path/to/ltx2.safetensors
+        --output-dir /path/to/output --model-path /path/to/ltx-checkpoint.safetensors
 """
 
 import json
@@ -45,9 +45,15 @@ from torchvision.transforms.functional import resize as tv_resize
 from transformers.utils.logging import disable_progress_bar
 
 from ltx_core.model.audio_vae import AudioProcessor
-from ltx_core.types import Audio
+from ltx_core.types import VIDEO_SCALE_FACTORS, Audio, SpatioTemporalScaleFactors
 from ltx_trainer import logger
-from ltx_trainer.model_loader import load_audio_vae_encoder, load_video_vae_encoder
+from ltx_trainer.model_loader import (
+    load_audio_vae_encoder,
+    load_video_vae_encoder,
+    read_video_scale_factors,
+    resolve_audio_vae_path,
+    resolve_video_vae_path,
+)
 from ltx_trainer.utils import open_image_as_srgb
 from ltx_trainer.video_utils import get_video_frame_count, read_video
 
@@ -55,10 +61,6 @@ disable_progress_bar()
 
 # Register HEIF/HEIC support
 register_heif_opener()
-
-# Constants for validation
-VAE_SPATIAL_FACTOR = 32
-VAE_TEMPORAL_FACTOR = 8
 
 # Audio constants
 AUDIO_LATENT_CHANNELS = 8
@@ -397,6 +399,8 @@ def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
     resolution_buckets: list[tuple[int, int, int]],
     output_dir: str,
     model_path: str,
+    video_vae_path: str | None = None,
+    audio_vae_path: str | None = None,
     main_media_column: str | None = None,
     reshape_mode: str = "center",
     batch_size: int = 1,
@@ -432,6 +436,10 @@ def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
             changed parameters (different model, resolution, etc.) so stale outputs are replaced.
         temporal_subsample_factor: Factor for VAE-aligned temporal subsampling of reference videos
     """
+    video_vae_path = resolve_video_vae_path(model_path, video_vae_path)
+    # Video VAE compression factors, derived from the checkpoint config (default 32x32x8).
+    scale_factors = read_video_scale_factors(video_vae_path)
+
     # Validate temporal subsampling compatibility with resolution buckets
     if temporal_subsample_factor > 1:
         for frames, _h, _w in resolution_buckets:
@@ -443,10 +451,10 @@ def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
                     f"(frames - 1) must be divisible by the factor."
                 )
             subsampled = 1 + pixel_frames_minus_one // temporal_subsample_factor
-            if (subsampled - 1) % VAE_TEMPORAL_FACTOR != 0:
+            if (subsampled - 1) % scale_factors.time != 0:
                 raise ValueError(
                     f"After temporal subsampling {frames} → {subsampled} frames, "
-                    f"result does not satisfy (frames - 1) % {VAE_TEMPORAL_FACTOR} == 0."
+                    f"result does not satisfy (frames - 1) % {scale_factors.time} == 0."
                 )
 
     if with_audio and audio_output_dir is None:
@@ -497,15 +505,17 @@ def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
     if dataloader is None:
         return
 
-    with console.status(f"[bold]Loading video VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
-        vae = load_video_vae_encoder(model_path, device=torch_device, dtype=torch.bfloat16)
+    with console.status(f"[bold]Loading video VAE encoder from [cyan]{video_vae_path}[/]...", spinner="dots"):
+        vae = load_video_vae_encoder(video_vae_path, device=torch_device, dtype=torch.bfloat16)
 
     audio_vae_encoder = None
     audio_processor = None
     if with_audio:
-        with console.status(f"[bold]Loading audio VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
+        # Resolved here so a video-only run never has to name a split pack's audio VAE.
+        audio_vae_path = resolve_audio_vae_path(model_path, audio_vae_path)
+        with console.status(f"[bold]Loading audio VAE encoder from [cyan]{audio_vae_path}[/]...", spinner="dots"):
             audio_vae_encoder = load_audio_vae_encoder(
-                checkpoint_path=model_path,
+                checkpoint_path=audio_vae_path,
                 device=torch_device,
                 dtype=torch.float32,  # Audio VAE needs float32 for quality. TODO: re-test with bfloat16.
             )
@@ -539,7 +549,9 @@ def compute_latents(  # noqa: PLR0912, PLR0913, PLR0915
 
             # Encode video
             with torch.inference_mode():
-                video_latent_data = _encode_video(vae=vae, video=video, use_tiling=vae_tiling)
+                video_latent_data = _encode_video(
+                    vae=vae, video=video, use_tiling=vae_tiling, scale_factors=scale_factors
+                )
 
             # Save latents for each item in batch
             for i in range(len(batch["relative_path"])):
@@ -611,6 +623,7 @@ def _encode_video(
     use_tiling: bool = False,
     tile_size: int = DEFAULT_TILE_SIZE,
     tile_overlap: int = DEFAULT_TILE_OVERLAP,
+    scale_factors: SpatioTemporalScaleFactors = VIDEO_SCALE_FACTORS,
 ) -> dict[str, torch.Tensor | int]:
     """Encode video into non-patchified latent representation.
     Args:
@@ -619,8 +632,9 @@ def _encode_video(
                This is the format expected by the VAE encoder.
         dtype: Target dtype for output latents
         use_tiling: Whether to use spatial tiling for memory efficiency
-        tile_size: Tile size in pixels (must be divisible by 32)
-        tile_overlap: Overlap between tiles in pixels (must be divisible by 32)
+        tile_size: Tile size in pixels (must be divisible by the VAE spatial factor)
+        tile_overlap: Overlap between tiles in pixels (must be divisible by the VAE spatial factor)
+        scale_factors: Video VAE spatiotemporal compression factors (default 32x32x8)
     Returns:
         Dict containing non-patchified latents and shape information:
         {
@@ -646,6 +660,7 @@ def _encode_video(
             video=video,
             tile_size=tile_size,
             tile_overlap=tile_overlap,
+            scale_factors=scale_factors,
         )
     else:
         # Encode video - VAE expects [B, C, F, H, W], returns [B, C, F', H', W']
@@ -669,6 +684,7 @@ def _tiled_encode_video(  # noqa: PLR0912, PLR0915
     video: torch.Tensor,
     tile_size: int = DEFAULT_TILE_SIZE,
     tile_overlap: int = DEFAULT_TILE_OVERLAP,
+    scale_factors: SpatioTemporalScaleFactors = VIDEO_SCALE_FACTORS,
 ) -> torch.Tensor:
     """Encode video using spatial tiling for memory efficiency.
     Splits the video into overlapping spatial tiles, encodes each tile separately,
@@ -685,11 +701,14 @@ def _tiled_encode_video(  # noqa: PLR0912, PLR0915
     device = video.device
     dtype = video.dtype
 
+    # Spatial tiling assumes a square spatial compression (height factor == width factor).
+    spatial_factor = scale_factors.height
+
     # Validate tile parameters
-    if tile_size % VAE_SPATIAL_FACTOR != 0:
-        raise ValueError(f"tile_size must be divisible by {VAE_SPATIAL_FACTOR}, got {tile_size}")
-    if tile_overlap % VAE_SPATIAL_FACTOR != 0:
-        raise ValueError(f"tile_overlap must be divisible by {VAE_SPATIAL_FACTOR}, got {tile_overlap}")
+    if tile_size % spatial_factor != 0:
+        raise ValueError(f"tile_size must be divisible by {spatial_factor}, got {tile_size}")
+    if tile_overlap % spatial_factor != 0:
+        raise ValueError(f"tile_overlap must be divisible by {spatial_factor}, got {tile_overlap}")
     if tile_overlap >= tile_size:
         raise ValueError(f"tile_overlap ({tile_overlap}) must be less than tile_size ({tile_size})")
 
@@ -697,14 +716,13 @@ def _tiled_encode_video(  # noqa: PLR0912, PLR0915
     if height <= tile_size and width <= tile_size:
         return vae(video)
 
-    # Calculate output dimensions
-    # VAE compresses: H -> H/32, W -> W/32, F -> 1 + (F-1)/8
-    output_height = height // VAE_SPATIAL_FACTOR
-    output_width = width // VAE_SPATIAL_FACTOR
-    output_frames = 1 + (frames - 1) // VAE_TEMPORAL_FACTOR
+    # Calculate output dimensions from the VAE compression factors
+    # (e.g. the default 32x32x8: H -> H/32, W -> W/32, F -> 1 + (F-1)/8)
+    output_height = height // scale_factors.height
+    output_width = width // scale_factors.width
+    output_frames = 1 + (frames - 1) // scale_factors.time
 
-    # Latent channels (128 for LTX-2)
-    # Get from a small test encode or assume 128
+    # Latent channels are 128 across all supported VAE variants.
     latent_channels = 128
 
     # Initialize output and weight tensors
@@ -738,8 +756,8 @@ def _tiled_encode_video(  # noqa: PLR0912, PLR0915
     w_positions = sorted(set(w_positions))
 
     # Overlap in latent space
-    overlap_out_h = tile_overlap // VAE_SPATIAL_FACTOR
-    overlap_out_w = tile_overlap // VAE_SPATIAL_FACTOR
+    overlap_out_h = tile_overlap // scale_factors.height
+    overlap_out_w = tile_overlap // scale_factors.width
 
     # Process each tile
     for h_pos in h_positions:
@@ -750,11 +768,11 @@ def _tiled_encode_video(  # noqa: PLR0912, PLR0915
             h_end = min(h_start + tile_size, height)
             w_end = min(w_start + tile_size, width)
 
-            # Ensure tile dimensions are divisible by VAE_SPATIAL_FACTOR
-            tile_h = ((h_end - h_start) // VAE_SPATIAL_FACTOR) * VAE_SPATIAL_FACTOR
-            tile_w = ((w_end - w_start) // VAE_SPATIAL_FACTOR) * VAE_SPATIAL_FACTOR
+            # Ensure tile dimensions are divisible by the VAE spatial factor
+            tile_h = ((h_end - h_start) // scale_factors.height) * scale_factors.height
+            tile_w = ((w_end - w_start) // scale_factors.width) * scale_factors.width
 
-            if tile_h < VAE_SPATIAL_FACTOR or tile_w < VAE_SPATIAL_FACTOR:
+            if tile_h < scale_factors.height or tile_w < scale_factors.width:
                 continue
 
             # Adjust end positions
@@ -771,8 +789,8 @@ def _tiled_encode_video(  # noqa: PLR0912, PLR0915
             _, _, tile_out_frames, tile_out_height, tile_out_width = encoded_tile.shape
 
             # Calculate output positions
-            out_h_start = h_start // VAE_SPATIAL_FACTOR
-            out_w_start = w_start // VAE_SPATIAL_FACTOR
+            out_h_start = h_start // scale_factors.height
+            out_w_start = w_start // scale_factors.width
             out_h_end = min(out_h_start + tile_out_height, output_height)
             out_w_end = min(out_w_start + tile_out_width, output_width)
 
@@ -909,6 +927,7 @@ def compute_video_masks(
     output_dir: str,
     main_media_column: str | None = None,
     overwrite: bool = False,
+    scale_factors: SpatioTemporalScaleFactors = VIDEO_SCALE_FACTORS,
 ) -> None:
     """Preprocess video mask files to latent-space binary masks.
     For each sample, loads the mask video/image, applies the same spatial
@@ -921,6 +940,8 @@ def compute_video_masks(
             spatial/temporal metadata to ensure mask alignment).
         output_dir: Directory to save mask .pt files.
         main_media_column: Column for output file naming (defaults to mask_column).
+        scale_factors: Video VAE spatiotemporal compression factors (default 32x32x8),
+            used to map latent mask dimensions back to pixel space and downsample.
     """
     dataset_path = Path(dataset_file)
     data_root = dataset_path.parent
@@ -949,9 +970,9 @@ def compute_video_masks(
         latent_f = target_meta["num_frames"]
         latent_h = target_meta["height"]
         latent_w = target_meta["width"]
-        pixel_h = latent_h * VAE_SPATIAL_FACTOR
-        pixel_w = latent_w * VAE_SPATIAL_FACTOR
-        pixel_f = (latent_f - 1) * VAE_TEMPORAL_FACTOR + 1
+        pixel_h = latent_h * scale_factors.height
+        pixel_w = latent_w * scale_factors.width
+        pixel_f = (latent_f - 1) * scale_factors.time + 1
 
         # Load mask as video or image
         if mask_file.suffix.lower() in IMAGE_FILE_EXTENSIONS:
@@ -967,16 +988,16 @@ def compute_video_masks(
             mask_pixels = frames
 
         # Downsample to latent dims: [F, H, W] → [F', H', W']
-        mask_latent = torch.nn.functional.avg_pool2d(mask_pixels.unsqueeze(1), kernel_size=VAE_SPATIAL_FACTOR).squeeze(
-            1
-        )  # [F, H', W'] → spatial done
-        # Temporal: max-pool over groups of VAE_TEMPORAL_FACTOR frames (any masked frame masks the group)
+        mask_latent = torch.nn.functional.avg_pool2d(
+            mask_pixels.unsqueeze(1), kernel_size=scale_factors.height
+        ).squeeze(1)  # [F, H', W'] → spatial done
+        # Temporal: max-pool over groups of scale_factors.time frames (any masked frame masks the group)
         f_spatial = mask_latent.shape[0]
-        pad_f = (VAE_TEMPORAL_FACTOR - f_spatial % VAE_TEMPORAL_FACTOR) % VAE_TEMPORAL_FACTOR
+        pad_f = (scale_factors.time - f_spatial % scale_factors.time) % scale_factors.time
         if pad_f > 0:
             mask_latent = torch.nn.functional.pad(mask_latent, (0, 0, 0, 0, 0, pad_f))
         h_prime, w_prime = mask_latent.shape[1], mask_latent.shape[2]
-        mask_latent = mask_latent.reshape(-1, VAE_TEMPORAL_FACTOR, h_prime, w_prime).amax(dim=1)[:latent_f]
+        mask_latent = mask_latent.reshape(-1, scale_factors.time, h_prime, w_prime).amax(dim=1)[:latent_f]
 
         # Binarize
         mask_latent = (mask_latent > 0.5).float()
@@ -1065,6 +1086,7 @@ def compute_audio_latents(  # noqa: PLR0915
     audio_column: str,
     output_dir: str,
     model_path: str,
+    audio_vae_path: str | None = None,
     main_media_column: str | None = None,
     max_duration: float | None = None,
     duration_buckets: list[float] | None = None,
@@ -1103,9 +1125,10 @@ def compute_audio_latents(  # noqa: PLR0915
         _load_paths_from_dataset(dataset_path, naming_column) if naming_column != audio_column else audio_paths
     )
 
-    with console.status(f"[bold]Loading audio VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
+    audio_vae_path = resolve_audio_vae_path(model_path, audio_vae_path)
+    with console.status(f"[bold]Loading audio VAE encoder from [cyan]{audio_vae_path}[/]...", spinner="dots"):
         audio_vae_encoder = load_audio_vae_encoder(
-            checkpoint_path=model_path,
+            checkpoint_path=audio_vae_path,
             device=torch_device,
             dtype=torch.float32,
         )
@@ -1263,21 +1286,28 @@ def detect_dataset_columns(dataset_file: str | Path) -> set[str]:
     return set()
 
 
-def parse_resolution_buckets(resolution_buckets_str: str) -> list[tuple[int, int, int]]:
-    """Parse resolution buckets from string format to list of tuples (frames, height, width)"""
+def parse_resolution_buckets(
+    resolution_buckets_str: str,
+    scale_factors: SpatioTemporalScaleFactors = VIDEO_SCALE_FACTORS,
+) -> list[tuple[int, int, int]]:
+    """Parse resolution buckets from string format to list of tuples (frames, height, width).
+    ``scale_factors`` are the video VAE's spatiotemporal compression factors (default 32x32x8);
+    width/height must be multiples of the spatial factors and frames must satisfy
+    ``f % scale_factors.time == 1``.
+    """
     resolution_buckets = []
     for bucket_str in resolution_buckets_str.split(";"):
         w, h, f = map(int, bucket_str.split("x"))
 
-        if w % VAE_SPATIAL_FACTOR != 0 or h % VAE_SPATIAL_FACTOR != 0:
+        if w % scale_factors.width != 0 or h % scale_factors.height != 0:
             raise typer.BadParameter(
-                f"Width and height must be multiples of {VAE_SPATIAL_FACTOR}, got {w}x{h}",
+                f"Width and height must be multiples of {scale_factors.width}x{scale_factors.height}, got {w}x{h}",
                 param_hint="resolution-buckets",
             )
 
-        if f % VAE_TEMPORAL_FACTOR != 1:
+        if f % scale_factors.time != 1:
             raise typer.BadParameter(
-                f"Number of frames must be a multiple of {VAE_TEMPORAL_FACTOR} plus 1, got {f}",
+                f"Number of frames must be a multiple of {scale_factors.time} plus 1, got {f}",
                 param_hint="resolution-buckets",
             )
 
@@ -1288,8 +1318,12 @@ def parse_resolution_buckets(resolution_buckets_str: str) -> list[tuple[int, int
 def compute_scaled_resolution_buckets(
     resolution_buckets: list[tuple[int, int, int]],
     scale_factor: int,
+    scale_factors: SpatioTemporalScaleFactors = VIDEO_SCALE_FACTORS,
 ) -> list[tuple[int, int, int]]:
-    """Compute scaled resolution buckets and validate the results."""
+    """Compute scaled resolution buckets and validate the results.
+    ``scale_factors`` are the video VAE's spatiotemporal compression factors (default 32x32x8),
+    used to check the post-scale dimensions are still VAE-aligned.
+    """
     if scale_factor == 1:
         return resolution_buckets
 
@@ -1311,16 +1345,16 @@ def compute_scaled_resolution_buckets(
         scaled_width = width // scale_factor
 
         # Validate scaled dimensions are divisible by VAE spatial factor
-        if scaled_height % VAE_SPATIAL_FACTOR != 0:
+        if scaled_height % scale_factors.height != 0:
             raise ValueError(
                 f"Scaled height {scaled_height} (from {height} / {scale_factor}) "
-                f"is not divisible by {VAE_SPATIAL_FACTOR}. "
+                f"is not divisible by {scale_factors.height}. "
                 f"Choose a different scale factor or adjust your resolution buckets."
             )
-        if scaled_width % VAE_SPATIAL_FACTOR != 0:
+        if scaled_width % scale_factors.width != 0:
             raise ValueError(
                 f"Scaled width {scaled_width} (from {width} / {scale_factor}) "
-                f"is not divisible by {VAE_SPATIAL_FACTOR}. "
+                f"is not divisible by {scale_factors.width}. "
                 f"Choose a different scale factor or adjust your resolution buckets."
             )
 
@@ -1378,7 +1412,15 @@ def main(  # noqa: PLR0913
     ),
     model_path: str = typer.Option(
         ...,
-        help="Path to LTX-2 checkpoint (.safetensors file)",
+        help="Path to the unified checkpoint or split transformer safetensors",
+    ),
+    video_vae_path: str | None = typer.Option(
+        default=None,
+        help="Split-pack video VAE safetensors (defaults to --model-path for unified checkpoints)",
+    ),
+    audio_vae_path: str | None = typer.Option(
+        default=None,
+        help="Split-pack audio VAE safetensors (defaults to --model-path for unified checkpoints)",
     ),
     video_column: str = typer.Option(
         default="media_path",
@@ -1423,16 +1465,16 @@ def main(  # noqa: PLR0913
     Examples:
         # Process videos from a CSV file
         python scripts/process_videos.py dataset.csv --resolution-buckets 768x768x25 \\
-            --output-dir ./latents --model-path /path/to/ltx2.safetensors
+            --output-dir ./latents --model-path /path/to/ltx-checkpoint.safetensors
         # Process videos from a JSON file with custom video column
         python scripts/process_videos.py dataset.json --resolution-buckets 768x768x25 \\
-            --output-dir ./latents --model-path /path/to/ltx2.safetensors --video-column "video_path"
+            --output-dir ./latents --model-path /path/to/ltx-checkpoint.safetensors --video-column "video_path"
         # Enable VAE tiling to save GPU VRAM
         python scripts/process_videos.py dataset.csv --resolution-buckets 1024x1024x25 \\
-            --output-dir ./latents --model-path /path/to/ltx2.safetensors --vae-tiling
+            --output-dir ./latents --model-path /path/to/ltx-checkpoint.safetensors --vae-tiling
         # Process videos with audio
         python scripts/process_videos.py dataset.csv --resolution-buckets 768x768x25 \\
-            --output-dir ./latents --model-path /path/to/ltx2.safetensors \\
+            --output-dir ./latents --model-path /path/to/ltx-checkpoint.safetensors \\
             --with-audio --audio-output-dir ./audio_latents
     """
 
@@ -1444,8 +1486,9 @@ def main(  # noqa: PLR0913
     if with_audio and audio_output_dir is None:
         raise typer.BadParameter("--audio-output-dir is required when --with-audio is set")
 
-    # Parse resolution buckets
-    parsed_resolution_buckets = parse_resolution_buckets(resolution_buckets)
+    # Parse resolution buckets, validating against the checkpoint's VAE compression factors.
+    scale_factors = read_video_scale_factors(resolve_video_vae_path(model_path, video_vae_path))
+    parsed_resolution_buckets = parse_resolution_buckets(resolution_buckets, scale_factors)
 
     if len(parsed_resolution_buckets) > 1:
         logger.warning(
@@ -1460,6 +1503,8 @@ def main(  # noqa: PLR0913
         resolution_buckets=parsed_resolution_buckets,
         output_dir=output_dir,
         model_path=model_path,
+        video_vae_path=video_vae_path,
+        audio_vae_path=audio_vae_path,
         reshape_mode=reshape_mode,
         batch_size=batch_size,
         device=device,

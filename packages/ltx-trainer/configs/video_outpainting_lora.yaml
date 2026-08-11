@@ -28,13 +28,18 @@
 # -----------------------------------------------------------------------------
 # Specifies the base model to fine-tune and the training mode.
 model:
-  # Path to the LTX-2 model checkpoint (.safetensors file)
-  # This should be a local path to your downloaded model
+  # The LTX model checkpoint. A unified checkpoint is one .safetensors holding every
+  # component; a split pack ships one file per component, and this names its transformer.
   model_path: "path/to/ltx-2-model.safetensors"
 
-  # Path to the text encoder model directory
-  # For LTX-2, this is typically the Gemma-based text encoder
+  # The Gemma text encoder: a model directory for a unified checkpoint, or the packed
+  # text-encoder .safetensors for a split pack.
   text_encoder_path: "path/to/gemma-text-encoder"
+
+  # VAE components. Leave these out for a unified checkpoint — they default to model_path.
+  # A split pack's transformer carries no VAE weights, so there they are required:
+  # video_vae_path: "path/to/vae/ltx-2.5-video-vae-bf16.safetensors"
+  # audio_vae_path: "path/to/vae/ltx-2.5-audio-vae-bf16.safetensors"
 
   # Training mode: "lora" for efficient adapter training, "full" for full fine-tuning
   # LoRA is recommended for most use cases (faster, less memory, prevents overfitting)
@@ -231,15 +236,27 @@ validation:
           spatial_region: [0, 0, 288, 576]
 
   # Negative prompt to avoid unwanted artifacts
-  negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"
+  negative_prompt: >-
+    blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise,
+    grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones,
+    deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands,
+    wrong hand count, artifacts around text, inconsistent perspective, camera shake, incorrect depth of
+    field, background too sharp, background clutter, distracting reflections, harsh shadows, inconsistent
+    lighting direction, color banding, cartoonish rendering, 3D CGI look, unrealistic materials, uncanny
+    valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong gaze direction,
+    mismatched lip sync, silent or muted audio, distorted voice, robotic voice, echo, background noise,
+    off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward
+    pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting,
+    inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts.
 
   # Output video dimensions [width, height, frames]
-  # Width and height must be divisible by 32
-  # Frames must satisfy: frames % 8 == 1 (e.g., 1, 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, ...)
-  video_dims: [ 576, 576, 89 ]
+  # Width and height must be divisible by the VAE spatial factor (32 for the default VAE).
+  # Frames must satisfy frames % T == 1, where T is the VAE temporal factor
+  # (8 for the default VAE, i.e. 1, 9, 17, 25, ...).
+  video_dims: [ 960, 544, 89 ]
 
   # Frame rate for generated videos
-  frame_rate: 25.0
+  frame_rate: 24.0
 
   # Random seed for reproducible validation outputs
   seed: 42
@@ -252,15 +269,29 @@ validation:
   # Set to null to disable validation during training
   interval: 100
 
-  # Classifier-free guidance scale
-  # Higher values = stronger adherence to prompt but may introduce artifacts
-  guidance_scale: 4.0
+  # Video CFG scale for validation sampling
+  video_cfg_scale: 3.0
 
-  # STG (Spatio-Temporal Guidance) parameters for improved video quality
-  # STG is combined with CFG for better temporal coherence
-  stg_scale: 1.0  # Recommended: 1.0 (0.0 disables STG)
-  stg_blocks: [29]  # Recommended: single block 29
-  stg_mode: "stg_v"  # "stg_v" for video-only validation
+  # Audio CFG scale for validation sampling
+  audio_cfg_scale: 7.0
+
+  # Video STG scale; set to 0.0 to disable video STG
+  video_stg_scale: 1.0
+
+  # Audio STG scale; set to 0.0 to disable audio STG
+  audio_stg_scale: 1.0
+
+  # Transformer blocks perturbed for STG
+  stg_blocks: [28]
+
+  # Guidance variance rescale; set to 0.0 to disable
+  guidance_rescale: 0.7
+
+  # Video modality guidance scale for audio-to-video isolation guidance
+  video_modality_guidance_scale: 1.0
+
+  # Audio modality guidance scale for video-to-audio isolation guidance
+  audio_modality_guidance_scale: 3.0
 
   # Video outpainting trains video only; do not generate validation audio.
   generate_audio: false

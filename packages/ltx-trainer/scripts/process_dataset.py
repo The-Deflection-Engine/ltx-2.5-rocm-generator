@@ -15,7 +15,7 @@ Convention table:
 Legacy aliases: media_path → video, ref_media_path → reference_video
 Basic usage:
     python scripts/process_dataset.py /path/to/dataset.json --resolution-buckets 768x768x49 \\
-        --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma
+        --model-path /path/to/ltx-checkpoint.safetensors --text-encoder-path /path/to/gemma-root
 """
 
 from pathlib import Path
@@ -36,13 +36,14 @@ from rich.console import Console
 
 from ltx_trainer import logger
 from ltx_trainer.gpu_utils import free_gpu_memory_context
+from ltx_trainer.model_loader import read_video_scale_factors, resolve_video_vae_path
 
 console = Console()
 
 app = typer.Typer(
     pretty_exceptions_enable=False,
     no_args_is_help=True,
-    help="Preprocess a media dataset for LTX-2 training. "
+    help="Preprocess a media dataset for LTX family training. "
     "Automatically detects columns (video, audio, reference_video, reference_audio, caption) "
     "and processes each with the appropriate encoder.",
 )
@@ -57,6 +58,8 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
     model_path: str,
     text_encoder_path: str,
     device: str,
+    video_vae_path: str | None = None,
+    audio_vae_path: str | None = None,
     output_dir: str | None = None,
     video_column: str | None = None,
     caption_column: str | None = None,
@@ -74,6 +77,12 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
 ) -> None:
     """Run the preprocessing pipeline with convention-based column detection."""
     _validate_dataset_file(dataset_file)
+
+    # Video VAE compression factors, derived from the checkpoint config (default 32x32x8).
+    # audio_vae_path stays unresolved and is passed through as-is: the phases below resolve it
+    # only when they actually encode audio, so a video-only run needs no audio VAE.
+    video_vae_path = resolve_video_vae_path(model_path, video_vae_path)
+    scale_factors = read_video_scale_factors(video_vae_path)
 
     # Detect columns and resolve roles
     dataset_columns = detect_dataset_columns(dataset_file)
@@ -142,6 +151,8 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
                 resolution_buckets=resolution_buckets,
                 output_dir=str(output_base / "latents"),
                 model_path=model_path,
+                video_vae_path=video_vae_path,
+                audio_vae_path=audio_vae_path,
                 batch_size=batch_size,
                 device=device,
                 vae_tiling=vae_tiling,
@@ -161,7 +172,9 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
                     "When using --reference-temporal-scale-factor > 1, only a single resolution bucket is supported."
                 )
 
-            reference_buckets = compute_scaled_resolution_buckets(resolution_buckets, reference_downscale_factor)
+            reference_buckets = compute_scaled_resolution_buckets(
+                resolution_buckets, reference_downscale_factor, scale_factors
+            )
             if reference_downscale_factor > 1:
                 logger.info(f"Processing reference videos at 1/{reference_downscale_factor} resolution...")
             if reference_temporal_scale_factor > 1:
@@ -178,6 +191,8 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
                     resolution_buckets=reference_buckets,
                     output_dir=str(output_base / "reference_latents"),
                     model_path=model_path,
+                    video_vae_path=video_vae_path,
+                    audio_vae_path=audio_vae_path,
                     batch_size=batch_size,
                     device=device,
                     vae_tiling=vae_tiling,
@@ -193,6 +208,7 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
             latents_dir=str(output_base / "latents"),
             output_dir=str(output_base / "video_masks"),
             main_media_column=roles["video"],
+            scale_factors=scale_factors,
         )
 
     # --- Phase 3: Audio VAE (audio, reference_audio) ---
@@ -218,6 +234,7 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
                     audio_column=roles[role],
                     output_dir=str(output_base / output_subdir),
                     model_path=model_path,
+                    audio_vae_path=audio_vae_path,
                     main_media_column=roles.get("video"),
                     max_duration=max_audio_duration,
                     duration_buckets=audio_duration_buckets,
@@ -242,7 +259,14 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
     # --- Decode for verification ---
     if decode:
         logger.info("Decoding latents for verification...")
-        decoder = LatentsDecoder(model_path=model_path, device=device, vae_tiling=vae_tiling, with_audio=has_audio)
+        decoder = LatentsDecoder(
+            model_path=model_path,
+            video_vae_path=video_vae_path,
+            audio_vae_path=audio_vae_path,
+            device=device,
+            vae_tiling=vae_tiling,
+            with_audio=has_audio,
+        )
         if has_video:
             decoder.decode(output_base / "latents", output_base / "decoded_videos")
         if "reference_video" in roles and (output_base / "reference_latents").exists():
@@ -300,11 +324,19 @@ def main(  # noqa: PLR0913
     ),
     model_path: str = typer.Option(
         ...,
-        help="Path to LTX-2 checkpoint (.safetensors file)",
+        help="Path to the unified checkpoint or split transformer safetensors",
     ),
     text_encoder_path: str = typer.Option(
         ...,
-        help="Path to Gemma text encoder directory",
+        help="Path to the matching Gemma directory or packed text-encoder safetensors",
+    ),
+    video_vae_path: str | None = typer.Option(
+        default=None,
+        help="Split-pack video VAE safetensors (defaults to --model-path for unified checkpoints)",
+    ),
+    audio_vae_path: str | None = typer.Option(
+        default=None,
+        help="Split-pack audio VAE safetensors (defaults to --model-path for unified checkpoints)",
     ),
     caption_column: str | None = typer.Option(
         default=None,
@@ -376,9 +408,11 @@ def main(  # noqa: PLR0913
         "changed parameters (different model, resolution, etc.) so stale outputs are replaced.",
     ),
 ) -> None:
-    """Preprocess a media dataset for LTX-2 training.
+    """Preprocess a media dataset for LTX family training.
     See module docstring for the convention table. Audio is auto-extracted from
     video files by default — use --skip-audio to disable.
+    Checkpoint architecture and VAE factors are detected automatically. When switching
+    checkpoint or Gemma versions, use a fresh output directory or --overwrite.
     For multi-GPU preprocessing, invoke under ``accelerate launch`` -- each process
     will handle an interleaved shard of the dataset.
     """
@@ -388,7 +422,8 @@ def main(  # noqa: PLR0913
             "--with-audio is deprecated. Audio extraction is now on by default. Use --skip-audio to disable."
         )
 
-    parsed_buckets = parse_resolution_buckets(resolution_buckets) if resolution_buckets else None
+    scale_factors = read_video_scale_factors(resolve_video_vae_path(model_path, video_vae_path))
+    parsed_buckets = parse_resolution_buckets(resolution_buckets, scale_factors) if resolution_buckets else None
 
     if parsed_buckets and len(parsed_buckets) > 1:
         logger.warning("Using multiple resolution buckets. Training batch size must be 1.")
@@ -411,6 +446,8 @@ def main(  # noqa: PLR0913
         model_path=model_path,
         text_encoder_path=text_encoder_path,
         device=device,
+        video_vae_path=video_vae_path,
+        audio_vae_path=audio_vae_path,
         output_dir=output_dir,
         video_column=video_column,
         caption_column=caption_column,

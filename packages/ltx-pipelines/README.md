@@ -6,7 +6,8 @@ Pipelines are built using building blocks from [`ltx-core`](../ltx-core/) (sched
 
 **Key Features:**
 
-- 🎬 **Multiple Pipeline Types**: Text-to-video, image-to-video, video-to-video, audio-to-video, keyframe interpolation, and retake
+- 🎬 **Multiple Pipeline Types**: Text-to-video, image-to-video, video-to-video, audio-to-video, keyframe interpolation, detail-fidelity rendering, and retake
+- 🎥 **HDR / EXR**: Native `--hdr` EXR conditioning with EXR + BT.2020/HLG output, plus dedicated HDR IC-LoRA
 - ⚡ **Optimized Performance**: Support for FP8 transformers, gradient estimation, and memory optimization
 - 🎯 **Production Ready**: Two-stage pipelines for best quality output
 - 🔧 **LoRA Support**: Easy integration with trained LoRA adapters
@@ -39,6 +40,7 @@ See [Installation & Usage](docs/installation.md) for full setup, CLI modules, an
 | [Pipeline Selection Guide](docs/pipeline-selection.md) | Decision tree + feature comparison to pick the right pipeline |
 | [Available Pipelines](docs/pipelines.md) | Full reference for all 11 pipelines |
 | [Conditioning Types](docs/conditioning.md) | Image and video conditioning methods |
+| [HDR Support](docs/hdr.md) | Native EXR/`--hdr` colour spaces, I/O, and examples |
 | [Multimodal Guidance](docs/multimodal-guidance.md) | CFG / STG / modality guidance parameters and tuning |
 | [Optimization Tips](docs/optimization.md) | FP8 quantization, `torch.compile`, gradient estimation |
 | [Multi-GPU Inference](docs/multigpu/README.md) | Run a single generation across GPUs for latency (SP, TDP, distributed VAE, distributed Gemma) |

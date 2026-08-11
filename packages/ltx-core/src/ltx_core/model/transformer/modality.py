@@ -38,6 +38,13 @@ class Modality:
             attention. ``None`` means unrestricted (full) attention between
             all tokens. Built incrementally by conditioning items; see
             :class:`~ltx_core.conditioning.types.attention_strength_wrapper.ConditioningItemAttentionStrengthWrapper`.
+        keyframes_mask: Optional per-token marker, shape ``(B, T, 1)`` -- the same layout as
+            ``timesteps`` -- non-zero for tokens whose latent encodes a *single standalone pixel
+            frame* rather than the usual multi-frame span. That is the target's first latent frame
+            (the video encoder is causal) plus any generated keyframe slots. Selects the tokens
+            that receive the model's learned keyframe absolute-position embedding. ``None`` means
+            no token is marked, which is also the effective behaviour of every model built without
+            ``use_keyframes_abs_pos_embedding``.
     """
 
     latent: (
@@ -53,6 +60,7 @@ class Modality:
     enabled: bool = True
     context_mask: torch.Tensor | None = None
     attention_mask: torch.Tensor | None = None
+    keyframes_mask: torch.Tensor | None = None  # Shape: (B, T, 1), non-zero on single-pixel-frame latents
 
     def split(self, sizes: list[int]) -> list[Modality]:
         """Split along the batch dimension into chunks of the given sizes."""

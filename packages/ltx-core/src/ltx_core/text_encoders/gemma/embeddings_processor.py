@@ -3,6 +3,7 @@ from typing import NamedTuple
 import torch
 from torch import nn
 
+from ltx_core.model.disposable import Disposable
 from ltx_core.text_encoders.gemma.embeddings_connector import Embeddings1DConnector
 
 
@@ -47,7 +48,7 @@ def _to_binary_mask(encoded_mask: torch.Tensor, lead_shape: tuple[int, int]) -> 
     return (encoded_mask < 0.000001).to(torch.int64).reshape([lead_shape[0], lead_shape[1], 1])
 
 
-class EmbeddingsProcessor(nn.Module):
+class EmbeddingsProcessor(nn.Module, Disposable):
     """Wraps feature extractor + video connector + optional audio connector.
     Can operate in two modes:
     1. create_embeddings(): Takes pre-computed features + additive mask (backward compat, used by trainer)

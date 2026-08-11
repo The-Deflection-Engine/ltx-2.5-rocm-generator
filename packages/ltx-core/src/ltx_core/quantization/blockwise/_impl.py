@@ -290,7 +290,8 @@ def _blockwise_fp8_fuse(
     scale_key = key.replace(".weight", ".weight_scale")
     if scale_key not in model_sd.sd:
         return bf16_fuse_rule(key, weight, deltas, model_sd)
-    weight_scale = model_sd.sd[scale_key]
+    # ``weight`` is already on the fusion device; companion scale may still be CPU-retained.
+    weight_scale = model_sd.sd[scale_key].to(device=weight.device)
     bf16_weight = _blockwise_dequantize_2d(weight, weight_scale)
     merged = bf16_weight + deltas.to(dtype=bf16_weight.dtype)
     new_fp8_weight, new_weight_scale = fp8_blockwise_quantize_weights_torch(merged.cuda())
@@ -321,7 +322,8 @@ def _blockwise_fp6_fuse(
     scale_key = key.replace(".weight", ".weight_scale")
     if scale_key not in model_sd.sd:
         return bf16_fuse_rule(key, weight, deltas, model_sd)
-    weight_scale = model_sd.sd[scale_key]
+    # ``weight`` is already on the fusion device; companion scale may still be CPU-retained.
+    weight_scale = model_sd.sd[scale_key].to(device=weight.device)
     # Packed shape is [out, (in // 4) * 3]; recover in_features.
     original_n = weight.shape[-1] * 4 // 3
     fp8_view = fp6_unpack_tensor(weight, original_n).view(torch.float8_e4m3fn)
@@ -358,8 +360,8 @@ class BlockwiseFP8LTXModelConfigurator(ModelConfigurator[LTXModel]):
     OPS: ClassVar[TransformerOpsConfig] = _BLOCKWISE_OPS
 
     @classmethod
-    def from_config(cls, config: dict) -> LTXModel:
-        return cls.BASE.from_config(config, ops=cls.OPS)
+    def from_metadata(cls, metadata: dict) -> LTXModel:
+        return cls.BASE.from_metadata(metadata, ops=cls.OPS)
 
 
 class BlockwiseFP8LTXVideoOnlyModelConfigurator(BlockwiseFP8LTXModelConfigurator):

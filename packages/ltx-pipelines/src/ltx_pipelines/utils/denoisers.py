@@ -51,6 +51,10 @@ def _repeat_state(state: LatentState, n: int) -> LatentState:
         positions=_repeat(state.positions),
         clean_latent=_repeat(state.clean_latent),
         attention_mask=_repeat(state.attention_mask) if state.attention_mask is not None else None,
+        keyframes_mask=_repeat(state.keyframes_mask) if state.keyframes_mask is not None else None,
+        # Token layout is identical across guidance passes, so the layout carries over unchanged.
+        generated_keyframe_layout=state.generated_keyframe_layout,
+        frozen=state.frozen,
     )
 
 
@@ -228,9 +232,19 @@ class SimpleDenoiser:
         sigmas: torch.Tensor,
         step_index: int,
     ) -> tuple[DenoisedLatentResult | None, DenoisedLatentResult | None]:
+        # Modality.sigma is (B,); expand the scalar schedule value per modality so a rank-stable
+        # sigma reaches the (compiled) block instead of a 0-d scalar that recompiles on sigma.ndim.
         sigma = sigmas[step_index]
-        pos_video = modality_from_latent_state(video_state, self.v_context, sigma) if video_state is not None else None
-        pos_audio = modality_from_latent_state(audio_state, self.a_context, sigma) if audio_state is not None else None
+        pos_video = (
+            modality_from_latent_state(video_state, self.v_context, sigma.expand(video_state.latent.shape[0]))
+            if video_state is not None
+            else None
+        )
+        pos_audio = (
+            modality_from_latent_state(audio_state, self.a_context, sigma.expand(audio_state.latent.shape[0]))
+            if audio_state is not None
+            else None
+        )
         denoised_video, denoised_audio = transformer(video=pos_video, audio=pos_audio, perturbations=None)
         return (
             DenoisedLatentResult.result_or_none(denoised=denoised_video),

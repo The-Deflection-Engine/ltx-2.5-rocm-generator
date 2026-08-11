@@ -93,6 +93,11 @@ class ModelBuilderProtocol(BuilderProtocol[BuiltType], Protocol[BuiltType]):
         ...
 
     @property
+    def keeps_gpu_resident_weights(self) -> bool:
+        """Whether rebuilds rebind the same GPU weight storages (safe for CUDA-graph capture)."""
+        ...
+
+    @property
     def model_sd_ops(self) -> SDOps | None: ...
 
     @property

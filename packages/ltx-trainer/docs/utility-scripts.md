@@ -2,6 +2,9 @@
 
 This guide covers the various utility scripts available for preprocessing, conversion, and debugging tasks.
 
+All model-processing scripts use the same automatic checkpoint detection as the trainer and support LTX-2, LTX-2.3, and LTX 2.5.
+The checkpoint and Gemma paths must refer to a compatible pair.
+
 ## 🎬 Dataset Processing Scripts
 
 ### Video Scene Splitting
@@ -87,18 +90,35 @@ For Gemini, keep `--num-workers` at 3-5 (higher values may hit API rate limits).
 
 The `scripts/process_dataset.py` script processes videos and caches latents for training.
 
+> [!IMPORTANT]
+> The examples below use a **unified checkpoint** — one `.safetensors` holding every component, plus a Gemma folder.
+> On a **split pack** (LTX 2.5, one file per component) the transformer holds no VAE weights, so every command that
+> encodes latents also needs `--video-vae-path` and `--audio-vae-path`:
+>
+> ```bash
+> uv run python scripts/process_dataset.py dataset.json \
+>     --resolution-buckets "960x544x49" \
+>     --model-path /path/to/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors \
+>     --text-encoder-path /path/to/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors \
+>     --video-vae-path /path/to/vae/ltx-2.5-video-vae-bf16.safetensors \
+>     --audio-vae-path /path/to/vae/ltx-2.5-audio-vae-bf16.safetensors
+> ```
+>
+> The same two flags apply to `process_videos.py` and `decode_latents.py`. `process_captions.py` does not need them:
+> it only runs the text encoder.
+
 ```bash
 # Basic preprocessing
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
-    --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model
+    --model-path /path/to/ltx-2.x-checkpoint.safetensors \
+    --text-encoder-path /path/to/gemma-root
 
 # With video decoding for verification
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
-    --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model \
+    --model-path /path/to/ltx-2.x-checkpoint.safetensors \
+    --text-encoder-path /path/to/gemma-root \
     --decode
 ```
 
@@ -107,12 +127,14 @@ Multiple resolution buckets can be specified, separated by `;`:
 ```bash
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49;512x512x81" \
-    --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model
+    --model-path /path/to/ltx-2.x-checkpoint.safetensors \
+    --text-encoder-path /path/to/gemma-root
 ```
 
 > [!NOTE]
 > When training with multiple resolution buckets, set `optimization.batch_size: 1`.
+> When switching between LTX-2.3 and LTX 2.5, use a fresh output directory or `--overwrite`; existing text-feature
+> `.pt` files are skipped by default and are not interchangeable between Gemma versions.
 
 **Multi-GPU preprocessing.** Launch with `accelerate launch` to shard the dataset across processes. Reruns resume
 by default (existing `.pt` outputs are skipped); writes are atomic so interrupted runs are safe. Pass `--overwrite`
@@ -124,14 +146,14 @@ so stale outputs are replaced. Use the same `accelerate launch` pattern (and `--
 # Multi-GPU preprocessing
 uv run accelerate launch --num_processes 4 scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
-    --model-path /path/to/ltx-2-model.safetensors \
-    --text-encoder-path /path/to/gemma-model
+    --model-path /path/to/ltx-2.x-checkpoint.safetensors \
+    --text-encoder-path /path/to/gemma-root
 
 # Force re-encoding of all items (e.g. after switching model or resolution)
 uv run accelerate launch --num_processes 4 scripts/process_dataset.py dataset.json \
     --resolution-buckets "960x544x49" \
-    --model-path /path/to/ltx-2.3-model.safetensors \
-    --text-encoder-path /path/to/gemma-model \
+    --model-path /path/to/ltx-2.x-checkpoint.safetensors \
+    --text-encoder-path /path/to/gemma-root \
     --overwrite
 ```
 
@@ -169,20 +191,12 @@ The `scripts/decode_latents.py` script decodes precomputed video latents back in
 
 ```bash
 # Basic usage
-uv run python scripts/decode_latents.py /path/to/latents/dir \
-    --output-dir /path/to/output \
-    --model-path /path/to/ltx-2-model.safetensors
-
-# With VAE tiling for large videos
-uv run python scripts/decode_latents.py /path/to/latents/dir \
-    --output-dir /path/to/output \
-    --model-path /path/to/ltx-2-model.safetensors \
-    --vae-tiling
+uv run python scripts/decode_latents.py /path/to/latents/dir /path/to/output \
+    --model-path /path/to/ltx-2.x-checkpoint.safetensors
 
 # Decode both video and audio latents
-uv run python scripts/decode_latents.py /path/to/latents/dir \
-    --output-dir /path/to/output \
-    --model-path /path/to/ltx-2-model.safetensors \
+uv run python scripts/decode_latents.py /path/to/latents/dir /path/to/output \
+    --model-path /path/to/ltx-2.x-checkpoint.safetensors \
     --with-audio
 ```
 

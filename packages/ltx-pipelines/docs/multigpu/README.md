@@ -50,20 +50,37 @@ The [`MGPUController`](controller.md) spawns one worker process per GPU and runs
 user-defined **runner** (a subclass of `MGPURunner`) in SPMD lockstep. A runner's
 `setup()` builds a standard pipeline, then **swaps** each block's builder for an MGPU
 builder (SP / TDP / distributed decoder / distributed Gemma). All builders share one
-`StateDictRegistry` so the checkpoint loads from disk once per process.
+`ModelRegistry` so the checkpoint loads from disk once per process.
 
 Two runners are provided, each with a CLI:
 
 - [`ltx_pipelines.ti2vid_two_stages_mgpu`](../../src/ltx_pipelines/ti2vid_two_stages_mgpu.py) — SP stage 1 + TDP stage 2 + Accelerate Gemma + distributed VAE.
 - [`ltx_pipelines.distilled_mgpu`](../../src/ltx_pipelines/distilled_mgpu.py) — SP (shared stage) + Accelerate Gemma + distributed VAE.
 
+Checkpoint paths follow the same monolith **XOR** split contract as single-GPU CLIs:
+the parser builds a `ModelPaths` object and runners read only that (see
+[installation](../installation.md#checkpoint-layouts-monolith-vs-split)). Pass either a fat checkpoint +
+Gemma directory, or the split component flags — not both.
+
 ```bash
-# Two-stage on all visible GPUs
+# Two-stage on all visible GPUs (monolith layout)
 python -m ltx_pipelines.ti2vid_two_stages_mgpu \
     --checkpoint-path path/to/checkpoint.safetensors \
     --distilled-lora path/to/distilled_lora.safetensors 1.0 \
     --spatial-upsampler-path path/to/upsampler.safetensors \
     --gemma-root path/to/gemma \
+    --prompt "A beautiful sunset over the ocean" \
+    --output-path output.mp4
+
+# Same entrypoint with a Comfy-aligned split pack (subset of flags as needed)
+python -m ltx_pipelines.ti2vid_two_stages_mgpu \
+    --transformer-path path/to/diffusion_models/ltx-….safetensors \
+    --text-encoder-path path/to/text_encoders/gemma-….safetensors \
+    --video-vae-path path/to/vae/ltx-…-video-vae.safetensors \
+    --audio-vae-path path/to/vae/ltx-…-audio-vae.safetensors \
+    --duration-head-path path/to/duration_head/ltx-….safetensors \
+    --distilled-lora path/to/distilled_lora.safetensors 1.0 \
+    --spatial-upsampler-path path/to/upsampler.safetensors \
     --prompt "A beautiful sunset over the ocean" \
     --output-path output.mp4
 ```

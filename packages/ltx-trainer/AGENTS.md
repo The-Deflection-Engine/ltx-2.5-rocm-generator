@@ -27,9 +27,15 @@ All conditioning scenarios are expressed through the unified `FlexibleStrategy` 
 
 - **LTX-2** (19B, initial audio-video model)
 - **LTX-2.3** (22B, improved text conditioning and audio quality)
+- **LTX 2.5** (22B, Gemma 4 text encoder)
 
 Version detection is fully automatic — ltx-core reads the checkpoint config and selects the correct architecture
-components. The trainer does not need version-specific code paths.
+components. The trainer does not need version-specific code paths; use the checkpoint metadata supplied with the model.
+Do not add an explicit version flag.
+
+The checkpoint and Gemma text encoder are separate local paths. The Gemma root must match the checkpoint metadata:
+LTX 2.5 checkpoints require the LTX-specific fine-tuned Gemma 4 text encoder, not Google's vanilla Gemma 4 model;
+older checkpoints use Gemma 3.
 
 **Key Dependencies:**
 
@@ -60,7 +66,7 @@ packages/ltx-trainer/
 │   │   ├── text_to_video.py      # TextToVideoStrategy, TextToVideoConfig [DEPRECATED]
 │   │   └── video_to_video.py     # VideoToVideoStrategy, VideoToVideoConfig [DEPRECATED]
 │   ├── timestep_samplers.py      # Flow matching timestep sampling
-│   ├── gemma_8bit.py             # 8-bit Gemma text encoder loading (bitsandbytes)
+│   ├── gemma_8bit.py             # 8-bit Gemma text encoder quantization (bitsandbytes)
 │   ├── quantization.py           # Transformer INT8/INT4/FP8 quantization
 │   ├── captioning.py             # Video captioning utilities
 │   ├── video_utils.py            # Video I/O and processing
@@ -126,9 +132,10 @@ The `configs/` directory is documented in two places that both contain a trainin
   `load_text_encoder()`, `load_embeddings_processor()`, etc.
 - Combined loader: `load_model()` returns `LtxModelComponents` dataclass
 - Uses `SingleGPUModelBuilder` from ltx-core internally
-- Text encoder and embeddings processor are loaded separately (the text encoder only needs Gemma weights; the embeddings
-  processor only needs the LTX checkpoint)
-- 8-bit text encoder loading via `gemma_8bit.py` (bitsandbytes)
+- Text encoder and embeddings processor are loaded separately (the text encoder only needs Gemma weights; the
+  embeddings processor needs the LTX checkpoint, plus the packed text-encoder file on a split pack)
+- Optional 8-bit quantization of the text encoder via `gemma_8bit.py` (bitsandbytes), applied after the standard
+  build rather than as a separate loading path
 
 **Training Flow:**
 
@@ -173,8 +180,8 @@ video_pred, audio_pred = model(video=video, audio=audio, perturbations=None)
 > **Note:** `Modality` is immutable (frozen dataclass). Use `dataclasses.replace()` to modify.
 
 **`sigma` vs `timesteps`:** These serve different roles. `timesteps` is per-token (e.g. `sigma * denoise_mask` —
-conditioning tokens get 0, noisy tokens get sigma). `sigma` is per-batch and is used for prompt AdaLN conditioning (
-LTX-2.3) and cross-modality (video↔audio) attention conditioning (both versions).
+conditioning tokens get 0, noisy tokens get sigma). `sigma` is per-batch and is used for prompt AdaLN conditioning
+and cross-modality (video↔audio) attention conditioning. The exact behavior is selected from the checkpoint config for all supported model versions.
 
 **Configuration System:**
 
@@ -190,26 +197,33 @@ LTX-2.3) and cross-modality (video↔audio) attention conditioning (both version
 - Config uses `extra="forbid"` — unknown fields cause validation errors
 - Config files in `configs/` directory
 
-## LTX-2 vs LTX-2.3: Differences
+## LTX-2 Family: Differences
 
-Both model versions share the same latent space interface (see [Latent Space Constants](#latent-space-constants)).
+All supported model versions share the same latent space interface (see [Latent Space Constants](#latent-space-constants)).
 The differences lie in how text conditioning and audio generation work. Version detection is automatic via checkpoint
 config — the trainer uses a unified API.
 
-| Component             | LTX-2 (19B)                                                                     | LTX-2.3 (22B)                                                                                       |
-|-----------------------|---------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------|
-| Feature extractor     | `FeatureExtractorV1`: single `aggregate_embed`, same output for video and audio | `FeatureExtractorV2`: separate `video_aggregate_embed` + `audio_aggregate_embed`, per-token RMSNorm |
-| Caption projection    | Inside the transformer (`caption_projection`)                                   | Inside the feature extractor (before connector)                                                     |
-| Embeddings connectors | Same dimensions for video and audio                                             | Separate dimensions (`AudioEmbeddings1DConnectorConfigurator`)                                      |
-| Prompt AdaLN          | Not present (`cross_attention_adaln=False`)                                     | Active — modulates cross-attention to text using `sigma`                                            |
-| Vocoder               | HiFi-GAN (`Vocoder`)                                                            | BigVGAN v2 + bandwidth extension (`VocoderWithBWE`)                                                 |
+| Component             | LTX-2 (19B)                                                                     | LTX-2.3 (22B)                                                                                       | LTX 2.5 (22B)                                                                                                      |
+|-----------------------|---------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------|
+| Text encoder          | Gemma 3                                                                         | Gemma 3                                                                                             | LTX-specific fine-tuned Gemma 4; checkpoint-specific root, commonly `gemma4-12b-ltx-v1`                      |
+| Feature extractor     | `FeatureExtractorV1`: single `aggregate_embed`, same output for video and audio | `FeatureExtractorV2`: separate `video_aggregate_embed` + `audio_aggregate_embed`, per-token RMSNorm | `FeatureExtractorV2`: separate video/audio features with Gemma 4 hidden states and per-token RMSNorm          |
+| Caption projection    | Inside the transformer (`caption_projection`)                                   | Inside the feature extractor (before connector)                                                     | Inside the feature extractor (before connector)                                                               |
+| Embeddings connectors | Same dimensions for video and audio                                             | Separate dimensions (`AudioEmbeddings1DConnectorConfigurator`)                                      | Separate video/audio connectors; 4096/2048 output dimensions                                                 |
+| Prompt AdaLN          | Not present (`cross_attention_adaln=False`)                                     | Active — modulates cross-attention to text using `sigma`                                            | Active — modulates text cross-attention using `sigma`                                                        |
+| Video FFN bias        | Enabled by checkpoint config                                                     | Enabled by checkpoint config                                                                         | Bias-free video FFN layers                                                                                   |
+| Vocoder               | HiFi-GAN (`Vocoder`)                                                            | BigVGAN v2 + bandwidth extension (`VocoderWithBWE`)                                                 | BigVGAN v2 + bandwidth extension (`VocoderWithBWE`)                                                         |
 
 **How version detection works in ltx-core:**
 
 - **Feature extractor:** `_create_feature_extractor()` checks for V2 config keys (`caption_proj_before_connector`,
   etc.). Present → V2; absent → V1.
-- **Vocoder:** `VocoderConfigurator` checks for `config["vocoder"]["bwe"]`. Present → `VocoderWithBWE`; absent →
-  `Vocoder`.
+- **Gemma family:** `get_gemma_ops()` dispatches from the Gemma root's `model_type` (`gemma3`, `gemma4`, or
+  `gemma4_unified`). For LTX 2.5+, the embeddings processor also validates the checkpoint's
+  `gemma_source_checkpoint` metadata against the Gemma root.
+- **Vocoder:** LTX 2.5 uses `VocoderWithBWE` — BigVGAN v2 with bandwidth extension — loaded from the checkpoint.
+  Older LTX checkpoints without the `vocoder.bwe` setting use the legacy `Vocoder` implementation.
+- **Video decoder:** `load_video_vae_decoder()` selects the convolutional or diffusion decoder from checkpoint
+  metadata. Diffusion-decoder checkpoints require diffusion-compatible SDOps and tiled decoding.
 - **Transformer:** `_build_caption_projections()` checks `caption_proj_before_connector`. True (V2) → no caption
   projection in transformer; False (V1) → caption projection created in transformer.
 - **Embeddings connectors:** `AudioEmbeddings1DConnectorConfigurator` reads `audio_connector_*` keys, falling back to
@@ -217,7 +231,7 @@ config — the trainer uses a unified API.
 
 ## Text Encoder Pipeline
 
-The `GemmaTextEncoder` implements a 3-block pipeline:
+The `LTXGemmaTextEncoder` implements a 3-block pipeline:
 
 1. **Block 1 — Gemma LLM:** Tokenizes text → runs through Gemma → extracts hidden states
 2. **Block 2 — Feature extractor:** Hidden states → normalized features (V1: single stream duplicated for video/audio;
@@ -237,6 +251,11 @@ the results. Block 3 (connectors) is applied during training via
 The trainer handles both formats in `_training_step()`: if `video_prompt_embeds` is present, it uses the new format;
 otherwise, it duplicates `prompt_embeds` for both modalities (mirroring V1 behavior).
 
+> **Cache compatibility:** Caption features are produced by the selected Gemma model and are not interchangeable
+> across model versions. When switching between LTX-2.3 and LTX 2.5, preprocess into a fresh `conditions/` directory
+> or pass `--overwrite` to `process_dataset.py`/`process_captions.py`. Existing `.pt` files are skipped by default.
+> The checkpoint/Gemma metadata check validates the loaded model pair, but it does not rewrite old precomputed data.
+
 **After caching validation embeddings**, the trainer unloads heavy components to free VRAM:
 
 ```python
@@ -248,19 +267,26 @@ self._text_encoder.feature_extractor = None
 
 ## Latent Space Constants
 
-These values are shared across all supported model versions:
+Video latent channels are shared across all supported model versions. The video compression
+factors below are the **default** VAE's; the trainer derives the actual factors from the
+checkpoint's VAE config (`SpatioTemporalScaleFactors.from_model_config`), so a less-compressed
+VAE (e.g. 16x16x4) changes them. Geometry is enforced at runtime once the factors are known
+(`ValidationRunner._validate_sample_geometry`), not by config-time validators.
 
 | Constant                     | Value                            | Where used                                                |
 |------------------------------|----------------------------------|-----------------------------------------------------------|
 | Video latent channels        | 128                              | VAE encoder/decoder, patchifier, `VideoLatentShape`       |
-| Spatial compression          | 32× (H and W)                    | `SpatioTemporalScaleFactors.default()`, config validators |
-| Temporal compression         | 8×                               | `SpatioTemporalScaleFactors.default()`, config validators |
-| Frame constraint             | `frames % 8 == 1`                | Config validators, validation runner                      |
-| Resolution constraint        | Width and height divisible by 32 | Config validators, validation runner                      |
+| Spatial compression          | 32× (H and W), default VAE       | `SpatioTemporalScaleFactors`, runtime geometry check      |
+| Temporal compression         | 8×, default VAE                  | `SpatioTemporalScaleFactors`, runtime geometry check      |
+| Frame constraint             | `frames % T == 1` (T=8 default)  | `ValidationRunner`, preprocessing scripts                 |
+| Resolution constraint        | Divisible by spatial factor (32 default) | `ValidationRunner`, preprocessing scripts         |
 | Audio latent channels        | 8                                | `AudioLatentShape`, audio patchifier                      |
 | Audio mel bins               | 16                               | `AudioLatentShape`, audio patchifier                      |
 | Patchified token dim (video) | 128 (`128 × 1 × 1 × 1`)          | Transformer `in_channels`                                 |
 | Patchified token dim (audio) | 128 (`8 × 16`)                   | Transformer `audio_in_channels`                           |
+
+LTX 2.5 RC checkpoints use the default 128-channel, 32× spatial, 8× temporal latent layout. The trainer still reads
+these factors from the checkpoint because alternate VAE layouts are supported.
 
 ## Development Commands
 
@@ -429,12 +455,23 @@ Component loaders:
 
 - `load_transformer()` → `LTXModel`
 - `load_video_vae_encoder()` → `VideoEncoder`
-- `load_video_vae_decoder()` → `VideoDecoder`
+- `load_video_vae_decoder()` → `VideoDecoder` (convolutional or diffusion, selected from checkpoint metadata)
 - `load_audio_vae_decoder()` → `AudioDecoder`
 - `load_vocoder()` → `Vocoder` or `VocoderWithBWE` (auto-detected)
-- `load_text_encoder(gemma_model_path)` → `GemmaTextEncoder` (pure Gemma LLM, no checkpoint needed)
-- `load_embeddings_processor(checkpoint_path)` → `EmbeddingsProcessor` (feature extractor + connectors)
+- `load_text_encoder(gemma_model_path)` → `LTXGemmaTextEncoder` (pure Gemma LLM; a Gemma directory or a packed
+  single-file text encoder)
+- `load_embeddings_processor(checkpoint_path)` → `EmbeddingsProcessor` (feature extractor + connectors). Takes one
+  path for a unified checkpoint, or the `(transformer, text_encoder)` pair for a split pack — build it with
+  `embedding_weight_paths()`, never by hand. Metadata (including `gemma_source_checkpoint`) is read from the first
+  path, so the transformer must come first.
 - `load_model()` → `LtxModelComponents` (convenience wrapper)
+
+Split/unified resolution helpers:
+
+- `is_split_transformer(path)` → `bool`, from the checkpoint's declared config sections
+- `resolve_video_vae_path(model_path, video_vae_path)` / `resolve_audio_vae_path(...)` → the component file, raising
+  rather than falling back to a split pack's transformer. Call these where the component is loaded, never up front:
+  resolving eagerly makes a video-only run demand an audio VAE it will never open.
 
 **`src/ltx_trainer/validation_runner.py`** - Conditioned validation sampling
 
@@ -453,10 +490,19 @@ Component loaders:
     - Uniform fallback (10% of samples) to prevent distribution collapse
     - Reflection around `eps` for numerical stability near zero
 
-**`src/ltx_trainer/gemma_8bit.py`** - 8-bit text encoder loading
+**`src/ltx_trainer/gemma_8bit.py`** - 8-bit text encoder quantization
 
-Bypasses ltx-core's standard loading path to enable bitsandbytes 8-bit quantization of the Gemma backbone. Manually
-constructs the `GemmaTextEncoder` with quantized model, feature extractor, and embeddings processor.
+`quantize_gemma_to_8bit()` swaps the Gemma backbone's `nn.Linear` layers for bitsandbytes LLM.int8() equivalents and
+moves the result to the GPU, where bitsandbytes performs the actual quantization. `load_text_encoder(...,
+load_in_8bit=True)` builds the encoder on CPU through the normal ltx-core path and then calls it.
+
+Quantizing *after* the standard build (rather than loading through `transformers`) is what makes it work for every
+supported model: LTX 2.5's text encoder is a `gemma4_unified`, a model type only ltx-core's builder can assemble, and
+it ships as a single packed `.safetensors` rather than a Hugging Face directory. The trade-off is that the
+full-precision weights are materialized first — on CPU, so the peak is host RAM rather than VRAM.
+
+The `lm_head` is left in full precision. Caption precompute never runs it (`LTXGemmaTextEncoder.encode` calls the
+inner model directly), so it only affects prompt enhancement.
 
 ### Data
 
@@ -570,20 +616,37 @@ video_embeds, audio_embeds, binary_mask = text_encoder.embeddings_processor.crea
 
 ### Frame Requirements
 
-Frames must satisfy `frames % 8 == 1`:
+Frames must satisfy `frames % T == 1`, where `T` is the VAE temporal factor read from the
+checkpoint. For the default VAE (`T = 8`):
 
 - ✅ Valid: 1, 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 121
 - ❌ Invalid: 24, 32, 48, 64, 100
 
+A less-compressed VAE lowers `T` (e.g. 16x16x4 uses `T = 4`: 1, 5, 9, 13, ...).
+
 ### Resolution Requirements
 
-Width and height must be divisible by 32.
+Width and height must be divisible by the VAE spatial factor (32 for the default VAE).
 
 ### Model Paths
 
-- Must be local paths (URLs not supported)
-- `model_path`: Path to `.safetensors` checkpoint
-- `text_encoder_path`: Path to Gemma model directory
+Must be local paths (URLs not supported). Two checkpoint layouts are supported, and the trainer distinguishes
+them from checkpoint metadata rather than from a flag (`model_loader.is_split_transformer`):
+
+| Field | Unified checkpoint | Split pack |
+|---|---|---|
+| `model_path` | the whole `.safetensors` | the transformer `.safetensors` |
+| `text_encoder_path` | Gemma model directory | packed text-encoder `.safetensors` (Gemma weights + HF sidecars + text projections) |
+| `video_vae_path` | omit (defaults to `model_path`) | **required** — standalone video VAE |
+| `audio_vae_path` | omit (defaults to `model_path`) | **required when the run touches audio** — standalone audio VAE + vocoder |
+
+The split pack's transformer carries neither VAE config nor VAE weights, so falling back to it would build an
+uninitialized VAE and silently assume the default 32x32x8 scale factors. `resolve_video_vae_path` /
+`resolve_audio_vae_path` reject that fallback at the use site; `embedding_weight_paths` likewise rejects a Gemma
+directory paired with a split transformer, because the `text_embedding_projection.*` weights only exist in the
+packed text-encoder file.
+
+The preprocessing scripts expose the same components as `--video-vae-path` / `--audio-vae-path`.
 
 ### Platform Requirements
 
@@ -603,24 +666,24 @@ packages/ltx-core/src/ltx_core/
 │   │   ├── model_configurator.py   # LTXModelConfigurator (version-aware)
 │   │   └── timestep_embedding.py   # Timestep/sigma embedding
 │   ├── video_vae/
-│   │   ├── video_vae.py            # VideoEncoder, VideoDecoder
+│   │   ├── video_vae.py            # VideoEncoder, VideoDecoder (protocol), ConvVideoDecoder, DiffusionVideoDecoder
 │   │   └── model_configurator.py   # VideoEncoderConfigurator, VideoDecoderConfigurator
 │   ├── audio_vae/
 │   │   ├── audio_vae.py            # AudioEncoder, AudioDecoder
 │   │   └── vocoder.py              # Vocoder, VocoderWithBWE (output_sampling_rate)
 │   └── common/                     # Shared model components
 ├── text_encoders/gemma/
-│   ├── __init__.py                 # Exports: GemmaTextEncoder, GemmaTextEncoderConfigurator,
+│   ├── __init__.py                 # Exports: LTXGemmaTextEncoder, GemmaTextEncoderConfigurator,
 │   │                               #   AV_GEMMA_TEXT_ENCODER_KEY_OPS, GEMMA_MODEL_OPS,
 │   │                               #   module_ops_from_gemma_root
 │   ├── encoders/
-│   │   ├── base_encoder.py         # GemmaTextEncoder (unified 3-block pipeline)
+│   │   ├── base_encoder.py         # LTXGemmaTextEncoder (unified 3-block pipeline)
 │   │   └── encoder_configurator.py # GemmaTextEncoderConfigurator, _create_feature_extractor
 │   ├── feature_extractor.py        # FeatureExtractorV1 (19B), FeatureExtractorV2 (22B)
 │   ├── embeddings_connector.py     # Embeddings1DConnector, Embeddings1DConnectorConfigurator,
 │   │                               #   AudioEmbeddings1DConnectorConfigurator
 │   ├── embeddings_processor.py     # EmbeddingsProcessor (wraps video + audio connectors)
-│   └── tokenizer.py               # LTXVGemmaTokenizer
+│   └── tokenizer.py               # LTXGemmaTokenizer
 ├── components/
 │   ├── schedulers.py               # LTX2Scheduler
 │   ├── diffusion_steps.py          # EulerDiffusionStep

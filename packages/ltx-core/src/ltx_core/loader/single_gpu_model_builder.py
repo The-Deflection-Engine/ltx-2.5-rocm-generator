@@ -8,7 +8,13 @@ import torch
 from torch import nn
 
 from ltx_core.loader.fuse_loras import FuseRule, apply_loras, bf16_fuse_rule
-from ltx_core.loader.helpers import create_meta_model, load_state_dict, read_model_config
+from ltx_core.loader.helpers import (
+    as_path_list,
+    create_meta_model,
+    load_state_dict,
+    read_model_config,
+    read_model_metadata,
+)
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.primitives import (
     LoRAAdaptableProtocol,
@@ -18,7 +24,7 @@ from ltx_core.loader.primitives import (
     StateDict,
     StateDictLoader,
 )
-from ltx_core.loader.registry import DummyRegistry, Registry
+from ltx_core.loader.registry import ModelRegistry, Registry, module_registry_key
 from ltx_core.loader.sd_ops import SDOps
 from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
 from ltx_core.model.model_protocol import ModelConfigurator, ModelType
@@ -39,6 +45,31 @@ def _check_uninitialized(model: nn.Module) -> list[str]:
         if str(buf.device) == "meta":
             names.append(name)
     return names
+
+
+# dtypes that ``build(..., dtype=)`` may cast. Quantized payloads (uint8 NVFP4,
+# float8, etc.) must not be rewritten — SDOps policies emit them at load time.
+_DTYPE_CASTABLE = frozenset(
+    {
+        torch.float32,
+        torch.float64,
+        torch.float16,
+        torch.bfloat16,
+    }
+)
+
+
+def _cast_floating_sd(sd: dict[str, torch.Tensor], dtype: torch.dtype) -> dict[str, torch.Tensor]:
+    def _cast(value: torch.Tensor) -> torch.Tensor:
+        if value.dtype not in _DTYPE_CASTABLE:
+            return value
+        # Keep FP32 scalars (e.g. NVFP4 ``weight_scale_2`` / alpha) — bf16 would
+        # corrupt the per-tensor decode-scale convention.
+        if value.ndim == 0 and value.dtype == torch.float32:
+            return value
+        return value.to(dtype=dtype)
+
+    return {key: _cast(value) for key, value in sd.items()}
 
 
 def _load_model_weights(
@@ -63,7 +94,7 @@ def _load_model_weights(
     if not lora_strengths or (min(lora_strengths) == 0 and max(lora_strengths) == 0):
         sd = model_sd.sd
         if dtype is not None:
-            sd = {key: value.to(dtype=dtype) for key, value in sd.items()}
+            sd = _cast_floating_sd(sd, dtype)
         meta_model.load_state_dict(sd, strict=False, assign=True)
         return
 
@@ -71,15 +102,20 @@ def _load_model_weights(
     lora_sd_and_strengths = [
         LoraStateDictWithStrength(sd, strength) for sd, strength in zip(lora_state_dicts, lora_strengths, strict=True)
     ]
+    # Retained registry entries are clean cache — fuse into a fresh SD. Ephemeral loads (get miss)
+    # may be fused in place. Always leave fused tensors on the fusion device (no D2H bounce when
+    # ``model_sd`` is CPU-retained).
+    destination_sd = None if registry.get(as_path_list(model_path), model_sd_ops) is not None else model_sd
     final_sd = apply_loras(
         model_sd=model_sd,
         lora_sd_and_strengths=lora_sd_and_strengths,
         fuse_rule=fuse_rule,
-        destination_sd=model_sd if isinstance(registry, DummyRegistry) else None,
+        destination_sd=destination_sd,
+        preserve_input_device=False,
     )
     fused_sd = final_sd.sd
     if dtype is not None:
-        fused_sd = {key: value.to(dtype=dtype) for key, value in fused_sd.items()}
+        fused_sd = _cast_floating_sd(fused_sd, dtype)
     meta_model.load_state_dict(fused_sd, strict=False, assign=True)
 
 
@@ -97,7 +133,8 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         loras: Sequence of LoRA adapters (path, strength, optional sd_ops) to fuse into the model.
         model_loader: Strategy for loading state dicts from disk. Defaults to
             :class:`SafetensorsModelStateDictLoader`.
-        registry: Cache for already-loaded state dicts. Defaults to :class:`DummyRegistry` (no caching).
+        registry: Cache for model shells / state dicts. Defaults to a shell-only
+            :class:`ModelRegistry` (``cache_models=True``, ``cache_weights=False``).
         lora_load_device: Device used when loading LoRA weight tensors from disk. Defaults to
             ``torch.device("cpu")``, which keeps LoRA weights in CPU memory and transfers them to
             the target GPU sequentially during fusion, reducing peak GPU memory usage compared to
@@ -124,7 +161,7 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         self._module_ops = module_ops
         self._loras = loras
         self._model_loader = model_loader if model_loader is not None else SafetensorsModelStateDictLoader()
-        self._registry = registry if registry is not None else DummyRegistry()
+        self._registry = registry if registry is not None else ModelRegistry(cache_models=True, cache_weights=False)
         self._lora_load_device = lora_load_device if lora_load_device is not None else torch.device("cpu")
         self._fuse_rule = fuse_rule
 
@@ -143,6 +180,11 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
     @property
     def registry(self) -> Registry:
         return self._registry
+
+    @property
+    def keeps_gpu_resident_weights(self) -> bool:
+        # Registry may retain a CPU SD; each build H2Ds into fresh GPU storages.
+        return False
 
     @property
     def model_path(self) -> str | tuple[str, ...]:
@@ -202,8 +244,20 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
     def model_config(self) -> dict:
         return read_model_config(self._model_path, self._model_loader)
 
-    def meta_model(self, config: dict, module_ops: tuple[ModuleOps, ...]) -> ModelType:
-        return create_meta_model(self._model_class_configurator, config, module_ops)
+    def model_metadata(self) -> dict:
+        return read_model_metadata(self._model_path, self._model_loader)
+
+    def meta_model(self, metadata: dict, module_ops: tuple[ModuleOps, ...]) -> ModelType:
+        struct_key = module_registry_key(
+            configurator=self._model_class_configurator,
+            config=metadata,
+            module_ops_names=tuple(op.name for op in module_ops),
+        )
+        cached = self._registry.get_model(struct_key)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+        model = create_meta_model(self._model_class_configurator, metadata, module_ops)
+        return self._registry.add_model(struct_key, model)  # type: ignore[return-value]
 
     def load_sd(
         self, paths: list[str], registry: Registry, device: torch.device | None, sd_ops: SDOps | None = None
@@ -217,8 +271,8 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         **kwargs: object,  # noqa: ARG002
     ) -> ModelType:
         device = torch.device("cuda") if device is None else device
-        config = self.model_config()
-        meta_model = self.meta_model(config, self._module_ops)
+        metadata = self.model_metadata()
+        meta_model = self.meta_model(metadata, self._module_ops)
 
         _load_model_weights(
             meta_model=meta_model,

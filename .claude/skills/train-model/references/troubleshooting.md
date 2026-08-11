@@ -52,6 +52,12 @@ Common offenders:
 - `text_encoder_path` directory missing the Gemma config → ensure the path is to the Gemma model dir, not its parent.
 - `preprocessed_data_root` doesn't contain expected subdirs → re-verify Phase 7 ran for the chosen mode (see `phases/preprocess-dataset.md`).
 
+## Checkpoint/Gemma Compatibility Error
+
+If loading fails with `Gemma version mismatch` or a missing `gemma_source_checkpoint`, stop and re-check the model
+pair. LTX 2.5 requires the LTX-specific fine-tuned Gemma 4 root supplied with the checkpoint; Google's vanilla
+Gemma 4 model is not interchangeable. Do not proceed with a substitute or alter checkpoint metadata.
+
 ## Resume Stops Working
 
 The trainer **does not auto-resume from `output_dir`**. Resume happens only when `model.load_checkpoint` is explicitly set to a checkpoint file; the trainer then loads those weights and looks for a `training_state_step_*.pt` next to that file to restore optimizer/scheduler/step. Common pitfalls:

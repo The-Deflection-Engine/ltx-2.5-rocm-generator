@@ -8,7 +8,7 @@ This module provides functionality for processing text captions, including:
 - CaptionsDataset for caption-only preprocessing workflows
 Can be used as a standalone script:
     python scripts/process_captions.py dataset.json --output-dir /path/to/output \
-        --model-source /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma
+        --model-path /path/to/ltx-checkpoint.safetensors --text-encoder-path /path/to/gemma-root
 """
 
 import json
@@ -36,7 +36,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from transformers.utils.logging import disable_progress_bar
 
 from ltx_trainer import logger
-from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
+from ltx_trainer.model_loader import embedding_weight_paths, load_embeddings_processor, load_text_encoder
 
 # Disable tokenizers parallelism to avoid warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -307,7 +307,8 @@ def compute_captions_embeddings(  # noqa: PLR0913
             load_in_8bit=load_in_8bit,
         )
         embeddings_processor = load_embeddings_processor(
-            model_path,
+            embedding_weight_paths(model_path, text_encoder_path),
+            gemma_model_path=text_encoder_path,
             device=device,
             dtype=torch.bfloat16,
         )
@@ -334,7 +335,7 @@ def compute_captions_embeddings(  # noqa: PLR0913
                 # TODO(batch-tokenization): When tokenizer supports batching, encode all prompts at once.
                 # For now, process one at a time:
                 for i in range(len(batch["prompt"])):
-                    encoded = text_encoder.encode([batch["prompt"][i]], padding_side="left")
+                    encoded = text_encoder.encode([batch["prompt"][i]])
                     hidden_states, prompt_attention_mask = encoded[0]
                     video_prompt_embeds, audio_prompt_embeds = embeddings_processor.feature_extractor(
                         hidden_states, prompt_attention_mask, "left"
@@ -453,19 +454,23 @@ def main(  # noqa: PLR0913
     This script processes captions from metadata files and saves text embeddings
     that can be used for training video generation models. The output embeddings
     will maintain the same folder structure and naming as the corresponding media files.
-    Note: This script is designed for LTX-2 models which use the Gemma text encoder.
+    Note: This script supports the LTX family. Use the Gemma root that matches the
+    checkpoint; LTX 2.5 uses the LTX-specific fine-tuned Gemma 4 model, not Google's
+    vanilla Gemma 4 model.
     Examples:
-        # Process captions with LTX-2 model
+        # Process captions with an LTX checkpoint
         python scripts/process_captions.py dataset.json --output-dir ./embeddings \\
-            --model-path /path/to/ltx2_checkpoint.safetensors \\
-            --text-encoder-path /path/to/gemma
+            --model-path /path/to/ltx-checkpoint.safetensors \\
+            --text-encoder-path /path/to/gemma-root
         # Add a trigger word for LoRA training
         python scripts/process_captions.py dataset.json --output-dir ./embeddings \\
-            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma \\
+            --model-path /path/to/ltx-checkpoint.safetensors \\
+            --text-encoder-path /path/to/gemma-root \\
             --lora-trigger "mytoken"
         # Remove LLM-generated prefixes from captions
         python scripts/process_captions.py dataset.json --output-dir ./embeddings \\
-            --model-path /path/to/ltx2.safetensors --text-encoder-path /path/to/gemma \\
+            --model-path /path/to/ltx-checkpoint.safetensors \\
+            --text-encoder-path /path/to/gemma-root \\
             --remove-llm-prefixes
     """
 

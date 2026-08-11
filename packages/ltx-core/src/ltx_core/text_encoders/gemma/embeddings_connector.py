@@ -20,6 +20,7 @@ class _BasicTransformerBlock1D(torch.nn.Module):
         dim_head: int,
         rope_type: LTXRopeType = LTXRopeType.SPLIT,
         apply_gated_attention: bool = False,
+        ff_bias: bool = True,
     ):
         super().__init__()
 
@@ -34,6 +35,7 @@ class _BasicTransformerBlock1D(torch.nn.Module):
         self.ff = FeedForward(
             dim,
             dim_out=dim,
+            bias=ff_bias,
         )
 
     def forward(
@@ -90,7 +92,7 @@ class Embeddings1DConnector(torch.nn.Module):
 
     _supports_gradient_checkpointing = True
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         attention_head_dim: int = 128,
         num_attention_heads: int = 30,
@@ -102,6 +104,7 @@ class Embeddings1DConnector(torch.nn.Module):
         rope_type: LTXRopeType = LTXRopeType.SPLIT,
         double_precision_rope: bool = False,
         apply_gated_attention: bool = False,
+        ff_bias: bool = True,
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
@@ -121,6 +124,7 @@ class Embeddings1DConnector(torch.nn.Module):
                     dim_head=attention_head_dim,
                     rope_type=rope_type,
                     apply_gated_attention=apply_gated_attention,
+                    ff_bias=ff_bias,
                 )
                 for _ in range(num_layers)
             ]
@@ -191,8 +195,8 @@ class Embeddings1DConnectorConfigurator(ModelConfigurator[Embeddings1DConnector]
     """Configurator for video embeddings connector."""
 
     @classmethod
-    def from_config(cls: type[Embeddings1DConnector], config: dict) -> Embeddings1DConnector:
-        transformer_config = config.get("transformer", {})
+    def from_metadata(cls, metadata: dict) -> Embeddings1DConnector:
+        transformer_config = metadata.get("config", {}).get("transformer", {})
         rope_type = LTXRopeType(transformer_config.get("rope_type", "split"))
         double_precision_rope = transformer_config.get("frequencies_precision", False) == "float64"
         pe_max_pos = transformer_config.get("connector_positional_embedding_max_pos", [1])
@@ -210,6 +214,7 @@ class Embeddings1DConnectorConfigurator(ModelConfigurator[Embeddings1DConnector]
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
             apply_gated_attention=transformer_config.get("connector_apply_gated_attention", False),
+            ff_bias=transformer_config.get("connector_ff_bias", True),
         )
         return connector
 
@@ -218,8 +223,8 @@ class AudioEmbeddings1DConnectorConfigurator(ModelConfigurator[Embeddings1DConne
     """Configurator for audio embeddings connector with separate dimension settings."""
 
     @classmethod
-    def from_config(cls: type[Embeddings1DConnector], config: dict) -> Embeddings1DConnector:
-        transformer_config = config.get("transformer", {})
+    def from_metadata(cls, metadata: dict) -> Embeddings1DConnector:
+        transformer_config = metadata.get("config", {}).get("transformer", {})
         rope_type = LTXRopeType(transformer_config.get("rope_type", "split"))
         double_precision_rope = transformer_config.get("frequencies_precision", False) == "float64"
         pe_max_pos = transformer_config.get("connector_positional_embedding_max_pos", [1])
@@ -246,5 +251,6 @@ class AudioEmbeddings1DConnectorConfigurator(ModelConfigurator[Embeddings1DConne
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
             apply_gated_attention=transformer_config.get("connector_apply_gated_attention", False),
+            ff_bias=transformer_config.get("connector_ff_bias", True),
         )
         return connector

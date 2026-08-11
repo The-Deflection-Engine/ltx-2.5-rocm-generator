@@ -17,7 +17,14 @@ from ltx_core.conditioning import (
 )
 from ltx_core.model.video_vae import TilingConfig, VideoEncoder
 from ltx_core.types import VideoLatentShape
-from ltx_pipelines.utils.media_io import decode_video_by_frame, video_preprocess
+from ltx_pipelines.utils.media_io import (
+    ResizeMode,
+    decode_video_by_frame,
+    is_exr_dir,
+    load_exr_folder_conditioning_hdr,
+    video_preprocess,
+)
+from ltx_pipelines.utils.media_io.color_config import HDRColorSpace
 
 
 def read_lora_reference_downscale_factor(lora_path: str) -> int:
@@ -98,6 +105,7 @@ def append_ic_lora_reference_video_conditionings(  # noqa: PLR0913
     conditioning_attention_strength: float,
     conditioning_attention_mask: torch.Tensor | None,
     tiling_config: TilingConfig | None = None,
+    color_space: HDRColorSpace | None = None,
 ) -> None:
     """Append :class:`VideoConditionByReferenceLatent` items for each reference path."""
     scale = reference_downscale_factor
@@ -109,8 +117,29 @@ def append_ic_lora_reference_video_conditionings(  # noqa: PLR0913
     ref_width = width // scale
 
     for video_path, strength in video_conditioning:
-        frame_gen = decode_video_by_frame(path=video_path, frame_cap=num_frames, device=device)
-        video = video_preprocess(frame_gen, ref_height, ref_width, dtype, device)
+        if is_exr_dir(video_path):
+            if color_space is None:
+                raise ValueError(
+                    "EXR input requires --hdr {SRGB_LINEAR,ACESCG,ACESCCT} to declare the source colour space."
+                )
+            video = torch.cat(
+                list(
+                    load_exr_folder_conditioning_hdr(
+                        exr_dir=video_path,
+                        height=ref_height,
+                        width=ref_width,
+                        frame_cap=num_frames,
+                        dtype=dtype,
+                        device=device,
+                        color_space=color_space,
+                        resize_mode=ResizeMode.REFLECT_PAD,
+                    )
+                ),
+                dim=2,
+            )
+        else:
+            frame_gen = decode_video_by_frame(path=video_path, frame_cap=num_frames, device=device)
+            video = video_preprocess(frame_gen, ref_height, ref_width, dtype, device)
         if reference_temporal_scale_factor > 1:
             video = temporal_subsample(video, reference_temporal_scale_factor)
         if tiling_config is not None:

@@ -95,7 +95,12 @@ class BlockwiseGemmLinearFunc(torch.autograd.Function):
         b, n, h = a[0].shape
         out_h, _ = w[0].shape
         new_a = (a[0].view(-1, h), a[1])
-        d = blockwise_fp8_gemm(new_a, w, bias, use_fast_accum=True)
+        # Fast accum sums raw (pre-dequant-scale) e4m3 products in a fp16 accumulator; on
+        # Blackwell those partial sums overflow fp16 range and the GEMM returns NaN, so fall
+        # back to the fp32 accumulator there. Verified on GB200 (sm_100a). Non-CUDA
+        # (meta / CPU fake) paths skip the capability query — get_device_arch requires CUDA.
+        use_fast_accum = (not a[0].is_cuda) or get_device_arch() != "blackwell"
+        d = blockwise_fp8_gemm(new_a, w, bias, use_fast_accum=use_fast_accum)
         return d.view(b, n, out_h)
 
 

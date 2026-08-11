@@ -9,6 +9,20 @@ from ltx_trainer.training_strategies.flexible import FlexibleStrategyConfig
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig
 
+DEFAULT_NEGATIVE_PROMPT = (
+    "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, "
+    "grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, "
+    "deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, "
+    "wrong hand count, artifacts around text, inconsistent perspective, camera shake, incorrect depth of "
+    "field, background too sharp, background clutter, distracting reflections, harsh shadows, inconsistent "
+    "lighting direction, color banding, cartoonish rendering, 3D CGI look, unrealistic materials, uncanny "
+    "valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong gaze direction, "
+    "mismatched lip sync, silent or muted audio, distorted voice, robotic voice, echo, background noise, "
+    "off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward "
+    "pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, "
+    "inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts."
+)
+
 
 class ConfigBaseModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -37,7 +51,8 @@ class PrefixConditionConfig(ConfigBaseModel):
     num_frames: int | None = Field(
         default=None,
         ge=1,
-        description="Number of pixel frames for video prefix. Must satisfy num_frames %% 8 == 1.",
+        description="Number of pixel frames for video prefix. Must be VAE-aligned: "
+        "num_frames %% T == 1, where T is the VAE temporal compression factor (8 by default).",
     )
     duration: float | None = Field(default=None, gt=0, description="Duration in seconds for audio prefix")
 
@@ -45,15 +60,6 @@ class PrefixConditionConfig(ConfigBaseModel):
     def validate_exactly_one_modality(self) -> "PrefixConditionConfig":
         if (self.video is None) == (self.audio is None):
             raise ValueError("Exactly one of 'video' or 'audio' must be set for prefix condition")
-        return self
-
-    @model_validator(mode="after")
-    def validate_num_frames_constraint(self) -> "PrefixConditionConfig":
-        if self.video is not None and self.num_frames is not None and self.num_frames % 8 != 1:
-            raise ValueError(
-                f"num_frames ({self.num_frames}) must satisfy num_frames % 8 == 1 "
-                f"for video prefix (e.g., 1, 9, 17, 25, ...)"
-            )
         return self
 
 
@@ -66,7 +72,8 @@ class SuffixConditionConfig(ConfigBaseModel):
     num_frames: int | None = Field(
         default=None,
         ge=1,
-        description="Number of pixel frames for video suffix. Must satisfy num_frames %% 8 == 0.",
+        description="Number of pixel frames for video suffix. Must be VAE-aligned: "
+        "num_frames %% T == 0, where T is the VAE temporal compression factor (8 by default).",
     )
     duration: float | None = Field(default=None, gt=0, description="Duration in seconds for audio suffix")
 
@@ -74,15 +81,6 @@ class SuffixConditionConfig(ConfigBaseModel):
     def validate_exactly_one_modality(self) -> "SuffixConditionConfig":
         if (self.video is None) == (self.audio is None):
             raise ValueError("Exactly one of 'video' or 'audio' must be set for suffix condition")
-        return self
-
-    @model_validator(mode="after")
-    def validate_num_frames_constraint(self) -> "SuffixConditionConfig":
-        if self.video is not None and self.num_frames is not None and self.num_frames % 8 != 0:
-            raise ValueError(
-                f"num_frames ({self.num_frames}) must satisfy num_frames % 8 == 0 "
-                f"for video suffix (e.g., 8, 16, 24, 32, ...)"
-            )
         return self
 
 
@@ -194,20 +192,6 @@ class ValidationSample(ConfigBaseModel):
         description="Per-sample override for random seed. None = inherit from ValidationConfig.",
     )
 
-    @field_validator("video_dims")
-    @classmethod
-    def validate_video_dims(cls, v: tuple[int, int, int] | None) -> tuple[int, int, int] | None:
-        if v is None:
-            return v
-        width, height, frames = v
-        if width % 32 != 0:
-            raise ValueError(f"Width ({width}) must be divisible by 32")
-        if height % 32 != 0:
-            raise ValueError(f"Height ({height}) must be divisible by 32")
-        if frames % 8 != 1:
-            raise ValueError(f"Frames ({frames}) must satisfy frames % 8 == 1 for LTX-2 (e.g., 1, 9, 17, 25, ...)")
-        return v
-
     @model_validator(mode="after")
     def validate_frozen_modality_conflicts(self) -> "ValidationSample":
         frozen_types = {c.type for c in self.conditions if c.type in ("video_to_audio", "audio_to_video")}
@@ -239,12 +223,26 @@ class ModelConfig(ConfigBaseModel):
 
     model_path: str | Path = Field(
         ...,
-        description="Model path - local path to safetensors checkpoint file",
+        description="Path to a unified LTX checkpoint or the transformer safetensors in a split LTX-2.5 pack.",
     )
 
     text_encoder_path: str | Path | None = Field(
         default=None,
-        description="Path to text encoder (required for LTX-2/Gemma models, optional for LTXV/T5 models)",
+        description="Path to the matching Gemma directory, or the packed text-encoder safetensors of a split pack.",
+    )
+
+    video_vae_path: str | Path | None = Field(
+        default=None,
+        description=(
+            "Video VAE safetensors. Required for a split pack; defaults to model_path for a unified checkpoint."
+        ),
+    )
+
+    audio_vae_path: str | Path | None = Field(
+        default=None,
+        description=(
+            "Audio VAE/vocoder safetensors. Required for a split pack; defaults to model_path for a unified checkpoint."
+        ),
     )
 
     training_mode: Literal["lora", "full"] = Field(
@@ -270,6 +268,14 @@ class ModelConfig(ConfigBaseModel):
         if not Path(v).exists():
             raise ValueError(f"Model path does not exist: {v}")
 
+        return v
+
+    @field_validator("video_vae_path", "audio_vae_path")
+    @classmethod
+    def validate_component_path(cls, v: str | Path | None) -> str | Path | None:
+        """Validate optional split-pack component paths."""
+        if v is not None and not Path(v).is_file():
+            raise ValueError(f"Model component path does not exist or is not a file: {v}")
         return v
 
 
@@ -443,7 +449,7 @@ class ValidationConfig(ConfigBaseModel):
     )
 
     negative_prompt: str = Field(
-        default="worst quality, inconsistent motion, blurry, jittery, distorted",
+        default=DEFAULT_NEGATIVE_PROMPT,
         description="Negative prompt to use for validation examples",
     )
 
@@ -471,28 +477,14 @@ class ValidationConfig(ConfigBaseModel):
     )
 
     video_dims: tuple[int, int, int] = Field(
-        default=(960, 544, 97),
+        default=(960, 544, 89),
         description="Dimensions of validation videos (width, height, frames). "
-        "Width and height must be divisible by 32. Frames must satisfy frames % 8 == 1 for LTX-2.",
+        "Width and height must be divisible by the VAE spatial factor (32 by default), and frames must "
+        "satisfy frames % T == 1, where T is the VAE temporal compression factor (8 by default).",
     )
 
-    @field_validator("video_dims")
-    @classmethod
-    def validate_video_dims(cls, v: tuple[int, int, int]) -> tuple[int, int, int]:
-        """Validate video dimensions for LTX-2 compatibility."""
-        width, height, frames = v
-
-        if width % 32 != 0:
-            raise ValueError(f"Width ({width}) must be divisible by 32")
-        if height % 32 != 0:
-            raise ValueError(f"Height ({height}) must be divisible by 32")
-        if frames % 8 != 1:
-            raise ValueError(f"Frames ({frames}) must satisfy frames % 8 == 1 for LTX-2 (e.g., 1, 9, 17, 25, ...)")
-
-        return v
-
     frame_rate: float = Field(
-        default=25.0,
+        default=24.0,
         description="Frame rate for validation videos",
         gt=0,
     )
@@ -503,7 +495,7 @@ class ValidationConfig(ConfigBaseModel):
     )
 
     inference_steps: int = Field(
-        default=50,
+        default=30,
         description="Number of inference steps for validation",
         gt=0,
     )
@@ -514,29 +506,53 @@ class ValidationConfig(ConfigBaseModel):
         gt=0,
     )
 
-    guidance_scale: float = Field(
-        default=4.0,
-        description="CFG guidance scale to use during validation",
+    video_cfg_scale: float = Field(
+        default=3.0,
+        description="Video CFG guidance scale to use during validation",
         ge=1.0,
     )
 
-    stg_scale: float = Field(
+    audio_cfg_scale: float = Field(
+        default=7.0,
+        description="Audio CFG guidance scale to use during validation",
+        ge=1.0,
+    )
+
+    video_stg_scale: float = Field(
         default=1.0,
-        description="STG (Spatio-Temporal Guidance) scale. 0.0 disables STG. "
-        "Recommended value is 1.0. STG is combined with CFG for improved video quality.",
+        description="Video STG (Spatio-Temporal Guidance) scale. 0.0 disables video STG.",
+        ge=0.0,
+    )
+
+    audio_stg_scale: float = Field(
+        default=1.0,
+        description="Audio STG (Spatio-Temporal Guidance) scale. 0.0 disables audio STG.",
         ge=0.0,
     )
 
     stg_blocks: list[int] | None = Field(
-        default=[29],
-        description="Which transformer blocks to perturb for STG. "
-        "None means all blocks are perturbed. Recommended for LTX-2: [29].",
+        default_factory=lambda: [28],
+        description="Which transformer blocks to perturb for STG. None means all blocks are perturbed.",
     )
 
-    stg_mode: Literal["stg_av", "stg_v"] = Field(
-        default="stg_av",
-        description="STG mode: 'stg_av' skips both audio and video self-attention, "
-        "'stg_v' skips only video self-attention.",
+    guidance_rescale: float = Field(
+        default=0.7,
+        description="Guidance rescale factor used after CFG/STG/modality guidance. "
+        "Interpolates between the computed variance factor and 1.0. 0.0 disables rescaling.",
+        ge=0.0,
+        le=1.0,
+    )
+
+    video_modality_guidance_scale: float = Field(
+        default=3.0,
+        description="Video modality guidance scale for audio-to-video isolation guidance.",
+        ge=1.0,
+    )
+
+    audio_modality_guidance_scale: float = Field(
+        default=3.0,
+        description="Audio modality guidance scale for video-to-audio isolation guidance.",
+        ge=1.0,
     )
 
     generate_audio: bool = Field(
@@ -564,6 +580,43 @@ class ValidationConfig(ConfigBaseModel):
         "For video-to-video training: concatenate the original reference video side-by-side "
         "with the generated output. The reference comes from the input video, not from the model's output.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_deprecated_guidance_fields(cls, data: object) -> object:
+        """Map deprecated scalar guidance fields to explicit per-modality fields."""
+        if not isinstance(data, dict):
+            return data
+
+        values = dict(data)
+
+        if "guidance_scale" in values:
+            new_cfg_fields = {"video_cfg_scale", "audio_cfg_scale"} & values.keys()
+            if new_cfg_fields:
+                raise ValueError(
+                    "guidance_scale is deprecated; use video_cfg_scale and audio_cfg_scale instead, "
+                    "and do not combine old and new CFG fields."
+                )
+            guidance_scale = values.pop("guidance_scale")
+            values["video_cfg_scale"] = guidance_scale
+            values["audio_cfg_scale"] = guidance_scale
+
+        legacy_stg_fields = {"stg_scale", "stg_mode"} & values.keys()
+        if legacy_stg_fields:
+            new_stg_fields = {"video_stg_scale", "audio_stg_scale"} & values.keys()
+            if new_stg_fields:
+                raise ValueError(
+                    "stg_scale and stg_mode are deprecated; use video_stg_scale and audio_stg_scale instead, "
+                    "and do not combine old and new STG fields."
+                )
+            stg_scale = values.pop("stg_scale", 1.0)
+            stg_mode = values.pop("stg_mode", "stg_av")
+            if stg_mode not in {"stg_av", "stg_v"}:
+                raise ValueError("stg_mode must be either 'stg_av' or 'stg_v'")
+            values["video_stg_scale"] = stg_scale
+            values["audio_stg_scale"] = stg_scale if stg_mode == "stg_av" else 0.0
+
+        return values
 
     @field_validator("images")
     @classmethod
@@ -618,39 +671,6 @@ class ValidationConfig(ConfigBaseModel):
                     )
                 samples.append(ValidationSample(prompt=prompt, conditions=conditions))
             self.samples = samples
-        return self
-
-    @model_validator(mode="after")
-    def validate_scaled_reference_dimensions(self) -> "ValidationConfig":
-        """Validate that scaled reference dimensions are valid when reference_downscale_factor > 1."""
-        if self.reference_downscale_factor > 1:
-            width, height, _frames = self.video_dims
-
-            if width % self.reference_downscale_factor != 0:
-                raise ValueError(
-                    f"Width {width} is not evenly divisible by reference_downscale_factor "
-                    f"{self.reference_downscale_factor}. Choose a downscale factor that divides {width} evenly."
-                )
-            if height % self.reference_downscale_factor != 0:
-                raise ValueError(
-                    f"Height {height} is not evenly divisible by reference_downscale_factor "
-                    f"{self.reference_downscale_factor}. Choose a downscale factor that divides {height} evenly."
-                )
-
-            scaled_width = width // self.reference_downscale_factor
-            scaled_height = height // self.reference_downscale_factor
-
-            if scaled_width % 32 != 0:
-                raise ValueError(
-                    f"Scaled reference width {scaled_width} (from {width} / {self.reference_downscale_factor}) "
-                    f"is not divisible by 32. Choose a different downscale factor or adjust video_dims."
-                )
-            if scaled_height % 32 != 0:
-                raise ValueError(
-                    f"Scaled reference height {scaled_height} (from {height} / {self.reference_downscale_factor}) "
-                    f"is not divisible by 32. Choose a different downscale factor or adjust video_dims."
-                )
-
         return self
 
     @model_validator(mode="after")
@@ -760,7 +780,7 @@ class FlowMatchingConfig(ConfigBaseModel):
 
 
 class LtxTrainerConfig(ConfigBaseModel):
-    """Unified configuration for LTXV training"""
+    """Unified configuration for LTX family training."""
 
     # Sub-configurations
     model: ModelConfig = Field(default_factory=ModelConfig)

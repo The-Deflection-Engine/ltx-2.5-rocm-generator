@@ -16,7 +16,8 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
     """
 
     @classmethod
-    def from_config(cls, config: dict, ops: TransformerOpsConfig = DEFAULT_TRANSFORMER_OPS) -> LTXModel:
+    def from_metadata(cls, metadata: dict, ops: TransformerOpsConfig = DEFAULT_TRANSFORMER_OPS) -> LTXModel:
+        config = metadata.get("config", {})
         # Build caption projections for 19B models (projection handled in transformer).
         caption_projection, audio_caption_projection = _build_caption_projections(config, is_av=True)
 
@@ -69,6 +70,16 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
             caption_projection=caption_projection,
             audio_caption_projection=audio_caption_projection,
             cross_attention_adaln=config.get("cross_attention_adaln", False),
+            # Default True preserves the prompt-side AdaLN MLP for existing checkpoints. KV-cacheable
+            # checkpoints set use_prompt_adaln_single=false, dropping the timestep-dependence of the
+            # cross-attention K/V so they can be computed once per prompt and reused across steps.
+            use_prompt_adaln_single=config.get("use_prompt_adaln_single", True),
+            # Default True keeps backwards compatibility: pre-2.5 checkpoints lack these
+            # keys and retain FFN biases. LTX 2.5 (gemma4) sets ff_bias=false.
+            ff_bias=config.get("ff_bias", True),
+            audio_ff_bias=config.get("audio_ff_bias", True),
+            # Only generated-keyframe checkpoints set this; defaults off so older ones are untouched.
+            use_keyframes_abs_pos_embedding=config.get("use_keyframes_abs_pos_embedding", False),
         )
 
 
@@ -79,7 +90,8 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
     """
 
     @classmethod
-    def from_config(cls, config: dict, ops: TransformerOpsConfig = DEFAULT_TRANSFORMER_OPS) -> LTXModel:
+    def from_metadata(cls, metadata: dict, ops: TransformerOpsConfig = DEFAULT_TRANSFORMER_OPS) -> LTXModel:
+        config = metadata.get("config", {})
         # Build caption projection for 19B model (projection handled in transformer).
         caption_projection, _ = _build_caption_projections(config, is_av=False)
 
@@ -120,6 +132,14 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
             apply_gated_attention=config.get("apply_gated_attention", False),
             caption_projection=caption_projection,
             cross_attention_adaln=config.get("cross_attention_adaln", False),
+            # Default True preserves the prompt-side AdaLN MLP for existing checkpoints. KV-cacheable
+            # checkpoints set use_prompt_adaln_single=false, making the cross-attention K/V
+            # timestep-independent (computed once per prompt, reused across steps).
+            use_prompt_adaln_single=config.get("use_prompt_adaln_single", True),
+            # Default True keeps backwards compatibility with pre-2.5 checkpoints.
+            ff_bias=config.get("ff_bias", True),
+            # Only generated-keyframe checkpoints set this; defaults off so older ones are untouched.
+            use_keyframes_abs_pos_embedding=config.get("use_keyframes_abs_pos_embedding", False),
         )
 
 
@@ -132,7 +152,8 @@ class LTXAudioOnlyModelConfigurator(ModelConfigurator[LTXModel]):
     """
 
     @classmethod
-    def from_config(cls, config: dict, ops: TransformerOpsConfig = DEFAULT_TRANSFORMER_OPS) -> LTXModel:
+    def from_metadata(cls, metadata: dict, ops: TransformerOpsConfig = DEFAULT_TRANSFORMER_OPS) -> LTXModel:
+        config = metadata.get("config", {})
         # Build audio caption projection for 19B models (projection handled in transformer).
         _, audio_caption_projection = _build_caption_projections(config, is_av=True)
 

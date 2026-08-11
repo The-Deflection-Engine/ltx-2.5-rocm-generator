@@ -89,8 +89,8 @@ training_strategy:
 ## ⏩ Video Extension
 
 Extend a video forward (or backward) in time. Prefix or suffix conditioning provides a span of existing latent frames
-as clean conditioning. The `temporal_boundary` sets the number of **latent frames** used as context (each latent frame
-= 8 pixel frames due to temporal compression).
+as clean conditioning. The `temporal_boundary` sets the number of **latent frames** used as context. For the default
+VAE, each latent frame represents 8 pixel frames; the trainer derives the actual factor from the checkpoint.
 
 ```yaml
 training_strategy:
@@ -100,7 +100,7 @@ training_strategy:
     latents_dir: "latents"
     conditions:
       - type: prefix            # or "suffix" for backward extension
-        temporal_boundary: 8    # 8 latent frames = 64 pixel frames
+        temporal_boundary: 8    # 8 latent frames = 64 pixel frames for the default VAE
         probability: 1.0
   audio:
     is_generated: true
@@ -190,10 +190,14 @@ Preprocess with the `--reference-downscale-factor` option:
 ```bash
 uv run python scripts/process_dataset.py dataset.json \
     --resolution-buckets 768x768x25 \
-    --model-path /path/to/ltx2.safetensors \
-    --text-encoder-path /path/to/gemma \
+    --model-path /path/to/ltx-checkpoint.safetensors \
+    --text-encoder-path /path/to/gemma-root \
     --reference-downscale-factor 2
 ```
+
+> [!NOTE]
+> This example uses a unified checkpoint. On a split pack (LTX 2.5) also pass `--video-vae-path` and
+> `--audio-vae-path` — see [Dataset Preparation](dataset-preparation.md#basic-usage).
 
 > [!NOTE]
 > The `reference_video` column is auto-detected by convention — no `--reference-column` flag needed.
@@ -214,8 +218,9 @@ validation:
 ```
 
 > [!NOTE]
-> The scale factor must be a positive integer, and all dimensions must be divisible by 32.
-> Common values are 1 (no scaling), 2 (half resolution), or 4 (quarter resolution).
+> The scale factor must be a positive integer, and all dimensions must be divisible by the VAE
+> spatial factor (32 for the default VAE). Common values are 1 (no scaling), 2 (half resolution),
+> or 4 (quarter resolution).
 
 ---
 

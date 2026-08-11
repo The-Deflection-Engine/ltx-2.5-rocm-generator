@@ -11,17 +11,18 @@ Requires ``ltx-kernels`` to be installed (transitive via SP builder).
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from multiprocessing import SimpleQueue
 from typing import Any
 
 import torch
 import torch.distributed as dist
 
-from ltx_core.loader.registry import StateDictRegistry
+from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
+from ltx_core.loader.registry import ModelRegistry
 from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import get_video_chunks_number
-from ltx_core.model.video_vae.tiling import TilingConfig
+from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.multigpu.transformer.attention import AttentionManager
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.quantization.fp8_cast import build_policy as _build_fp8_cast_policy
@@ -33,8 +34,9 @@ from ltx_pipelines.multigpu.runner import MGPURunner
 from ltx_pipelines.multigpu.sp_builder import SequenceParallelBuilder
 from ltx_pipelines.multigpu.vae_builders import DistributedDecoderBuilder
 from ltx_pipelines.multigpu.weight_tracker import TransformerWeightTracker
-from ltx_pipelines.utils.allocator_trim_strategy import AllocatorTrimStrategy
-from ltx_pipelines.utils.media_io import encode_video
+from ltx_pipelines.utils.media_io import HDRColorSpace, encode_video, resolve_hdr_color_space, vae_dtype_for_hdr
+from ltx_pipelines.utils.model_paths import ModelPaths
+from ltx_pipelines.utils.types import DEFAULT_AUTO_DURATION, AutoDuration
 
 logger = logging.getLogger(__name__)
 
@@ -51,28 +53,30 @@ class DistilledRunner(MGPURunner):
     def setup(
         self,
         *,
-        distilled_checkpoint_path: str,
-        gemma_root: str,
+        model_paths: ModelPaths,
+        prompt_enhancer_gemma_root: str | None = None,
         spatial_upsampler_path: str,
         vae_queue: SimpleQueue,
         compilation_config: CompilationConfig | None = None,
         sp_max_tokens: int = _DEFAULT_SP_MAX_TOKENS,
         quantization: Callable[[], QuantizationPolicy] | None = None,
+        diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
     ) -> None:
         # quantization is a picklable zero-arg builder (built per worker, post-spawn); default fp8-cast.
         quantization_policy = (
-            quantization() if quantization is not None else _build_fp8_cast_policy(distilled_checkpoint_path)
+            quantization() if quantization is not None else _build_fp8_cast_policy(model_paths.transformer())
         )
-        registry = StateDictRegistry()
+        registry = ModelRegistry()
         pipeline = DistilledPipeline(
-            distilled_checkpoint_path=distilled_checkpoint_path,
-            gemma_root=gemma_root,
+            model_paths=model_paths,
+            prompt_enhancer_gemma_root=prompt_enhancer_gemma_root,
             spatial_upsampler_path=spatial_upsampler_path,
             loras=[],
             registry=registry,
             quantization=quantization_policy,
             compilation_config=compilation_config,
             alloc_trim_strategy=AllocatorTrimStrategy.DEFER,
+            diffvae_optimization=diffvae_optimization,
         )
         tracker = TransformerWeightTracker(group=self.groups.transformer_group)
 
@@ -92,15 +96,30 @@ class DistilledRunner(MGPURunner):
             tracker=tracker,
         )
 
-        # Accelerate Gemma parallelization.
-        pipeline.prompt_encoder._text_encoder_builder = AccelerateGemmaBuilder(
-            gemma_root_path=gemma_root,
+        # Accelerate Gemma parallelization. Capture shared-vs-separate before replacing
+        # the encode builder so a shared alias is re-bound to the new instance.
+        pe = pipeline.prompt_encoder
+        separate_enhancer = pe._enhancer_text_encoder_builder is not pe._text_encoder_builder
+        pe._text_encoder_builder = AccelerateGemmaBuilder(
+            gemma_root_path=model_paths.text_encoder(),
             gemma_group=self.groups.gemma_group,
             broadcast_group=self.groups.transformer_group,
             registry=registry,
             src_rank=_DRIVER_RANK,
             dtype=pipeline.dtype,
         )
+        if separate_enhancer:
+            assert prompt_enhancer_gemma_root is not None
+            pe._enhancer_text_encoder_builder = AccelerateGemmaBuilder(
+                gemma_root_path=prompt_enhancer_gemma_root,
+                gemma_group=self.groups.gemma_group,
+                broadcast_group=self.groups.transformer_group,
+                registry=registry,
+                src_rank=_DRIVER_RANK,
+                dtype=pipeline.dtype,
+            )
+        else:
+            pe._enhancer_text_encoder_builder = pe._text_encoder_builder
 
         # Distributed VAE decoding: balanced 2D spatial grid over the group (one tile/rank).
         # height takes the smaller factor of world_size, width the larger; size-aware split is a follow-up.
@@ -121,7 +140,7 @@ class DistilledRunner(MGPURunner):
         self._pipeline = pipeline
 
     @torch.inference_mode()
-    def __call__(
+    def __call__(  # noqa: PLR0913
         self,
         *,
         output_path: str,
@@ -129,13 +148,19 @@ class DistilledRunner(MGPURunner):
         seed: int,
         height: int,
         width: int,
-        num_frames: int,
         frame_rate: float,
+        num_frames: int | AutoDuration = DEFAULT_AUTO_DURATION,
         images: list[Any] | None = None,
+        enhance_prompt: bool = False,
+        enhance_static_cache: bool = False,
+        hdr: HDRColorSpace | None = None,
+        generated_keyframes: int | Sequence[int] = 0,
     ) -> Iterator[str | None]:
         # The pipeline raises ValueError on invalid input (symmetric across ranks); the controller
         # catches that and turns it into a recoverable RunnerError. Anything else is fatal.
-        video, audio = self._pipeline(
+        hdr = resolve_hdr_color_space(images=images or [], hdr=hdr)
+        vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
+        video, audio, num_frames, tiling_config = self._pipeline(
             prompt=prompt,
             seed=seed,
             height=height,
@@ -143,7 +168,12 @@ class DistilledRunner(MGPURunner):
             num_frames=num_frames,
             frame_rate=frame_rate,
             images=images or [],
+            vae_dtype=vae_dtype,
+            color_space=hdr,
             tiling_config=None,
+            enhance_prompt=enhance_prompt,
+            enhance_static_cache=enhance_static_cache,
+            generated_keyframes=generated_keyframes,
         )
         if dist.get_rank() != _DRIVER_RANK:
             yield None  # workers: nothing to encode
@@ -153,29 +183,35 @@ class DistilledRunner(MGPURunner):
             fps=frame_rate,
             audio=audio,
             output_path=output_path,
-            video_chunks_number=get_video_chunks_number(num_frames, TilingConfig.default()),
+            video_chunks_number=get_video_chunks_number(num_frames, tiling_config),
+            color_space=hdr,
         )
         yield output_path
 
 
 if __name__ == "__main__":
     from ltx_pipelines.utils.args import (
+        add_generated_keyframes_arg,
         default_2_stage_distilled_arg_parser,
         resolve_cli_params,
     )
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     params = resolve_cli_params(distilled=True)
-    args = default_2_stage_distilled_arg_parser(params=params).parse_args()
+    parser = add_generated_keyframes_arg(
+        default_2_stage_distilled_arg_parser(params=params, supports_auto_duration=True)
+    )
+    args = parser.parse_args()
 
     vae_queue = torch.multiprocessing.get_context("spawn").SimpleQueue()
     controller = MGPUController(DistilledRunner)
     controller.start(
-        distilled_checkpoint_path=args.distilled_checkpoint_path,
-        gemma_root=args.gemma_root,
+        model_paths=args.model_paths,
+        prompt_enhancer_gemma_root=args.prompt_enhancer_gemma_root,
         spatial_upsampler_path=args.spatial_upsampler_path,
         vae_queue=vae_queue,
         compilation_config=args.compile,
+        diffvae_optimization=args.diffvae_optimization,
     )
     try:
         for _ in controller.stream(
@@ -187,6 +223,10 @@ if __name__ == "__main__":
             num_frames=args.num_frames,
             frame_rate=args.frame_rate,
             images=args.images,
+            enhance_prompt=args.enhance_prompt,
+            enhance_static_cache=args.enhance_static_cache,
+            hdr=args.hdr,
+            generated_keyframes=args.num_generated_keyframes,
         ):
             pass  # drive the job to completion; the runner writes the file as a side effect
     finally:

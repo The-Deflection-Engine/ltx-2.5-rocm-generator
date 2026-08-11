@@ -1,6 +1,6 @@
 # ltx-kernels
 
-Custom CUDA/C++ kernels for `ltx-core`. Three compiled extensions:
+Custom CUDA/C++ kernels for `ltx-core`. Four compiled extensions:
 
 - **`all2all_cpp`** -- All2All communication kernels for multi-GPU tensor
   parallelism, used by the sequence-parallel inference path.
@@ -9,9 +9,32 @@ Custom CUDA/C++ kernels for `ltx-core`. Three compiled extensions:
 - **`blockwise_cpp`** -- Blockwise FP8 GEMM. SM89 (GeForce/Ada) kernel always;
   the SM90 (Hopper, `deep_gemm`) kernel is added when a `9.0` architecture is
   requested.
+- **`nvfp4_cpp`** -- NVFP4 (FP4 E2M1 + FP8 E4M3 per-16 block scales) quantize and
+  cuBLASLt block-scaled GEMM. Built for Blackwell arches (`10.0` / `12.0`) that the
+  local nvcc can emit (honors `TORCH_CUDA_ARCH_LIST` when set; skipped entirely if
+  nvcc is too old). Needs a **Blackwell** GPU (SM ≥ 10.0) at runtime -- FP4 tensor
+  cores do not exist before it. Python surface: `ltx_kernels.nvfp4`; see
+  [`docs/NVFP4.md`](docs/NVFP4.md) for the layout contract (cuBLAS 128×4 block
+  scales, Core42 PTQ checkpoint bytes). ltx-core drives it via `NVFP4Linear` and
+  `build_nvfp4_*_policy`.
 
 The Python surface for blockwise quantization lives in
 `ltx_kernels.blockwise` (`functional`, `linear`, `triton_ops`).
+
+`ltx_kernels.vae` adds two JIT-compiled CuTe DSL kernels for the diffusion VAE decoder
+(no C++ extension; `nvidia-cutlass-dsl` compiles them on first call):
+
+- **`na_attn_dsl`** -- standalone 3D neighborhood attention, a drop-in for
+  `natten.na3d`, used by the decoder's deterministic stages.
+- **`block_fna_dsl`** -- a whole `DiffusionNABlock` in one launch, with no full-volume
+  Q/K/V, used by stage 5.
+
+Both need a **datacenter Blackwell** GPU: they use `tcgen05` MMA *and* Tensor Memory
+(`sm_100`/`sm_101`/`sm_103`). Consumer Blackwell has the former but not the latter, and
+Hopper and Ada have neither, so this is not a slower fallback -- the instructions are
+absent from those ISAs. Gate on `ltx_kernels.vae.block_fna_available` /
+`na_attn_available`; each launcher also enforces it. ltx-core drives both through the
+`NA_DSL_KERNELS` module op.
 
 ## Requirements
 
@@ -70,6 +93,13 @@ Tests require a CUDA GPU:
 
 ```bash
 uv run pytest packages/ltx-kernels/tests/ -v
+```
+
+The `ltx_kernels.vae` and `ltx_kernels.nvfp4` tests additionally require a datacenter
+Blackwell GPU and skip elsewhere. NVFP4 layout/API docs: [`docs/NVFP4.md`](docs/NVFP4.md).
+
+```bash
+uv run pytest packages/ltx-kernels/tests/test_nvfp4.py -v
 ```
 
 ## Operations

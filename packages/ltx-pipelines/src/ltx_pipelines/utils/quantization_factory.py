@@ -12,25 +12,39 @@ from typing_extensions import assert_never
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.quantization.fp8_cast import build_policy as _build_fp8_cast_policy
 from ltx_core.quantization.fp8_scaled_mm import build_policy as _build_fp8_scaled_mm_policy
+from ltx_core.quantization.nvfp4 import (
+    ActScale,
+    build_nvfp4_cast_policy,
+    build_nvfp4_prequant_policy,
+)
 
 
 class QuantizationKind(str, Enum):
     FP8_CAST = "fp8-cast"
     FP8_SCALED_MM = "fp8-scaled-mm"
+    NVFP4_CAST = "nvfp4-cast"
+    NVFP4_PREQUANT = "nvfp4-prequant"
 
     def to_policy(self, checkpoint_path: str | None = None) -> QuantizationPolicy:
         """Build the :class:`QuantizationPolicy` for this kind.
-        ``checkpoint_path`` is required for both backends: ``FP8_SCALED_MM``
-        uses it to discover the layer set from ``.weight_scale`` tensors,
-        and ``FP8_CAST`` uses it to fold any prequant scales into the fp8
-        weight at load time.
+        ``checkpoint_path`` is required for ``FP8_*`` and ``NVFP4_PREQUANT``.
+        ``NVFP4_CAST`` ignores it (online BF16→NVFP4); the CLI still asks for
+        a path so the missing-flag error stays uniform across kinds.
         """
-        if checkpoint_path is None:
-            raise ValueError(f"{self.value} quantization requires checkpoint_path.")
         match self:
             case QuantizationKind.FP8_CAST:
+                if checkpoint_path is None:
+                    raise ValueError(f"{self.value} quantization requires checkpoint_path.")
                 return _build_fp8_cast_policy(checkpoint_path)
             case QuantizationKind.FP8_SCALED_MM:
+                if checkpoint_path is None:
+                    raise ValueError(f"{self.value} quantization requires checkpoint_path.")
                 return _build_fp8_scaled_mm_policy(checkpoint_path)
+            case QuantizationKind.NVFP4_CAST:
+                return build_nvfp4_cast_policy(act_scale=ActScale.FIXED_1)
+            case QuantizationKind.NVFP4_PREQUANT:
+                if checkpoint_path is None:
+                    raise ValueError(f"{self.value} quantization requires checkpoint_path.")
+                return build_nvfp4_prequant_policy(checkpoint_path, act_scale=ActScale.STATIC)
             case _:
                 assert_never(self)

@@ -66,7 +66,8 @@ validation:
     # so the output filenames make the category obvious.
     - prompt: "[CAT1-IND] <caption from dataset.json>"
     # ... repeat for each prompt in all three categories
-  # Keep video_dims, frame_rate, guidance/STG settings as the trained config.
+  # Keep video_dims, frame_rate, and validation guidance fields
+  # (video/audio CFG, STG, guidance_rescale, and modality guidance) as the trained config.
   # Keep generate_audio consistent with the trained modality config.
 
 checkpoints:

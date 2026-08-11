@@ -6,12 +6,12 @@ What the orchestrator's Phase 2 probe checks for, what to do when something is m
 
 | Prerequisite | How to detect | If missing |
 |--------------|---------------|------------|
-| CUDA GPU visible | `nvidia-smi` returns ≥1 GPU | Stop. Training requires CUDA — point the user at non-LTX-2 docs. |
+| CUDA GPU visible | `nvidia-smi` returns ≥1 GPU | Stop. Training requires CUDA — point the user at non-LTX docs. |
 | Linux | `uname -s` returns `Linux` | Stop. Trainer uses Triton (Linux-only). |
 | `uv` installed | `command -v uv` | Offer to install (see "Auto-setup" below). |
 | Workspace synced | `[ -f uv.lock ] && uv pip list \| grep -q ltx-trainer` | Offer to run `uv sync` from repo root. |
-| LTX-2 model weights | Search `/models/`, `~/models/`, `$LTX_MODELS_DIR` for a `.safetensors` matching `*ltx*2*` | Offer to download (see "Model downloads"). |
-| Gemma text encoder dir | Search same locations for a directory containing Gemma config | Offer to download. |
+| LTX model weights | Search `/models/`, `~/models/`, `$LTX_MODELS_DIR` for a `.safetensors` matching `*ltx*2*` | Offer to locate or download (see "Model downloads"). |
+| Matching Gemma text encoder dir | Search same locations for a directory containing Gemma config and checkpoint metadata | Offer to locate the matching encoder. |
 | Captioner backend | Gemini auth (`GEMINI_API_KEY`/`GOOGLE_API_KEY` or gcloud/Vertex), OR a ≥40 GiB GPU to host the Qwen3-Omni-30B vLLM server (FP8), OR captions already in the dataset | See "Captioner graceful degradation" below. **Check the HF cache for an already-downloaded Qwen model before assuming a download is needed** (see note below the table). |
 | W&B login (optional) | `uv run python -c "import wandb; print(bool(wandb.Api().api_key))"` → `True` means logged in. Uses wandb's own credential resolution (env/netrc/settings). **Don't** use `wandb status` (reports `api_key: null` even when logged in). | Not a blocker. If `False`: disabled in config + flagged in plan. If the check errors/ambiguous: ask the user, don't assume off. |
 | Disk space | `df -h $WORKSPACE` | Surface available space alongside what a run consumes (preprocessed latents, several-GB checkpoints, validation samples). Flag concerns to the user; don't enforce a hard threshold. |
@@ -52,24 +52,26 @@ After install, ask the user to restart their shell or `source ~/.bashrc` before 
 
 ### Model downloads
 
-Use `huggingface-cli` (comes with `huggingface-hub`, transitively pulled by `uv sync`). Default destination: `$LTX_MODELS_DIR` if set, else `~/models/` (create if missing). Surface destination in the prompt — never download into the repo or into the workspace.
+Use the official model URLs listed in the repository root `README.md` as the source of truth. Read that section before
+offering or running any download command; do not invent URLs or substitute a different release. Use `huggingface-cli`
+(comes with `huggingface-hub`, transitively pulled by `uv sync`) when the root README specifies a Hugging Face artifact.
+Default destination: `$LTX_MODELS_DIR` if set, else `~/models/` (create if missing). Surface destination in the prompt —
+never download into the repo or into the workspace.
 
-**LTX-2 base model:**
+**LTX model checkpoint:**
 
-```bash
-huggingface-cli download Lightricks/LTX-2.3 \
-  ltx-2.3-22b-dev.safetensors \
-  --local-dir ~/models/ltx-2.3
-```
+Read the root `README.md` and use the official LTX 2.5 checkpoint URL listed there. The 2.5 checkpoint and its
+matching text-encoder URL are the canonical pair; do not silently substitute an older model when either is unavailable.
+Ask the user before downloading each artifact.
 
-Public reference: <https://huggingface.co/Lightricks/LTX-2.3>.
+**LTX 2.5 text encoder:**
 
-**Gemma text encoder:**
+Read the root `README.md` and use the official URL listed there for the LTX 2.5-specific fine-tuned Gemma 4 root
+(for example, `gemma4-12b-ltx-v1`). Do **not** download Google's vanilla Gemma 4 model: it is not the text encoder
+used by LTX 2.5 and can fail the checkpoint/Gemma compatibility check. Ask the user before downloading it.
 
-```bash
-huggingface-cli download google/gemma-3-12b-it-qat-q4_0-unquantized \
-  --local-dir ~/models/gemma-3-12b
-```
+Older LTX checkpoints may use a matching Gemma 3 root. Select the text encoder from the checkpoint's metadata and
+the user's chosen model release.
 
 **Qwen3-Omni captioner (only if the GPU can host it):**
 
@@ -104,12 +106,13 @@ Wait for the user's choice. Don't pick one automatically — but make the hardwa
 
 ## Configuration Inheritance
 
-After downloads, the skill records the resolved paths into the plan's Assumptions section and into `config.yaml`:
+After approved downloads or when using existing model files, the skill records the resolved paths into the plan's
+Assumptions section and into `config.yaml`:
 
 ```yaml
 model:
-  model_path: "/home/<user>/models/ltx-2.3/ltx-2.3-22b-dev.safetensors"
-  text_encoder_path: "/home/<user>/models/gemma-3-12b"
+  model_path: "/home/<user>/models/ltx-checkpoint.safetensors"
+  text_encoder_path: "/home/<user>/models/matching-gemma-root"
 ```
 
 Suggest (don't enforce) setting `LTX_MODELS_DIR=~/models` in their shell rc for future runs.

@@ -11,8 +11,10 @@ import torch
 import torch.distributed as dist
 from torch.multiprocessing import Queue
 
+from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.primitives import BuilderProtocol
 from ltx_core.loader.registry import Registry
+from ltx_core.loader.sd_ops import SDOps
 from ltx_core.multigpu.vae.distributed_decoder import DistributedVideoDecoder
 from ltx_core.tiling import TileCountConfig
 
@@ -21,7 +23,11 @@ if TYPE_CHECKING:
 
 
 class DistributedDecoderBuilder(BuilderProtocol):
-    """Builder that wraps a base decoder builder with distributed logic."""
+    """Builder that wraps a base decoder builder with distributed logic.
+    Forwards ``module_ops`` / ``with_module_ops`` to the inner builder so
+    pipeline flags like ``diffvae_optimization`` (``build_diffvae_mode_op``)
+    still apply to the base ``DiffusionVideoDecoder`` before wrapping.
+    """
 
     def __init__(
         self,
@@ -45,6 +51,24 @@ class DistributedDecoderBuilder(BuilderProtocol):
     def with_registry(self, registry: Registry) -> Self:
         clone = copy.copy(self)
         clone._inner = self._inner.with_registry(registry)
+        return clone
+
+    @property
+    def model_sd_ops(self) -> SDOps | None:
+        return self._inner.model_sd_ops
+
+    def with_sd_ops(self, sd_ops: SDOps | None) -> Self:
+        clone = copy.copy(self)
+        clone._inner = self._inner.with_sd_ops(sd_ops)
+        return clone
+
+    @property
+    def module_ops(self) -> tuple[ModuleOps, ...]:
+        return self._inner.module_ops
+
+    def with_module_ops(self, module_ops: tuple[ModuleOps, ...]) -> Self:
+        clone = copy.copy(self)
+        clone._inner = self._inner.with_module_ops(module_ops)
         return clone
 
     def build(

@@ -1,6 +1,6 @@
 [project]
 name = "ltx-trainer"
-version = "1.1.7"
+version = "1.2.0"
 description = "LTX-2 training, democratized."
 readme = "README.md"
 authors = [
@@ -31,14 +31,28 @@ dependencies = [
     "torch>=2.6.0",
     "torchaudio>=2.7.0",
     # torchcodec must match the torch version (it ships a torch-ABI C++ extension and declares
-    # no torch pin of its own); the 0.9 line matches torch 2.9. torchaudio>=2.9 routes
+    # no torch pin of its own). With the natten extra (torch 2.13 + cu132), keep the upper
+    # bound open enough for matching torchcodec wheels. torchaudio>=2.9 routes
     # torchaudio.load() through torchcodec, so audio preprocessing needs it installed.
-    "torchcodec>=0.8.1,<0.10",
+    "torchcodec>=0.8.1,<1.0.0",
     "torchvision>=0.21.0",
     "typer>=0.15.1",
     "wandb>=0.27.0",
     "setuptools>=79.0.0",
 ]
+
+[tool.uv.sources]
+torchcodec = { index = "torch" }
+torchaudio = { index = "torch-test" }
+
+[[tool.uv.index]]
+name = "torch"
+url = "https://download.pytorch.org/whl/cu132"
+
+[[tool.uv.index]]
+name = "torch-test"
+url = "https://download.pytorch.org/whl/test/cu132/"
+explicit = true
 
 [dependency-groups]
 dev = [
@@ -54,7 +68,7 @@ build-backend = "hatchling.build"
 
 
 [tool.ruff]
-target-version = "1.1.7"
+target-version = "py311"
 line-length = 120
 # Restrict isort first-party detection to src/ so stray dirs (e.g. wandb/ run output)
 # next to pyproject.toml don't get classified as first-party packages. See ruff#10519.

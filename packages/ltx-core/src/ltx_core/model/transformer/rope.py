@@ -102,7 +102,9 @@ def generate_freq_grid_np(
             dtype=np.float64,
         ),
     )
-    return torch.tensor(pow_indices * math.pi / 2, dtype=torch.float32)
+    # as_tensor (not tensor): under torch.compile the numpy ops above are traced as tensors,
+    # so torch.tensor() would copy-construct from a tensor (warns); as_tensor casts in place.
+    return torch.as_tensor(pow_indices * math.pi / 2, dtype=torch.float32)
 
 
 @functools.lru_cache(maxsize=5)

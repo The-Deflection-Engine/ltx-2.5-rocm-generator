@@ -32,7 +32,7 @@ This is a fine-tuned version of [`{base_model}`]({base_model_link}) trained on c
 
 ## Usage
 
-This model is designed to be used with the LTX-2 (Lightricks Audio-Video) pipeline.
+This model is designed to be used with the matching LTX family pipeline.
 
 ### 🔌 Using Trained LoRAs in ComfyUI
 
@@ -56,4 +56,4 @@ This model inherits the license of the base model ([`{base_model}`]({base_model_
 ## Acknowledgments
 
 - Base model: [Lightricks](https://huggingface.co/Lightricks/LTX-2)
-- Trainer: [LTX-2](https://github.com/Lightricks/LTX-2)
+- Trainer: [LTX Trainer](https://github.com/Lightricks/LTX-2/tree/main/packages/ltx-trainer)

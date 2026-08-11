@@ -8,8 +8,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ltx-kernels"
-version = "0.1.0"
-dependencies = ["torch"]
+version = "1.2.0"
+dependencies = [
+    "torch",
+    "nvidia-cutlass-dsl>=4.6.0.dev0,<5; sys_platform == 'linux'",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

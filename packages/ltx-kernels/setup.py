@@ -3,11 +3,107 @@ import re
 import subprocess
 from pathlib import Path
 
-import setuptools
+
+def _prefer_pip_cuda_home() -> None:
+    """Point CUDA_HOME at pip nvidia-cuda-nvcc when unset (match torch's CUDA)."""
+    if os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH"):
+        return
+    try:
+        from importlib.metadata import PackageNotFoundError, distribution  # noqa: PLC0415
+
+        root = Path(str(distribution("nvidia-cuda-nvcc").locate_file("")))
+    except PackageNotFoundError:
+        return
+    for candidate in (root / "nvidia" / "cu13", root / "nvidia" / "cuda_nvcc"):
+        if (candidate / "bin" / "nvcc").is_file():
+            os.environ["CUDA_HOME"] = str(candidate)
+            path = os.environ.get("PATH", "")
+            bin_dir = str(candidate / "bin")
+            if bin_dir not in path.split(os.pathsep):
+                os.environ["PATH"] = bin_dir + os.pathsep + path
+            return
+
+
+_prefer_pip_cuda_home()
+
+import setuptools  # CUDA_HOME must be set before cpp_extension import
 import torch
 from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _cuda_lib_dirs() -> list[Path]:
+    """Real lib dirs under CUDA_HOME (pip wheels use ``lib/``, system toolkits ``lib64/``)."""
+    if CUDA_HOME is None:
+        return []
+    home = Path(CUDA_HOME)
+    return [p for p in (home / "lib", home / "lib64", home / "lib64" / "stubs", home / "lib" / "stubs") if p.is_dir()]
+
+
+def _system_cuda_stub_dirs() -> list[Path]:
+    """Dirs that provide ``libcuda.so`` (driver stub). Pip CUDA wheels do not ship it."""
+    candidates = [
+        Path("/usr/local/cuda/lib64/stubs"),
+        Path("/usr/local/cuda/lib/stubs"),
+        Path("/usr/lib/x86_64-linux-gnu"),
+        Path("/usr/lib64"),
+    ]
+    # If CUDA_HOME is the pip tree, also probe a sibling system toolkit.
+    if CUDA_HOME is not None:
+        home = Path(CUDA_HOME)
+        candidates.extend([home / "lib64" / "stubs", home / "lib" / "stubs"])
+    return [p for p in candidates if (p / "libcuda.so").is_file() or (p / "libcuda.so.1").is_file()]
+
+
+def _pip_cuda_link_dirs() -> list[str]:
+    """Library dirs for ``-lcudart`` / ``-lnvrtc`` / ``-lcuda`` against pip CUDA wheels.
+    Pip nvidia wheels ship versioned sonames only (``libcudart.so.13``) without the
+    unversioned ``libcudart.so`` that ``-lcudart`` expects. Rather than mutate
+    site-packages, stage relative symlinks in a build-local dir and put that first
+    on the linker search path. System toolkits already have unversioned names, so
+    the staging dir stays empty of conflicts and later dirs still work.
+    ``libcuda`` (driver) is never in the pip wheels; append system stub dirs for
+    ``-lcuda`` (blockwise).
+    """
+    real_dirs = _cuda_lib_dirs()
+    stub_dirs = _system_cuda_stub_dirs()
+    if not real_dirs and not stub_dirs:
+        return []
+
+    stage = ROOT / "build" / "cuda_so_links"
+    stage.mkdir(parents=True, exist_ok=True)
+
+    # Prefer the longest soname (libfoo.so.13.2.75 over libfoo.so.13) when several exist.
+    by_stem: dict[str, Path] = {}
+    for lib_dir in real_dirs:
+        for versioned in lib_dir.glob("lib*.so.*"):
+            if versioned.name.endswith(".a"):
+                continue
+            stem = versioned.name.split(".so.", 1)[0] + ".so"
+            prev = by_stem.get(stem)
+            if prev is None or len(versioned.name) >= len(prev.name):
+                by_stem[stem] = versioned
+
+    for stem, versioned in by_stem.items():
+        link = stage / stem
+        if link.is_symlink() or link.exists():
+            if link.is_symlink() and link.resolve() == versioned.resolve():
+                continue
+            link.unlink()
+        # Relative target so the stage dir is relocatable within the build tree.
+        link.symlink_to(os.path.relpath(versioned, start=stage))
+
+    # Dedupe while preserving order: stage, pip libs, system stubs.
+    out: list[str] = [str(stage)]
+    seen = {str(stage)}
+    for p in [*real_dirs, *stub_dirs]:
+        s = str(p)
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
 
 # cutlass headers for the blockwise GEMM kernels. Pinned to the upstream commit the
 # build was validated against and fetched into a cache dir, rather than carried as a
@@ -84,6 +180,27 @@ def _blockwise_gencode() -> tuple[list[str], bool]:
     return flags, ("90a" in archs)
 
 
+# Arch codes the NVFP4 kernels support. The E2M1 pack/convert intrinsics and the cuBLASLt
+# block-scaled FP4 kernels are Blackwell-only (sm_100a datacenter, sm_120a consumer).
+_NVFP4_ARCHES = ["100a", "120a"]
+
+
+def _nvfp4_gencode() -> list[str]:
+    """Blackwell arches to build the NVFP4 extension for, or [] to skip it."""
+    supported = _nvcc_arch_nums()
+    base = [a for a in _NVFP4_ARCHES if a in supported or a.rstrip("a") in supported]
+    env = _arch_tokens()
+    if not env:
+        return base
+    sel = []
+    for tok in env:
+        if tok.startswith("10.0"):
+            sel.append("100a")
+        elif tok.startswith("12.0"):
+            sel.append("120a")
+    return [a for a in dict.fromkeys(sel) if a in base]
+
+
 def _cutlass_include() -> str:
     """Return the cutlass include dir, fetching the pinned commit on first use.
     Honors ``CUTLASS_DIR`` (a prebuilt cutlass checkout, e.g. a system copy) and
@@ -123,6 +240,7 @@ if __name__ == "__main__":
             "CUDA_HOME set)."
         )
 
+    cuda_link_dirs = _pip_cuda_link_dirs()
     ext_modules = []
 
     # all2all_cpp -- unchanged.
@@ -136,6 +254,7 @@ if __name__ == "__main__":
                 "csrc/all2all/cuda/all2all_heads.cu",
                 "csrc/all2all/cuda/allgather.cu",
             ],
+            library_dirs=cuda_link_dirs,
             extra_compile_args={"cxx": all2all_args, "nvcc": ["-O3"]},
         )
     )
@@ -155,6 +274,7 @@ if __name__ == "__main__":
                 "csrc/ops/rms_norm_split_rope_cuda.cu",
             ],
             include_dirs=[str(ROOT / "csrc/ops/include"), *_nvidia_include_dirs()],
+            library_dirs=cuda_link_dirs,
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
                 "nvcc": [
@@ -167,6 +287,7 @@ if __name__ == "__main__":
                     "--expt-relaxed-constexpr",
                     "--expt-extended-lambda",
                     "--use_fast_math",
+                    "-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK",
                 ],
             },
         )
@@ -197,6 +318,7 @@ if __name__ == "__main__":
         "-U__CUDA_NO_HALF_CONVERSIONS__",
         "-U__CUDA_NO_HALF2_OPERATORS__",
         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK",
         *gencode,
     ]
     if build_sm90:
@@ -217,10 +339,49 @@ if __name__ == "__main__":
                 *_nvidia_include_dirs(),
             ],
             libraries=["cuda", "cudart", "nvrtc"],
-            library_dirs=[f"{CUDA_HOME}/lib64", f"{CUDA_HOME}/lib64/stubs"],
+            library_dirs=cuda_link_dirs,
             extra_compile_args={"cxx": blockwise_cxx, "nvcc": blockwise_nvcc},
         )
     )
+
+    # nvfp4_cpp -- in-house NVFP4 quantize (CUDA) + block-scaled GEMM (cuBLASLt).
+    # Blackwell-only: the E2M1/E4M3 conversion intrinsics and the cuBLASLt FP4 kernels
+    # both need SM >= 10.0, so this extension is built for the Blackwell targets among
+    # TORCH_CUDA_ARCH_LIST (defaulting to whatever this nvcc supports) and is skipped
+    # entirely when nvcc is too old to emit them.
+    nvfp4_archs = _nvfp4_gencode()
+    if nvfp4_archs:
+        ext_modules.append(
+            CUDAExtension(
+                name="nvfp4_cpp",
+                sources=[
+                    "csrc/nvfp4/api.cpp",
+                    "csrc/nvfp4/gemm.cpp",
+                    "csrc/nvfp4/quantize.cu",
+                ],
+                include_dirs=[
+                    str(ROOT / "csrc/nvfp4"),
+                    f"{CUDA_HOME}/include",
+                    *_nvidia_include_dirs(),
+                ],
+                libraries=["cublasLt"],
+                library_dirs=cuda_link_dirs,
+                extra_compile_args={
+                    "cxx": ["-O3", "-std=c++17"],
+                    "nvcc": [
+                        "-O3",
+                        "-std=c++17",
+                        "--expt-relaxed-constexpr",
+                        "--expt-extended-lambda",
+                        "-U__CUDA_NO_HALF_OPERATORS__",
+                        "-U__CUDA_NO_HALF_CONVERSIONS__",
+                        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                        "-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK",
+                        *[f"-gencode=arch=compute_{a},code=sm_{a}" for a in nvfp4_archs],
+                    ],
+                },
+            )
+        )
 
     setuptools.setup(
         ext_modules=ext_modules,

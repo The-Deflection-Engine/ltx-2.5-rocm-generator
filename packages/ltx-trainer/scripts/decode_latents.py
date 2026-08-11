@@ -6,7 +6,7 @@ This script loads latent files saved during preprocessing and decodes them
 back into video clips using the same VAE model.
 Basic usage:
     python scripts/decode_latents.py /path/to/latents/dir /path/to/output \
-        --model-source /path/to/ltx2.safetensors
+        --model-path /path/to/ltx-checkpoint.safetensors
 """
 
 from pathlib import Path
@@ -28,9 +28,15 @@ from rich.progress import (
 )
 from transformers.utils.logging import disable_progress_bar
 
-from ltx_core.model.video_vae import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
+from ltx_core.model.video_vae import DimensionSizeConfig, TileSizeConfig
 from ltx_trainer import logger
-from ltx_trainer.model_loader import load_audio_vae_decoder, load_video_vae_decoder, load_vocoder
+from ltx_trainer.model_loader import (
+    load_audio_vae_decoder,
+    load_video_vae_decoder,
+    load_vocoder,
+    resolve_audio_vae_path,
+    resolve_video_vae_path,
+)
 from ltx_trainer.video_utils import save_video
 
 DEFAULT_TILE_SIZE_PIXELS = 512  # Spatial tile size in pixels (must be ≥64 and divisible by 32)
@@ -54,13 +60,17 @@ class LatentsDecoder:
         device: str = "cuda",
         vae_tiling: bool = False,
         with_audio: bool = False,
+        video_vae_path: str | None = None,
+        audio_vae_path: str | None = None,
     ):
         """Initialize the decoder with model configuration.
         Args:
-            model_path: Path to LTX-2 checkpoint (.safetensors)
+            model_path: Unified checkpoint, or the transformer of a split pack
             device: Device to use for computation
             vae_tiling: Whether to enable VAE tiling for larger video resolutions
             with_audio: Whether to load audio VAE for audio decoding
+            video_vae_path: Standalone video VAE, required for a split pack
+            audio_vae_path: Standalone audio VAE, required for a split pack with audio
         """
         self.device = torch.device(device)
         self.model_path = model_path
@@ -69,19 +79,23 @@ class LatentsDecoder:
         self.vocoder = None
         self.vae_tiling = vae_tiling
 
-        self._load_model(model_path, with_audio)
+        self._load_model(
+            resolve_video_vae_path(model_path, video_vae_path),
+            resolve_audio_vae_path(model_path, audio_vae_path) if with_audio else str(model_path),
+            with_audio,
+        )
 
-    def _load_model(self, model_path: str, with_audio: bool = False) -> None:
+    def _load_model(self, video_vae_path: str, audio_vae_path: str, with_audio: bool = False) -> None:
         """Initialize and load the VAE model(s)."""
-        with console.status(f"[bold]Loading video VAE decoder from {model_path}...", spinner="dots"):
-            self.vae = load_video_vae_decoder(model_path, device=self.device, dtype=torch.bfloat16)
+        with console.status(f"[bold]Loading video VAE decoder from {video_vae_path}...", spinner="dots"):
+            self.vae = load_video_vae_decoder(video_vae_path, device=self.device, dtype=torch.bfloat16)
 
         if with_audio:
-            with console.status(f"[bold]Loading audio VAE decoder from {model_path}...", spinner="dots"):
-                self.audio_vae = load_audio_vae_decoder(model_path, device=self.device, dtype=torch.bfloat16)
+            with console.status(f"[bold]Loading audio VAE decoder from {audio_vae_path}...", spinner="dots"):
+                self.audio_vae = load_audio_vae_decoder(audio_vae_path, device=self.device, dtype=torch.bfloat16)
 
-            with console.status(f"[bold]Loading vocoder from {model_path}...", spinner="dots"):
-                self.vocoder = load_vocoder(model_path, device=self.device)
+            with console.status(f"[bold]Loading vocoder from {audio_vae_path}...", spinner="dots"):
+                self.vocoder = load_vocoder(audio_vae_path, device=self.device)
 
     @torch.inference_mode()
     def decode(self, latents_dir: Path, output_dir: Path, seed: int | None = None) -> None:
@@ -228,14 +242,18 @@ class LatentsDecoder:
         """Decode latents to video frames."""
         if self.vae_tiling:
             # Use tiled decoding for reduced VRAM
-            tiling_config = TilingConfig(
-                spatial_config=SpatialTilingConfig(
-                    tile_size_in_pixels=DEFAULT_TILE_SIZE_PIXELS,
-                    tile_overlap_in_pixels=DEFAULT_TILE_OVERLAP_PIXELS,
+            tiling_config = TileSizeConfig(
+                height=DimensionSizeConfig(
+                    tile_size=DEFAULT_TILE_SIZE_PIXELS,
+                    overlap=DEFAULT_TILE_OVERLAP_PIXELS,
                 ),
-                temporal_config=TemporalTilingConfig(
-                    tile_size_in_frames=DEFAULT_TILE_SIZE_FRAMES,
-                    tile_overlap_in_frames=DEFAULT_TILE_OVERLAP_FRAMES,
+                width=DimensionSizeConfig(
+                    tile_size=DEFAULT_TILE_SIZE_PIXELS,
+                    overlap=DEFAULT_TILE_OVERLAP_PIXELS,
+                ),
+                frames=DimensionSizeConfig(
+                    tile_size=DEFAULT_TILE_SIZE_FRAMES,
+                    overlap=DEFAULT_TILE_OVERLAP_FRAMES,
                 ),
             )
             chunks = list(
@@ -303,7 +321,15 @@ def main(
     ),
     model_path: str = typer.Option(
         ...,
-        help="Path to LTX-2 checkpoint (.safetensors file)",
+        help="Path to the unified checkpoint or split transformer safetensors",
+    ),
+    video_vae_path: str | None = typer.Option(
+        default=None,
+        help="Split-pack video VAE safetensors (defaults to --model-path for unified checkpoints)",
+    ),
+    audio_vae_path: str | None = typer.Option(
+        default=None,
+        help="Split-pack audio VAE safetensors (defaults to --model-path for unified checkpoints)",
     ),
     device: str = typer.Option(
         default="cuda",
@@ -332,13 +358,13 @@ def main(
     Examples:
         # Basic usage
         python scripts/decode_latents.py /path/to/latents /path/to/videos \\
-            --model-path /path/to/ltx2.safetensors
-        # With VAE tiling for large videos
+            --model-path /path/to/ltx-checkpoint.safetensors
+        # Disable tiled decoding when comparing against a full decode
         python scripts/decode_latents.py /path/to/latents /path/to/videos \\
-            --model-path /path/to/ltx2.safetensors --vae-tiling
+            --model-path /path/to/ltx-checkpoint.safetensors --no-vae-tiling
         # With audio decoding
         python scripts/decode_latents.py /path/to/latents /path/to/videos \\
-            --model-path /path/to/ltx2.safetensors --with-audio
+            --model-path /path/to/ltx-checkpoint.safetensors --with-audio
     """
     latents_path = Path(latents_dir)
     output_path = Path(output_dir)
@@ -348,6 +374,8 @@ def main(
 
     decoder = LatentsDecoder(
         model_path=model_path,
+        video_vae_path=video_vae_path,
+        audio_vae_path=audio_vae_path,
         device=device,
         vae_tiling=vae_tiling,
         with_audio=with_audio,

@@ -9,7 +9,8 @@ class LatentUpsamplerConfigurator(ModelConfigurator[LatentUpsampler]):
     """
 
     @classmethod
-    def from_config(cls: type[LatentUpsampler], config: dict) -> LatentUpsampler:
+    def from_metadata(cls, metadata: dict) -> LatentUpsampler:
+        config = metadata.get("config", {})
         in_channels = config.get("in_channels", 128)
         mid_channels = config.get("mid_channels", 512)
         num_blocks_per_stage = config.get("num_blocks_per_stage", 4)

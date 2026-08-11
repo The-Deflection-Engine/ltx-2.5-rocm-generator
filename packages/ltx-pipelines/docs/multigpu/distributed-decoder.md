@@ -12,6 +12,13 @@ Workers ship their decoded tiles to the **driver rank** over an `mp.Queue` (CUDA
 IPC — zero-copy handle sharing); the driver blends overlaps and yields the assembled
 frames as temporal batches spread across the GPUs.
 
+`DistributedVideoDecoder` wraps any `VideoDecoder` — both the conv
+`ConvVideoDecoder` and the diffusion `DiffusionVideoDecoder` — by calling the
+public `decode_video` API per MGPU tile (already `[F, H, W, C]` in `[0, 1]`).
+It does **not** apply a second `[-1, 1] → [0, 1]` map. Full-video assembly is
+`gather_frames` on the driver; any `torch.cat` of decode yields is only for
+stitching that tile’s optional SGPU temporal chunks.
+
 ## Inter-GPU tiling vs intra-GPU tiling
 
 Two independent tilings, commonly conflated:
@@ -22,9 +29,13 @@ Two independent tilings, commonly conflated:
 | **Intra-GPU** (SGPU) | Chunking *within* a rank's tile to bound **VRAM** | `tiling_config: TilingConfig` (per call) | the pipeline's usual tiling kwarg |
 
 They compose — a rank can further chunk its assigned tile for VRAM — with one
-guard: **multi-GPU temporal tiling and single-GPU temporal tiling cannot both be
-on.** If `vae_tiling.frames.num_tiles > 1` and `tiling_config.temporal_config` is
-set, `decode_video` raises, because two causal temporal splits would conflict.
+guard: **multi-GPU temporal tiling and single-GPU temporal tiling cannot both
+actually split the temporal axis.** If `vae_tiling.frames.num_tiles > 1` and
+SGPU `tiling_config.video_chunks_number(tile_frames) > 1` for a rank's tile
+(i.e. SGPU would produce more than one temporal chunk on that extent),
+`decode_video` raises, because two causal temporal splits would conflict. A
+size-based SGPU config such as `frames=80/24` on a short tile is fine when it
+still yields a single chunk.
 
 ## API
 

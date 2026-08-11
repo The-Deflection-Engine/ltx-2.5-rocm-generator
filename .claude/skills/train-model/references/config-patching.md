@@ -17,6 +17,9 @@ How to safely produce `<workspace>/<run-name>/config.yaml` from an example in `p
 | `data.preprocessed_data_root` | `<workspace>/<run-name>/dataset/.precomputed` (absolute). |
 | `output_dir` | `<workspace>/<run-name>/outputs` (absolute). |
 
+For LTX 2.5, `model.text_encoder_path` must resolve to the matching LTX-specific fine-tuned Gemma 4 root, not
+Google's vanilla Gemma 4 model. The checkpoint and text encoder are separate local paths.
+
 ## Hardware-Driven Patches
 
 Apply per the matched VRAM tier in `references/hardware-profiles.md`. After autotune (Phase 6), patch the winning trial's deltas in.

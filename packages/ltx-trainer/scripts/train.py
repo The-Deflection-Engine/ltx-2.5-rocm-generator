@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 
 """
-Train LTXV models using configuration from YAML files.
-This script provides a command-line interface for training LTXV models using
+Train LTX family models using configuration from YAML files.
+This script provides a command-line interface for training LTX family models using
 either LoRA fine-tuning or full model fine-tuning. It loads configuration from
 a YAML file and passes it to the trainer.
 Basic usage:
@@ -27,7 +27,7 @@ console = Console()
 app = typer.Typer(
     pretty_exceptions_enable=False,
     no_args_is_help=True,
-    help="Train LTXV models using configuration from YAML files.",
+    help="Train LTX models using configuration from YAML files.",
 )
 
 

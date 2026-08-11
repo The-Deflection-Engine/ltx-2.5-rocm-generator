@@ -9,6 +9,7 @@ from ltx_core.conditioning.types import (
     VideoConditionByLatentIndex,
     VideoConditionByMask,
     VideoConditionByReferenceLatent,
+    VideoGeneratedKeyframeSlots,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "VideoConditionByLatentIndex",
     "VideoConditionByMask",
     "VideoConditionByReferenceLatent",
+    "VideoGeneratedKeyframeSlots",
 ]

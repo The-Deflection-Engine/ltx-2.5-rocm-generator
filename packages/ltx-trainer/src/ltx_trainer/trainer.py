@@ -38,7 +38,13 @@ from ltx_trainer.config_display import print_config
 from ltx_trainer.datasets import PrecomputedDataset
 from ltx_trainer.gpu_utils import free_gpu_memory, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
-from ltx_trainer.model_loader import load_embeddings_processor, load_transformer
+from ltx_trainer.model_loader import (
+    embedding_weight_paths,
+    load_embeddings_processor,
+    load_transformer,
+    read_video_scale_factors,
+    resolve_video_vae_path,
+)
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
@@ -92,6 +98,13 @@ class LtxvTrainer:
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
+        # The VAE isn't loaded during training (latents are precomputed), so source the
+        # video compression factors from the checkpoint's embedded VAE config. This keeps
+        # the RoPE positions consistent with the VAE that produced the latents (and with
+        # inference), instead of assuming the default 32x32x8 layout.
+        self._training_strategy.video_scale_factors = read_video_scale_factors(
+            resolve_video_vae_path(self._config.model.model_path, self._config.model.video_vae_path)
+        )
 
         # ValidationRunner loads its own models (text encoder, VAE encoder/decoder, etc.),
         # caches prompt embeddings and conditioning media, then unloads encoders.
@@ -99,6 +112,8 @@ class LtxvTrainer:
             config=self._config.validation,
             model_path=self._config.model.model_path,
             text_encoder_path=self._config.model.text_encoder_path,
+            video_vae_path=self._config.model.video_vae_path,
+            audio_vae_path=self._config.model.audio_vae_path,
             load_text_encoder_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
         )
 
@@ -408,7 +423,11 @@ class LtxvTrainer:
 
         logger.debug("Loading embeddings processor...")
         self._embeddings_processor = load_embeddings_processor(
-            checkpoint_path=self._config.model.model_path,
+            checkpoint_path=embedding_weight_paths(
+                self._config.model.model_path,
+                self._config.model.text_encoder_path,
+            ),
+            gemma_model_path=self._config.model.text_encoder_path,
             device=init_device,
             dtype=torch.bfloat16,
         )
@@ -928,21 +947,19 @@ class LtxvTrainer:
 
         # Get state dict (collective operation - all processes must participate)
         self._accelerator.wait_for_everyone()
-        full_state_dict = self._accelerator.get_state_dict(self._transformer)
+        state_dict = self._accelerator.get_state_dict(self._transformer)
 
-        if not IS_MAIN_PROCESS:
+        # Only the main process saves the checkpoint
+        if not self._accelerator.is_main_process:
             return None
 
         save_dir.mkdir(exist_ok=True, parents=True)
 
-        # Determine save precision
-        save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32
-
         # For LoRA: extract only adapter weights; for full: use as-is
         if is_lora:
             unwrapped = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
-            # For FSDP, pass full_state_dict since model params aren't directly accessible
-            state_dict = get_peft_model_state_dict(unwrapped, state_dict=full_state_dict if is_fsdp else None)
+            # For FSDP, pass the gathered state dict since model params aren't directly accessible
+            state_dict = get_peft_model_state_dict(unwrapped, state_dict=state_dict if is_fsdp else None)
 
             # Remove "base_model.model." prefix added by PEFT
             state_dict = {k.replace("base_model.model.", "", 1): v for k, v in state_dict.items()}
@@ -950,20 +967,15 @@ class LtxvTrainer:
             # Convert to ComfyUI-compatible format (add "diffusion_model." prefix)
             state_dict = {f"diffusion_model.{k}": v for k, v in state_dict.items()}
 
-            # Cast to configured precision
-            state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in state_dict.items()}
+        # Determine save precision
+        save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32
 
-            # Build metadata for safetensors file
-            metadata = self._build_checkpoint_metadata()
+        # Cast to configured precision. safetensors rejects non-contiguous tensors, and casting
+        # a non-contiguous parameter keeps it non-contiguous.
+        state_dict = {k: v.to(save_dtype).contiguous() if isinstance(v, Tensor) else v for k, v in state_dict.items()}
 
-            # Save to disk with metadata
-            save_file(state_dict, saved_weights_path, metadata=metadata)
-        else:
-            # Cast to configured precision
-            full_state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in full_state_dict.items()}
-
-            # Save to disk
-            self._accelerator.save(full_state_dict, saved_weights_path)
+        # Save to disk with metadata
+        save_file(state_dict, saved_weights_path, metadata=self._build_checkpoint_metadata())
 
         rel_path = saved_weights_path.relative_to(self._config.output_dir)
         logger.info(f"💾 {prefix.capitalize()} weights for step {self._global_step} saved in {rel_path}")

@@ -42,6 +42,11 @@ class SequenceParallelBuilder(DelegatingBuilder[InnerModelT], Generic[InnerModel
         self._attn_mgr = attn_mgr
 
     @property
+    def keeps_gpu_resident_weights(self) -> bool:
+        # Weight tracker keeps registry tensors GPU-resident and rebinds them across builds.
+        return True
+
+    @property
     def all2all_timeout_seconds(self) -> float:
         """The SP all2all barrier timeout (seconds); forwards to the AttentionManager that owns the refs."""
         return self._attn_mgr.all2all_timeout_seconds

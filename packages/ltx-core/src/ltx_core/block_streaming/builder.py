@@ -28,7 +28,7 @@ from ltx_core.block_streaming.utils import (
 from ltx_core.block_streaming.wrapper import BlockStreamingWrapper
 from ltx_core.devices import synchronize_device
 from ltx_core.loader.fuse_loras import FuseRule, bf16_fuse_rule, fuse_lora_weights
-from ltx_core.loader.helpers import create_meta_model, load_state_dict, read_model_config
+from ltx_core.loader.helpers import create_meta_model, load_state_dict, read_model_config, read_model_metadata
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.primitives import (
     LoraPathStrengthAndSDOps,
@@ -38,7 +38,7 @@ from ltx_core.loader.primitives import (
     StateDictLoader,
     TensorLayout,
 )
-from ltx_core.loader.registry import DummyRegistry, Registry
+from ltx_core.loader.registry import ModelRegistry, Registry
 from ltx_core.loader.sd_ops import SDOps
 from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
 from ltx_core.model.model_protocol import ModelConfigurator, ModelType
@@ -102,7 +102,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         self._module_ops = module_ops
         self._loras = loras
         self._model_loader = model_loader if model_loader is not None else SafetensorsModelStateDictLoader()
-        self._registry = registry if registry is not None else DummyRegistry()
+        self._registry = registry if registry is not None else ModelRegistry(cache_models=True, cache_weights=False)
         self._fuse_rule = fuse_rule
         self._blocks_attr = blocks_attr
         self._blocks_prefix = blocks_prefix
@@ -156,6 +156,11 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
     def cpu_slots_count(self) -> int | None:
         return self._cpu_slots_count
 
+    @property
+    def keeps_gpu_resident_weights(self) -> bool:
+        # Block weights live in fixed GPU/CPU slots that are reused across builds.
+        return True
+
     def with_sd_ops(self, sd_ops: SDOps | None) -> Self:
         clone = copy.copy(self)
         clone._model_sd_ops = sd_ops
@@ -189,9 +194,13 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         """Read model configuration from the checkpoint metadata."""
         return read_model_config(self.model_path, self.model_loader)
 
-    def meta_model(self, config: dict, module_ops: tuple[ModuleOps, ...]) -> ModelType:
+    def model_metadata(self) -> dict:
+        """Read the full checkpoint metadata (including sibling keys beyond ``config``)."""
+        return read_model_metadata(self.model_path, self.model_loader)
+
+    def meta_model(self, metadata: dict, module_ops: tuple[ModuleOps, ...]) -> ModelType:
         """Create a model on the meta device and apply module operations."""
-        return create_meta_model(self.model_class_configurator, config, module_ops)
+        return create_meta_model(self.model_class_configurator, metadata, module_ops)
 
     def build(
         self,
@@ -218,8 +227,8 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
             raise ValueError("StreamingModelBuilder.build requires an explicit dtype")
         device = device if device is not None else torch.device("cuda")
 
-        config = read_model_config(self.model_path, self.model_loader)
-        meta_model: nn.Module = create_meta_model(self.model_class_configurator, config, self.module_ops)
+        metadata = self.model_metadata()
+        meta_model: nn.Module = create_meta_model(self.model_class_configurator, metadata, self.module_ops)
         meta_model.eval()
 
         blocks = resolve_attr(meta_model, self.blocks_attr)
