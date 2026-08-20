@@ -5,6 +5,7 @@
 # Whitelist root files
 !.gitignore
 !gen_test.py
+!generate_video.py
 !README.md
 !requirements.txt
 
