@@ -1,10 +1,8 @@
 # 🎬 LTX-2.5 ROCm Video Generator
 
-A GUI control panel (`generate_video.py`) for running the **LTX-2.5 video diffusion model** on a single AMD consumer GPU via ROCm — built and tuned on an RX 9070 XT (16GB VRAM) with 124GB system RAM.
+A GUI control panel (`generate_video.py`) for running the **LTX-2.5 video diffusion model** on a single AMD consumer GPU via ROCm — built and tuned on an RX 9070 XT (16GB VRAM) with 128GB system RAM.
 
 It keeps the FP8 model resident in memory between generations, runs the distilled guidance-free schedule correctly, tiles the VAE decode to avoid AMDGPU driver timeouts, and supports a working two-stage generate-then-upscale pipeline.
-
-> `gen_test.py` in this repo is an old prototype kept for reference only — it is **not** maintained and should not be used. `generate_video.py` is the active script.
 
 ---
 
@@ -36,7 +34,7 @@ This opens the control panel. Fill in:
 
 Click **🚀 Generate Video**. Progress and logs stream into the console pane; **🛑 Cancel** stops between steps.
 
-### Recommended settings for this hardware (16GB VRAM / 124GB RAM)
+### Recommended settings for this hardware (16GB VRAM / 128GB RAM)
 
 > ⚠️ **This has only been tested on an RX 9070 XT (16GB VRAM), and headroom on that card is tight.** A 960x544 (2-stage) run at 193 frames — the upper end of what the token-count math below suggested should fit — locked up the entire machine during testing, not just the generation process. Treat the figures below as the practical ceiling, not a floor to push past, until proven otherwise on your own hardware. **For this reason 2-stage upscaling now defaults to off in the GUI** — enable it deliberately, and start well below the maximum until you've confirmed your system handles it.
 
@@ -50,7 +48,9 @@ The binding constraint is VRAM, not RAM — the transformer's attention cost sca
 
 Going past the maximum recommended row (e.g. full-res 1280x704 direct at 2x, or frame counts above 121 with upscaling on) risks exhausting 16GB of VRAM, tripping the ring-timeout watchdog, or freezing the system outright — the token-count warning dialog is a rough guide, not a safety guarantee, so don't rely on it alone.
 
-> ⚠️ **On 32GB RAM (the minimum), do not attempt the "Pushing it" row or the highest resolution/frame settings.** Those figures assume the 124GB this script was tuned for — resident model caching (~18GB pinned) plus a transient 23GB text-encoder subprocess plus VAE/upsampler staging can exceed 32GB well before VRAM becomes the limit, causing a system-RAM OOM rather than a clean VRAM error. At 32GB, stick to the default 960x544 → 1920x1088 preset at the lower end of the frame range (121f), click **🧹 Free Models** between runs, and consider dropping `blocks_per_group` to 2.
+> ⚠️ **Free up VRAM before a large run: close unneeded GUI programs and run a single monitor.** This is real, not superstition — on this machine the desktop compositor alone (four connected outputs, one active) was holding ~1GB of VRAM at idle before any generation started, and every extra display and GPU-accelerated app (browsers especially — WebGL/video-decode tabs are heavy) adds to that. With only ~1-2GB of headroom above the "maximum recommended" row before you're back in lockup territory, that 1GB+ matters. Close browsers/other GPU-heavy apps and disable extra monitors before pushing toward the higher end of the table above.
+
+> ⚠️ **On 32GB RAM (the minimum), do not attempt the "Pushing it" row or the highest resolution/frame settings.** Those figures assume the 128GB this script was tuned for — resident model caching (~18GB pinned) plus a transient 23GB text-encoder subprocess plus VAE/upsampler staging can exceed 32GB well before VRAM becomes the limit, causing a system-RAM OOM rather than a clean VRAM error. At 32GB, stick to the default 960x544 → 1920x1088 preset at the lower end of the frame range (121f), click **🧹 Free Models** between runs, and consider dropping `blocks_per_group` to 2.
 
 ### Tuning knobs (in `ltx2_config.json`)
 
@@ -78,13 +78,13 @@ sudo update-initramfs -u
 2. Reduce resolution or frame count (see table above).
 3. Click **🧹 Free Models** before a large run if you've been experimenting with other settings — a stale resident pipeline plus a big new allocation can add up.
 
-System RAM is no longer the limiting factor **on a 124GB machine** (peak usage is roughly 45GB — the resident 18GB transformer plus a transient text-encoder subprocess), so a large swap file there is optional insurance rather than a hard requirement. On a 32GB machine it's the opposite: that same 45GB peak won't fit in RAM alone, so a swap file (16GB+) is required, not optional, and you should still expect to stay off the higher resolution/frame settings — see the warning above.
+System RAM is no longer the limiting factor **on a 128GB machine** (peak usage is roughly 45GB — the resident 18GB transformer plus a transient text-encoder subprocess), so a large swap file there is optional insurance rather than a hard requirement. On a 32GB machine it's the opposite: that same 45GB peak won't fit in RAM alone, so a swap file (16GB+) is required, not optional, and you should still expect to stay off the higher resolution/frame settings — see the warning above.
 
 ---
 
 ## Requirements
 
 * AMD GPU with ROCm support (developed/tested on RX 9070 XT, gfx1201)
-* **System RAM: 32GB minimum.** This is a hard floor, not a comfortable one — see the RAM warning under Recommended Settings above. At 32GB, keep to the lower end of resolution/frame settings and expect to rely on swap; the higher-end presets (large 2-stage output, longer clips) were tuned for and tested on 124GB and are not safe to attempt at 32GB.
+* **System RAM: 32GB minimum.** This is a hard floor, not a comfortable one — see the RAM warning under Recommended Settings above. At 32GB, keep to the lower end of resolution/frame settings and expect to rely on swap; the higher-end presets (large 2-stage output, longer clips) were tuned for and tested on 128GB and are not safe to attempt at 32GB.
 * Pre-quantized FP8 weights in `./local_ltx25_fp8` (run `quant_transformer_fp8.py` once if you don't have these)
 * The base LTX-2.5 model directory (`./local_ltx25_model`) for the latent upsampler config used by the 2-stage upscale path
