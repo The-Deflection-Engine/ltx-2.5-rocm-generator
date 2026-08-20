@@ -88,3 +88,4 @@ System RAM is no longer the limiting factor **on a 128GB machine** (peak usage i
 * **System RAM: 32GB minimum.** This is a hard floor, not a comfortable one — see the RAM warning under Recommended Settings above. At 32GB, keep to the lower end of resolution/frame settings and expect to rely on swap; the higher-end presets (large 2-stage output, longer clips) were tuned for and tested on 128GB and are not safe to attempt at 32GB.
 * Pre-quantized FP8 weights in `./local_ltx25_fp8` (run `quant_transformer_fp8.py` once if you don't have these)
 * The base LTX-2.5 model directory (`./local_ltx25_model`) for the latent upsampler config used by the 2-stage upscale path
+### PLEASE FEEL FREE TO CONTRIBUTE TO MY "Buy Euan an RTX 5090 Fund" ;-)
