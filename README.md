@@ -1,5 +1,7 @@
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/S6I125FYNB)
+
 # 🎬 LTX-2.5 ROCm Video Generator
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/S6I125FYNB)
 
 A GUI control panel (`generate_video.py`) for running the **LTX-2.5 video diffusion model** on a single AMD consumer GPU via ROCm — built and tuned on an RX 9070 XT (16GB VRAM) with 128GB system RAM.
 
