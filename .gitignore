@@ -8,6 +8,7 @@
 !generate_video.py
 !README.md
 !requirements.txt
+!ltx2_config.json
 
 # Un-ignore the directory container, ignore its contents, but allow model_index.json
 !local_ltx25_model/
