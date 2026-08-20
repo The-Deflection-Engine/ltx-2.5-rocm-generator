@@ -13,3 +13,4 @@
 !local_ltx25_model/
 local_ltx25_model/*
 !local_ltx25_model/model_index.json
+.embed_cache/

@@ -4,7 +4,9 @@ import gc
 import sys
 import time
 import json
+import glob
 import random
+import hashlib
 import threading
 import multiprocessing as mp
 import tkinter as tk
@@ -13,7 +15,14 @@ from tkinter import ttk, messagebox, scrolledtext
 # =========================================================================
 # 1. Environment Configuration
 # =========================================================================
-os.environ["PYTORCH_ALLOC_CONF"] = "garbage_collection_threshold:0.8,max_split_size_mb:128"
+# VRAM is still the binding constraint (16GB), so allocator tuning stays.
+# `expandable_segments` is the modern ROCm/CUDA fix for the fragmentation that
+# `max_split_size_mb` used to paper over; it copes far better with the large,
+# variable-sized tensors that VAE tiling and group-offload produce.
+os.environ.setdefault(
+    "PYTORCH_ALLOC_CONF",
+    "expandable_segments:True,garbage_collection_threshold:0.9",
+)
 os.environ["MIOPEN_LOG_LEVEL"] = "3"
 os.environ["MIOPEN_FIND_MODE"] = "1"
 os.environ["AMD_DIRECT_DISPATCH"] = "1"
@@ -21,10 +30,25 @@ os.environ["HIP_FORCE_DEV_KERN_LAZY_COMPILE"] = "0"
 os.environ["TORCH_ROCM_AOTXN_ENABLE"] = "1"
 os.environ["AMD_SERIALIZE_KERNEL"] = "0"
 os.environ["HIP_VISIBLE_DEVICES"] = "0"
+# 124GB RAM / 16 threads: let the CPU-side maths (text encode, pinning,
+# numpy postprocess, ffmpeg staging) actually use the box.
+os.environ.setdefault("OMP_NUM_THREADS", "16")
+os.environ.setdefault("MKL_NUM_THREADS", "16")
 
 CONFIG_FILE = "ltx2_config.json"
 MODEL_PATH = os.path.abspath("./local_ltx25_fp8")
-UPSCALER_PATH = os.path.abspath("./local_ltx25_upscaler")
+# LTX-2.5 model dir: holds the *correct* latent_upsampler config (the standalone
+# ./local_ltx25_upscaler dir is an LTX-1 / 0.9.x upsampler and is NOT compatible).
+BASE_MODEL_PATH = os.path.abspath("./local_ltx25_model")
+UPSCALER_PATH = os.path.abspath("./local_ltx25_upscaler")  # legacy, unused
+EMBED_CACHE_DIR = os.path.abspath("./.embed_cache")
+
+# --- Process-lifetime caches -------------------------------------------------
+# With 124GB of RAM there is no reason to re-read 18GB of transformer weights
+# (or 23GB of text encoder) from disk on every click of "Generate".
+_MODEL_CACHE = {"pipe": None, "transformer": None, "path": None}
+_UPSAMPLER_CACHE = {"model": None, "path": None}
+_EMBED_MEM_CACHE = {}
 
 cancel_flag = False
 
@@ -128,7 +152,15 @@ class TextRedirector:
 # =========================================================================
 # 3. Stage 1 Subprocess: Text Encoding 
 # =========================================================================
-def encode_in_subprocess(model_path, p, np):
+def _embed_cache_key(model_path, p, np_text, need_negative):
+    h = hashlib.sha256()
+    for part in (model_path, p, np_text or "", "neg" if need_negative else "noneg"):
+        h.update(part.encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def encode_in_subprocess(model_path, p, np_text, need_negative, out_path):
     import torch
     import warnings
     warnings.filterwarnings("ignore", category=FutureWarning)
@@ -140,34 +172,112 @@ def encode_in_subprocess(model_path, p, np):
         torch_dtype=torch.bfloat16, local_files_only=True,
     )
     with torch.no_grad():
-        embeds = pipe_text.encode_prompt(prompt=p, negative_prompt=np, device="cpu")
-    torch.save(embeds, "tmp_embeds.pt")
+        # When CFG is disabled (distilled schedule) the negative branch is never
+        # evaluated, so skip encoding it entirely -- that halves this stage.
+        embeds = pipe_text.encode_prompt(
+            prompt=p,
+            negative_prompt=np_text if need_negative else None,
+            do_classifier_free_guidance=need_negative,
+            device="cpu",
+        )
+    torch.save(embeds, out_path)
     print("  -> Encoding complete. Terminating process to release RAM.")
 
 # =========================================================================
 # 4. Background Generation Thread
 # =========================================================================
-def generation_worker(config, root, progress_var, btn_generate, btn_cancel):
+def _build_latent_upsampler(torch, local_files_only=True):
+    """
+    Load the LTX-2.5 spatial x2 latent upsampler.
+
+    NOTE: ./local_ltx25_upscaler is an *LTX-1 / 0.9.x* upsampler
+    (`LTXLatentUpsamplerModel` + `AutoencoderKLLTXVideo`) and is architecturally
+    incompatible with the LTX-2.5 VAE. The real LTX-2.5 weights live in
+    ./local_ltx25_fp8/latent_upscale_models/*spatial-upscaler*.safetensors and the
+    matching config in ./local_ltx25_model/latent_upsampler/config.json.
+    """
+    import json as _json
+    from safetensors.torch import load_file
+    from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
+
+    if _UPSAMPLER_CACHE["model"] is not None:
+        return _UPSAMPLER_CACHE["model"]
+
+    model = None
+    # Preferred: a proper diffusers subfolder with weights next to the config.
+    for root_dir in (BASE_MODEL_PATH, MODEL_PATH):
+        sub = os.path.join(root_dir, "latent_upsampler")
+        if glob.glob(os.path.join(sub, "*.safetensors")) or glob.glob(os.path.join(sub, "*.bin")):
+            model = LTX2LatentUpsamplerModel.from_pretrained(
+                root_dir, subfolder="latent_upsampler",
+                torch_dtype=torch.bfloat16, local_files_only=local_files_only,
+            )
+            break
+
+    if model is None:
+        # Fallback: raw checkpoint + standalone config (this is the layout we have).
+        cfg_path = None
+        for root_dir in (BASE_MODEL_PATH, MODEL_PATH):
+            candidate = os.path.join(root_dir, "latent_upsampler", "config.json")
+            if os.path.exists(candidate):
+                cfg_path = candidate
+                break
+
+        weights = []
+        for root_dir in (MODEL_PATH, BASE_MODEL_PATH):
+            weights += sorted(glob.glob(os.path.join(root_dir, "latent_upscale_models", "*spatial*.safetensors")))
+        if not weights:
+            raise FileNotFoundError(
+                "Could not find an LTX-2.5 spatial latent upscaler .safetensors under "
+                f"{MODEL_PATH}/latent_upscale_models or {BASE_MODEL_PATH}/latent_upscale_models."
+            )
+        weight_path = weights[0]
+
+        if cfg_path is not None:
+            cfg = {k: v for k, v in _json.load(open(cfg_path)).items() if not k.startswith("_")}
+        else:
+            # Every LTX-2.5 x2 spatial upscaler ships these dims.
+            cfg = dict(in_channels=128, mid_channels=1024, num_blocks_per_stage=4, dims=3,
+                       spatial_upsample=True, temporal_upsample=False,
+                       rational_spatial_scale=2.0, use_rational_resampler=False)
+
+        model = LTX2LatentUpsamplerModel(**cfg)
+        state = load_file(weight_path)
+        model.load_state_dict(state, strict=True)
+        model = model.to(torch.bfloat16)
+        print(f"  -> Latent upsampler loaded from {os.path.basename(weight_path)}")
+
+    model.eval()
+    _UPSAMPLER_CACHE["model"] = model
+    return model
+
+
+def generation_worker(config, root, progress_var, progress_bar, btn_generate, btn_cancel):
     global cancel_flag
-    
+
+    pipe = None
+    upscale_pipe = None
     try:
         print("\n[*] Initializing PyTorch and ROCm backends...")
         script_start_time = time.time()
-        
+
         import warnings
         import torch
-        import torch.nn as nn
         import torch.nn.functional as F
         import diffusers
-        from diffusers import LTX2Pipeline, LTX2VideoTransformer3DModel, LTXLatentUpsamplePipeline
+        from diffusers import LTX2Pipeline, LTX2VideoTransformer3DModel, LTX2LatentUpsamplePipeline
         from diffusers.hooks import apply_group_offloading
-        from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES
+        from diffusers.pipelines.ltx2.utils import (
+            DISTILLED_SIGMA_VALUES,
+            STAGE_2_DISTILLED_SIGMA_VALUES,
+        )
         from diffusers.utils import encode_video
 
         warnings.filterwarnings("ignore", category=FutureWarning)
         diffusers.logging.set_verbosity_error()
 
-        # FP8 Dynamic Patching (Keeps RAM allocation low)
+        # FP8 Dynamic Patching (weights stay fp8 in RAM *and* on the PCIe wire;
+        # only the active block is upcast to bf16 on-GPU inside the linear).
         fp8_types = {torch.float8_e4m3fn}
         if hasattr(torch, "float8_e4m3fnuz"):
             fp8_types.add(torch.float8_e4m3fnuz)
@@ -184,10 +294,10 @@ def generation_worker(config, root, progress_var, btn_generate, btn_cancel):
         def patch_transformer_fp8_params(module, target_dtype=torch.bfloat16):
             if isinstance(module, torch.nn.Linear):
                 return
-            for name, param in module.named_parameters(recurse=False):
+            for _name, param in module.named_parameters(recurse=False):
                 if param.dtype in fp8_types:
                     param.data = param.data.to(target_dtype)
-            for child_name, child_module in module.named_children():
+            for _child_name, child_module in module.named_children():
                 patch_transformer_fp8_params(child_module, target_dtype)
 
         try:
@@ -196,164 +306,261 @@ def generation_worker(config, root, progress_var, btn_generate, btn_cancel):
         except RuntimeError:
             pass
 
-        # --- Stage 1: Text Subprocess ---
-        print("\n--- [1/4] Loading Text Encoder & Encoding Prompts ---")
-        if os.path.exists("tmp_embeds.pt"):
-            os.remove("tmp_embeds.pt")
-            
-        p_proc = mp.Process(target=encode_in_subprocess, args=(MODEL_PATH, config['prompt'], config['negative_prompt']))
-        p_proc.start()
-        
-        while p_proc.is_alive():
-            p_proc.join(timeout=0.5)
-            if cancel_flag:
-                p_proc.terminate()
-                p_proc.join()
-                raise CancellationError("Cancelled during text encoding.")
-        
-        if not os.path.exists("tmp_embeds.pt"):
-            raise RuntimeError("Text encoding failed. Check subprocess output.")
-            
-        prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask = torch.load("tmp_embeds.pt")
-        
-        if cancel_flag: raise CancellationError("Cancelled after text encoding.")
-        
-        # --- Stage 2: Load FP8 Models ---
-        print("--- [2/4] Loading FP8 Transformer & Enabling VRAM Protections ---")
-        transformer = LTX2VideoTransformer3DModel.from_pretrained(
-            MODEL_PATH,
-            subfolder="transformer",
-            torch_dtype=torch.float8_e4m3fn,
-            local_files_only=True
+        use_upscale = bool(config.get("upscale"))
+
+        # The distilled LTX-2.5 schedule is guidance-free. Leaving
+        # `audio_guidance_scale` at its 7.0 default silently turns CFG back ON
+        # (`do_classifier_free_guidance` ORs the video and audio scales), which
+        # doubles the transformer batch => ~2x the time and ~2x the activation VRAM.
+        distilled_guidance = dict(
+            guidance_scale=1.0,
+            audio_guidance_scale=1.0,
+            stg_scale=0.0,
+            audio_stg_scale=0.0,
+            modality_scale=1.0,
+            audio_modality_scale=1.0,
         )
-        patch_transformer_fp8_params(transformer, target_dtype=torch.bfloat16)
-        
-        if cancel_flag: raise CancellationError("Cancelled during model load.")
+        need_negative = False  # CFG off => negative branch is never evaluated
 
-        pipe = LTX2Pipeline.from_pretrained(
-            MODEL_PATH,
-            transformer=transformer,
-            text_encoder=None,
-            tokenizer=None,
-            torch_dtype=torch.bfloat16,
-            local_files_only=True,
-        )
-        pipe.set_progress_bar_config(disable=True)
+        stage1_w, stage1_h = int(config["width"]), int(config["height"])
+        out_w, out_h = (stage1_w * 2, stage1_h * 2) if use_upscale else (stage1_w, stage1_h)
 
-        if hasattr(pipe.transformer, "set_attention_backend"):
-            pipe.transformer.set_attention_backend("native")
+        total_steps = len(DISTILLED_SIGMA_VALUES) + (len(STAGE_2_DISTILLED_SIGMA_VALUES) if use_upscale else 0)
+        root.after(0, lambda: progress_bar.config(maximum=total_steps))
+        root.after(0, progress_var.set, 0)
 
+        # --- Stage 1: Prompt embeddings (memory -> disk -> subprocess) ---
+        print("\n--- [1/4] Resolving Prompt Embeddings ---")
+        key = _embed_cache_key(MODEL_PATH, config["prompt"], config["negative_prompt"], need_negative)
+        embeds = _EMBED_MEM_CACHE.get(key)
+
+        if embeds is not None:
+            print("  -> Reusing embeddings from RAM cache (text encoder not loaded).")
+        else:
+            os.makedirs(EMBED_CACHE_DIR, exist_ok=True)
+            cache_path = os.path.join(EMBED_CACHE_DIR, key + ".pt")
+            if os.path.exists(cache_path):
+                print("  -> Reusing embeddings from disk cache (text encoder not loaded).")
+                embeds = torch.load(cache_path, weights_only=False)
+            else:
+                p_proc = mp.Process(
+                    target=encode_in_subprocess,
+                    args=(MODEL_PATH, config["prompt"], config["negative_prompt"], need_negative, cache_path),
+                )
+                p_proc.start()
+                while p_proc.is_alive():
+                    p_proc.join(timeout=0.5)
+                    if cancel_flag:
+                        p_proc.terminate()
+                        p_proc.join()
+                        raise CancellationError("Cancelled during text encoding.")
+                if not os.path.exists(cache_path):
+                    raise RuntimeError("Text encoding failed. Check subprocess output.")
+                embeds = torch.load(cache_path, weights_only=False)
+            _EMBED_MEM_CACHE[key] = embeds
+
+        prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask = embeds
+
+        if cancel_flag:
+            raise CancellationError("Cancelled after text encoding.")
+
+        # --- Stage 2: Models (kept resident in RAM across runs) ---
         onload_device = torch.device("cuda")
         offload_device = torch.device("cpu")
 
-        if hasattr(pipe.transformer, "enable_group_offload"):
-            pipe.transformer.enable_group_offload(
-                onload_device=onload_device, offload_device=offload_device,
-                offload_type="block_level", num_blocks_per_group=2, use_stream=True
-            )
+        if _MODEL_CACHE["pipe"] is not None and _MODEL_CACHE["path"] == MODEL_PATH:
+            pipe = _MODEL_CACHE["pipe"]
+            print("--- [2/4] Reusing resident FP8 pipeline (no disk reload) ---")
         else:
-            apply_group_offloading(pipe.transformer, onload_device=onload_device, offload_type="block_level", num_blocks_per_group=2)
+            print("--- [2/4] Loading FP8 Transformer & Enabling VRAM Protections ---")
+            transformer = LTX2VideoTransformer3DModel.from_pretrained(
+                MODEL_PATH,
+                subfolder="transformer",
+                torch_dtype=torch.float8_e4m3fn,
+                local_files_only=True,
+            )
+            patch_transformer_fp8_params(transformer, target_dtype=torch.bfloat16)
 
-        if hasattr(pipe, "enable_vae_slicing"): pipe.enable_vae_slicing()
-        if hasattr(pipe, "enable_vae_tiling"): pipe.enable_vae_tiling()
-        if hasattr(pipe.vae, "enable_slicing"): pipe.vae.enable_slicing()
-        if hasattr(pipe.vae, "enable_tiling"): pipe.vae.enable_tiling()
-        if hasattr(pipe.vae, "tile_sample_min_size"): pipe.vae.tile_sample_min_size = 128
-        if hasattr(pipe.vae, "tile_latent_min_size"): pipe.vae.tile_latent_min_size = 16
+            if cancel_flag:
+                raise CancellationError("Cancelled during model load.")
 
-        if cancel_flag: raise CancellationError("Cancelled before generation.")
+            pipe = LTX2Pipeline.from_pretrained(
+                MODEL_PATH,
+                transformer=transformer,
+                text_encoder=None,
+                tokenizer=None,
+                torch_dtype=torch.bfloat16,
+                local_files_only=True,
+            )
+            pipe.set_progress_bar_config(disable=True)
 
-        # --- Stage 3: Generation Loop ---
+            # "native" = torch SDPA auto-dispatch. On this GPU (gfx1201) the flash,
+            # mem-efficient and math kernels are all available, and auto-dispatch
+            # picks flash/efficient where the mask allows and falls back safely
+            # where it does not. Force "_native_flash" / "_native_efficient" via
+            # config only if you want to experiment -- a forced kernel will hard-fail
+            # on the masked cross-attention calls.
+            if hasattr(pipe.transformer, "set_attention_backend"):
+                backend = config.get("attention_backend", "native")
+                try:
+                    pipe.transformer.set_attention_backend(backend)
+                    print(f"  -> Attention backend: {backend}")
+                except Exception as exc:
+                    print(f"  -> Attention backend '{backend}' unavailable ({exc}); using default.")
+
+            # Group offload: 48 transformer blocks. 2 blocks/group was a *RAM*-era
+            # setting; with 124GB we can pin the whole 18GB checkpoint and use
+            # bigger groups + stream prefetch + record_stream (no per-group sync).
+            offload_kwargs = dict(
+                onload_device=onload_device,
+                offload_device=offload_device,
+                offload_type="block_level",
+                num_blocks_per_group=int(config.get("blocks_per_group", 4)),
+                use_stream=True,
+                record_stream=True,
+                non_blocking=True,
+                low_cpu_mem_usage=False,   # False => pinned (page-locked) host buffers
+            )
+            if hasattr(pipe.transformer, "enable_group_offload"):
+                pipe.transformer.enable_group_offload(**offload_kwargs)
+            else:
+                apply_group_offloading(pipe.transformer, **offload_kwargs)
+
+            # VAE tiling. The old `tile_sample_min_size` / `tile_latent_min_size`
+            # assignments did nothing at all -- AutoencoderKLLTX2Video has no such
+            # attributes, so tiling silently ran at its 512/448 defaults. These are
+            # the real knobs, plus framewise (temporal) decoding, which is what
+            # actually bounds VRAM on long clips.
+            if hasattr(pipe.vae, "enable_slicing"):
+                pipe.vae.enable_slicing()
+            if hasattr(pipe.vae, "enable_tiling"):
+                pipe.vae.enable_tiling(
+                    tile_sample_min_height=512,
+                    tile_sample_min_width=512,
+                    tile_sample_min_num_frames=24,
+                    tile_sample_stride_height=448,
+                    tile_sample_stride_width=448,
+                    tile_sample_stride_num_frames=16,
+                )
+            # Temporal tiling of the decoder; composes with the spatial tiling above.
+            pipe.vae.use_framewise_decoding = True
+            pipe.vae.use_framewise_encoding = True
+
+            # The decoders are small (VAE 1.4GB + audio VAE 0.1GB + vocoder 0.25GB)
+            # and `_execution_device` is cuda because of the transformer's offload
+            # hooks, so they MUST be on the GPU before pipe() runs -- the old code
+            # moved them *after* the call, i.e. never in time for the decode.
+            pipe.vae.to(onload_device)
+            if getattr(pipe, "audio_vae", None) is not None:
+                pipe.audio_vae.to(onload_device)
+            if getattr(pipe, "vocoder", None) is not None:
+                pipe.vocoder.to(onload_device)
+
+            _MODEL_CACHE.update({"pipe": pipe, "transformer": transformer, "path": MODEL_PATH})
+
+        if cancel_flag:
+            raise CancellationError("Cancelled before generation.")
+
+        # --- Stage 3: Generation ---
         generation_start_time = time.time()
-        print(f"--- [3/4] Generating Base Video ({config['width']}x{config['height']}) ---")
-        
-        root.after(0, progress_var.set, 0)
-        
+        print(f"--- [3/4] Generating Base Video ({stage1_w}x{stage1_h}, {config['frames']} frames) ---")
+
+        steps_done = [0]
+
         def step_callback(pipe_instance, step_index, timestep, callback_kwargs):
             if cancel_flag:
                 raise CancellationError("Cancelled by user during diffusion process.")
-                
+            steps_done[0] += 1
+            done = steps_done[0]
             elapsed = time.time() - generation_start_time
-            print(f"  --> Completed Step {step_index + 1}/8 ({elapsed:.1f}s elapsed)")
-            root.after(0, progress_var.set, step_index + 1)
-                
+            print(f"  --> Completed Step {done}/{total_steps} ({elapsed:.1f}s elapsed)")
+            root.after(0, progress_var.set, done)
             return callback_kwargs
 
+        shared_call = dict(
+            prompt_embeds=prompt_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            frame_rate=config["fps"],
+            callback_on_step_end=step_callback,
+            return_dict=False,
+            **distilled_guidance,
+        )
+
+        # One generator threaded through both stages so stage 2 continues the
+        # noise stream (this is what the LTX-2.5 reference two-stage recipe does).
+        generator = torch.Generator("cuda").manual_seed(config["active_seed"])
+
         with torch.inference_mode():
-            output_type = "latent" if config.get('upscale') else "np"
-            output = pipe(
-                prompt_embeds=prompt_embeds,
-                prompt_attention_mask=prompt_attention_mask,
-                negative_prompt_embeds=negative_prompt_embeds,
-                negative_prompt_attention_mask=negative_prompt_attention_mask,
-                width=config['width'],
-                height=config['height'],
-                num_frames=config['frames'],
-                frame_rate=config['fps'],
+            stage1 = pipe(
+                width=stage1_w,
+                height=stage1_h,
+                num_frames=config["frames"],
                 sigmas=DISTILLED_SIGMA_VALUES,
-                guidance_scale=1.0,
-                callback_on_step_end=step_callback,
-                generator=torch.Generator("cuda").manual_seed(config['active_seed']),
-                output_type=output_type,
-                return_dict=False,
+                generator=generator,
+                output_type="latent" if use_upscale else "np",
+                **shared_call,
             )
 
-        if cancel_flag: raise CancellationError("Cancelled before video export.")
+            if cancel_flag:
+                raise CancellationError("Cancelled before video export.")
+
+            if use_upscale:
+                # --- Stage 4: 2x latent upsample + short refinement tail ---
+                # stage1[0] = denormalised video latents [B, C, F, H, W]
+                # stage1[1] = *audio latents* (NOT a waveform) -- the old code fed
+                #             these straight to the muxer, which is why "upscale"
+                #             produced broken output.
+                stage1_latents, audio_latents = stage1[0], stage1[1]
+
+                print(f"--- [4/4] Latent upsample -> {out_w}x{out_h}, then {len(STAGE_2_DISTILLED_SIGMA_VALUES)}-sigma refinement ---")
+                latent_upsampler = _build_latent_upsampler(torch).to(onload_device)
+                upscale_pipe = LTX2LatentUpsamplePipeline(vae=pipe.vae, latent_upsampler=latent_upsampler)
+
+                upsampled_latents = upscale_pipe(
+                    latents=stage1_latents,
+                    output_type="latent",
+                    return_dict=False,
+                )[0]
+
+                # Free the upsampler's ~1GB before the (larger) stage-2 denoise.
+                latent_upsampler.to(offload_device)
+                torch.cuda.empty_cache()
+
+                if cancel_flag:
+                    raise CancellationError("Cancelled before refinement pass.")
+
+                # Stage 2 infers its resolution from the 5D latents, so no height/width.
+                output = pipe(
+                    num_frames=config["frames"],
+                    sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
+                    latents=upsampled_latents,
+                    audio_latents=audio_latents,
+                    noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0],
+                    generator=generator,
+                    output_type="np",
+                    **shared_call,
+                )
+            else:
+                print("--- [4/4] Skipping Upscaler (Native Resolution selected) ---")
+                output = stage1
 
         video = output[0]
         audio = output[1] if len(output) > 1 else None
-        
-        # --- Stage 4: Upscaling ---
-        if config.get('upscale'):
-            print(f"--- [4/4] Upscaling Latents to {config['width']*2}x{config['height']*2} ---")
-            
-            # Move transformer out to free VRAM for the upscaler
-            pipe.transformer.to("cpu") 
-            torch.cuda.empty_cache()
-            
-            upscale_pipe = LTXLatentUpsamplePipeline.from_pretrained(
-                UPSCALER_PATH, 
-                vae=pipe.vae,
-                torch_dtype=torch.bfloat16, 
-                local_files_only=True
-            )
-            # Move upscaler to GPU
-            upscale_pipe.to("cuda")
-            
-            print("  --> Running spatial upscaler diffusion (this may take a minute)...")
-            with torch.inference_mode():
-                # The upscaler runs the enhancement and decodes it via the shared VAE
-                video = upscale_pipe(
-                    latents=video, 
-                    generator=torch.Generator("cuda").manual_seed(config['active_seed']),
-                    output_type="np", 
-                    return_dict=False
-                )[0]
-                
-            # Free upscaler from VRAM
-            upscale_pipe.to("cpu")
-            torch.cuda.empty_cache()
-        else:
-            print("--- [4/4] Skipping Upscaler (Native Resolution selected) ---")
-            print("  --> Denoising complete. Moving VAE to GPU for decode...")
-            pipe.vae.to("cuda")
-            if hasattr(pipe, "audio_vae") and pipe.audio_vae is not None:
-                pipe.audio_vae.to("cuda")
-            if hasattr(pipe, "vocoder") and pipe.vocoder is not None:
-                pipe.vocoder.to("cuda")
 
         print("  --> Exporting final video...")
-        out_w = config['width'] * 2 if config.get('upscale') else config['width']
-        out_h = config['height'] * 2 if config.get('upscale') else config['height']
         output_file = f"output_{out_w}x{out_h}_{config['frames']}f_seed{config['active_seed']}.mp4"
-        sample_rate = getattr(pipe.vocoder.config, "output_sampling_rate", 24000) if hasattr(pipe, "vocoder") and pipe.vocoder else 24000
+        sample_rate = 24000
+        if getattr(pipe, "vocoder", None) is not None:
+            sample_rate = getattr(pipe.vocoder.config, "output_sampling_rate", 24000)
 
         encode_video(
-            video[0], # Pass the extracted first video in the batch to the encoder
+            video[0],  # first video in the batch
             audio=audio[0].float().cpu() if audio is not None else None,
             audio_sample_rate=sample_rate,
             output_path=output_file,
-            fps=int(config['fps']),
+            fps=int(config["fps"]),
         )
 
         print(f"\nSUCCESS! Video saved as: {output_file}")
@@ -370,21 +577,33 @@ def generation_worker(config, root, progress_var, btn_generate, btn_cancel):
         import traceback
         traceback.print_exc()
     finally:
-        if os.path.exists("tmp_embeds.pt"):
-            os.remove("tmp_embeds.pt")
-        try: del pipe; del transformer
-        except: pass
-        try: del upscale_pipe
-        except: pass
-        
+        # NOTE: `pipe` / the upsampler are deliberately NOT deleted -- they live in
+        # _MODEL_CACHE so the next run skips ~18GB of disk reads. Use the
+        # "Free Models" button to drop them.
+        try:
+            del upscale_pipe
+        except Exception:
+            pass
+
         import torch
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            
+
         root.after(0, btn_generate.config, {"state": "normal"})
         root.after(0, btn_cancel.config, {"state": "disabled"})
         print("-" * 60)
+
+
+def free_resident_models():
+    """Drop the cached pipeline/upsampler and hand the RAM+VRAM back."""
+    import torch
+    _MODEL_CACHE.update({"pipe": None, "transformer": None, "path": None})
+    _UPSAMPLER_CACHE.update({"model": None, "path": None})
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("[*] Resident models released.")
 
 # =========================================================================
 # 5. Main Application / GUI
@@ -393,13 +612,17 @@ def main():
     def load_saved_config():
         defaults = {
             "prompt": "A high-quality cinematic shot of a classic sports car driving along a coastal highway at sunset, vibrant orange horizon, clear ocean view.",
-            "negative_prompt": "", 
-            "width": 768,
-            "height": 512,
-            "frames": 65,
+            "negative_prompt": "",
+            # Reference LTX-2.5 two-stage base resolution; stage 2 emits 1920x1088.
+            "width": 960,
+            "height": 544,
+            "frames": 121,
             "fps": 24.0,
             "seed": "42",
-            "upscale": False
+            "upscale": True,
+            # 48 transformer blocks. 4 => 12 offload groups; raise to 6-8 for a bit
+            # more speed at the cost of VRAM, drop to 2 if stage 2 OOMs.
+            "blocks_per_group": 4
         }
         if os.path.exists(CONFIG_FILE):
             try:
@@ -495,7 +718,11 @@ def main():
     
     np_header = ttk.Frame(main_frame)
     np_header.pack(fill=tk.X)
-    ttk.Label(np_header, text="Negative Prompt (Leave blank for default):", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
+    ttk.Label(
+        np_header,
+        text="Negative Prompt (unused: distilled schedule runs guidance-free):",
+        font=("Arial", 10, "bold"),
+    ).pack(side=tk.LEFT)
     
     text_np = tk.Text(main_frame, height=3, wrap=tk.WORD, font=("Arial", 10))
     
@@ -523,7 +750,13 @@ def main():
     
     res_var = tk.StringVar(value=f"{config['width']}x{config['height']}")
     res_combo = ttk.Combobox(res_frame, textvariable=res_var, state="readonly", width=18)
-    res_combo['values'] = ("1280x704 (High)", "1024x576 (Medium)", "768x512 (Low)", "Custom")
+    res_combo['values'] = (
+        "1280x704 (High)",
+        "1024x576 (Medium)",
+        "960x544 (2-stage base)",
+        "768x512 (Low)",
+        "Custom",
+    )
     res_combo.pack(pady=(0, 4))
     
     custom_frame = ttk.Frame(res_frame)
@@ -539,7 +772,11 @@ def main():
 
     # The Restored Upscaler Checkbox
     upscale_var = tk.BooleanVar(value=config.get('upscale', False))
-    ttk.Checkbutton(res_frame, text="Enable 2x Latent Upscaler", variable=upscale_var).pack(pady=(5,0))
+    ttk.Checkbutton(
+        res_frame,
+        text="2-stage: 2x latent upscale + refine\n(output = 2x the size above)",
+        variable=upscale_var,
+    ).pack(pady=(5, 0))
     
     def on_res_select(event):
         val = res_combo.get()
@@ -551,7 +788,7 @@ def main():
             entry_w.config(state="disabled"); entry_h.config(state="disabled")
             
     res_combo.bind("<<ComboboxSelected>>", on_res_select)
-    if f"{config['width']}x{config['height']}" not in [v.split(" ")[0] for v in res_combo['values'][:3]]:
+    if f"{config['width']}x{config['height']}" not in [v.split(" ")[0] for v in res_combo['values'][:-1]]:
         res_combo.set("Custom")
     on_res_select(None)
     
@@ -654,7 +891,24 @@ def main():
             
             s_val = entry_seed.get().strip().lower()
             active_seed = random.randint(0, 2**32 - 1) if s_val == 'r' else int(s_val)
-                
+
+            # VRAM sanity check. The transformer sequence length is
+            # latent_frames * (H/32) * (W/32); attention cost is quadratic in it.
+            # ~50k tokens is about where 16GB of VRAM stops being comfortable.
+            scale = 2 if upscale_var.get() else 1
+            latent_frames = (aligned_frames - 1) // 8 + 1
+            tokens = latent_frames * ((h_adj * scale) // 32) * ((w_adj * scale) // 32)
+            if tokens > 50000:
+                if not messagebox.askokcancel(
+                    "Large sequence",
+                    f"Final stage would run {tokens:,} latent tokens "
+                    f"({w_adj*scale}x{h_adj*scale}, {aligned_frames} frames).\n\n"
+                    "Above ~50,000 tokens this is likely to exhaust 16GB of VRAM or trip "
+                    "the AMDGPU ring-timeout watchdog.\n\nContinue anyway?",
+                ):
+                    return
+
+
             config.update({
                 'prompt': p, 'negative_prompt': np_val,
                 'width': w_adj, 'height': h_adj, 'fps': fps, 'frames': aligned_frames, 'seed': s_val,
@@ -667,7 +921,10 @@ def main():
             btn_cancel.config(state="normal")
             progress_var.set(0)
             
-            thread = threading.Thread(target=generation_worker, args=(config, root, progress_var, btn_generate, btn_cancel))
+            thread = threading.Thread(
+                target=generation_worker,
+                args=(config, root, progress_var, progress_bar, btn_generate, btn_cancel),
+            )
             thread.daemon = True
             thread.start()
             
@@ -684,7 +941,12 @@ def main():
     btn_generate.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8, padx=(0, 4))
     
     btn_cancel = ttk.Button(btn_frame, text="🛑 Cancel", command=cancel_generation, state="disabled")
-    btn_cancel.pack(side=tk.RIGHT, fill=tk.X, expand=True, ipady=8, padx=(4, 0))
+    btn_cancel.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8, padx=(4, 4))
+
+    # Models stay resident in RAM between runs (18GB transformer + 1.8GB decoders).
+    # On a 124GB box that is free speed; this button gives it back if needed.
+    btn_free = ttk.Button(btn_frame, text="🧹 Free Models", command=free_resident_models)
+    btn_free.pack(side=tk.RIGHT, ipady=8, padx=(4, 0))
 
     root.update_idletasks()
     x = (root.winfo_screenwidth() // 2) - (740 // 2)
