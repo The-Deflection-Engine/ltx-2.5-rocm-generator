@@ -43,6 +43,10 @@ BASE_MODEL_PATH = os.path.abspath("./local_ltx25_model")
 UPSCALER_PATH = os.path.abspath("./local_ltx25_upscaler")  # legacy, unused
 EMBED_CACHE_DIR = os.path.abspath("./.embed_cache")
 
+# Auto Duration can predict up to 20s; at these resolutions that is far past
+# what 16GB of VRAM survives. Hard ceiling on what the model is allowed to pick.
+AUTO_DURATION_CAP_S = 6.0
+
 # --- Process-lifetime caches -------------------------------------------------
 # With 124GB of RAM there is no reason to re-read 18GB of transformer weights
 # (or 23GB of text encoder) from disk on every click of "Generate".
@@ -343,6 +347,15 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         stage1_w, stage1_h = int(config["width"]), int(config["height"])
         out_w, out_h = (stage1_w * 2, stage1_h * 2) if use_upscale else (stage1_w, stage1_h)
 
+        # Auto Duration: with a `duration_head` present the model predicts clip
+        # length from the prompt when `num_frames` is omitted. Left unbounded it
+        # will happily pick up to 20s, which no 16GB card survives at these
+        # resolutions -- so max_seconds is clamped hard (see AUTO_DURATION_CAP_S).
+        want_auto_duration = bool(config.get("auto_duration"))
+        auto_min_s = float(config.get("auto_min_seconds", 2.0))
+        auto_max_s = min(float(config.get("auto_max_seconds", 5.0)), AUTO_DURATION_CAP_S)
+        auto_min_s = min(auto_min_s, auto_max_s - 0.1)
+
         total_steps = len(DISTILLED_SIGMA_VALUES) + (len(STAGE_2_DISTILLED_SIGMA_VALUES) if use_upscale else 0)
         root.after(0, lambda: progress_bar.config(maximum=total_steps))
         root.after(0, progress_var.set, 0)
@@ -481,8 +494,20 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
 
         # --- Stage 3: Generation ---
         generation_start_time = time.time()
+        # duration_head is what makes Auto Duration possible; fall back to the
+        # explicit frame count if this checkpoint doesn't ship one.
+        use_auto_duration = want_auto_duration and getattr(pipe, "duration_head", None) is not None
+        if want_auto_duration and not use_auto_duration:
+            print("  -> Auto Duration requested but this checkpoint has no duration_head; using frame count.")
+        if use_auto_duration:
+            length_call = dict(min_seconds=auto_min_s, max_seconds=auto_max_s)
+            print(f"  -> Auto Duration: model picks length within {auto_min_s:.1f}-{auto_max_s:.1f}s.")
+        else:
+            length_call = dict(num_frames=config["frames"])
+
         mode_label = "Image-to-Video" if use_image else "Text-to-Video"
-        print(f"--- [3/4] Generating Base Video, {mode_label} ({stage1_w}x{stage1_h}, {config['frames']} frames) ---")
+        len_label = "auto length" if use_auto_duration else f"{config['frames']} frames"
+        print(f"--- [3/4] Generating Base Video, {mode_label} ({stage1_w}x{stage1_h}, {len_label}) ---")
 
         steps_done = [0]
 
@@ -518,24 +543,29 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 # component instances in the image-conditioned __call__, no
                 # extra weights are loaded or moved.
                 i2v_pipe = LTX2ImageToVideoPipeline(**pipe.components)
+                # image_crf: LTX-2.5 re-compresses the conditioning image to CRF
+                # 18 by default to match training. 0 skips it and keeps the
+                # source detail; None uses the model default.
+                crf = config.get("image_crf", None)
                 stage1 = i2v_pipe(
                     image=input_image,
                     width=stage1_w,
                     height=stage1_h,
-                    num_frames=config["frames"],
                     sigmas=DISTILLED_SIGMA_VALUES,
                     generator=generator,
                     output_type="latent" if use_upscale else "np",
+                    **({} if crf is None else {"image_crf": int(crf)}),
+                    **length_call,
                     **shared_call,
                 )
             else:
                 stage1 = pipe(
                     width=stage1_w,
                     height=stage1_h,
-                    num_frames=config["frames"],
                     sigmas=DISTILLED_SIGMA_VALUES,
                     generator=generator,
                     output_type="latent" if use_upscale else "np",
+                    **length_call,
                     **shared_call,
                 )
 
@@ -549,6 +579,14 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 #             these straight to the muxer, which is why "upscale"
                 #             produced broken output.
                 stage1_latents, audio_latents = stage1[0], stage1[1]
+
+                # Under Auto Duration the realized length is whatever the model
+                # picked, not config["frames"], so read it back off the latents
+                # (VAE temporal compression is 8: frames = (F - 1) * 8 + 1).
+                if stage1_latents.ndim == 5:
+                    realized_frames = (stage1_latents.shape[2] - 1) * 8 + 1
+                else:
+                    realized_frames = config["frames"]
 
                 print(f"--- [4/4] Latent upsample -> {out_w}x{out_h}, then {len(STAGE_2_DISTILLED_SIGMA_VALUES)}-sigma refinement ---")
                 # Group-offload uses non_blocking transfers on a separate stream, so
@@ -574,7 +612,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
 
                 # Stage 2 infers its resolution from the 5D latents, so no height/width.
                 output = pipe(
-                    num_frames=config["frames"],
+                    num_frames=realized_frames,
                     sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
                     latents=upsampled_latents,
                     audio_latents=audio_latents,
@@ -592,7 +630,12 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
 
         print("  --> Exporting final video...")
         mode_tag = "i2v_" if use_image else ""
-        output_file = f"output_{mode_tag}{out_w}x{out_h}_{config['frames']}f_seed{config['active_seed']}.mp4"
+        # Report what was actually produced -- under Auto Duration this is the
+        # model's chosen length, not config["frames"].
+        final_frames = len(video[0])
+        if use_auto_duration:
+            print(f"  --> Auto Duration produced {final_frames} frames ({final_frames / float(config['fps']):.2f}s).")
+        output_file = f"output_{mode_tag}{out_w}x{out_h}_{final_frames}f_seed{config['active_seed']}.mp4"
         sample_rate = 24000
         if getattr(pipe, "vocoder", None) is not None:
             sample_rate = getattr(pipe.vocoder.config, "output_sampling_rate", 24000)
@@ -664,6 +707,14 @@ def main():
             "upscale": False,
             "mode": "text2video",
             "image_path": "",
+            # Auto Duration: let the model pick clip length from the prompt.
+            # Capped at AUTO_DURATION_CAP_S regardless of what's set here.
+            "auto_duration": False,
+            "auto_min_seconds": 2.0,
+            "auto_max_seconds": 5.0,
+            # Conditioning-image compression for image-to-video. null = model
+            # default (CRF 18 on LTX-2.5), 0 = keep full source detail.
+            "image_crf": None,
             # 48 transformer blocks. 4 => 12 offload groups; raise to 6-8 for a bit
             # more speed at the cost of VRAM, drop to 2 if stage 2 OOMs.
             "blocks_per_group": 4
@@ -924,6 +975,33 @@ def main():
     entry_len.insert(0, str(config['frames']))
     entry_fps.bind("<KeyRelease>", on_fps_typing)
     entry_len.bind("<KeyRelease>", on_len_typing)
+
+    # Auto Duration: model picks the length, capped for VRAM safety.
+    auto_dur_var = tk.BooleanVar(value=config.get("auto_duration", False))
+
+    def on_auto_toggle():
+        on_auto = auto_dur_var.get()
+        entry_len.config(state="disabled" if on_auto else "normal")
+        if on_auto:
+            lbl_auto_max.pack(side=tk.LEFT)
+            entry_auto_max.pack(side=tk.LEFT, padx=(2, 0))
+        else:
+            lbl_auto_max.pack_forget()
+            entry_auto_max.pack_forget()
+
+    ttk.Checkbutton(
+        time_frame,
+        text=f"Auto Duration (max {AUTO_DURATION_CAP_S:.0f}s)",
+        variable=auto_dur_var,
+        command=on_auto_toggle,
+    ).pack(anchor=tk.W, pady=(6, 0))
+
+    auto_row = ttk.Frame(time_frame)
+    auto_row.pack(anchor=tk.W, pady=(2, 0))
+    lbl_auto_max = ttk.Label(auto_row, text="max s:")
+    entry_auto_max = ttk.Entry(auto_row, width=4)
+    entry_auto_max.insert(0, str(config.get("auto_max_seconds", 5.0)))
+    on_auto_toggle()
     
     seed_frame = ttk.Frame(main_frame)
     seed_frame.pack(fill=tk.X, pady=(0, 12))
@@ -979,17 +1057,26 @@ def main():
             s_val = entry_seed.get().strip().lower()
             active_seed = random.randint(0, 2**32 - 1) if s_val == 'r' else int(s_val)
 
+            try:
+                auto_max_val = min(float(entry_auto_max.get()), AUTO_DURATION_CAP_S)
+            except ValueError:
+                auto_max_val = AUTO_DURATION_CAP_S
+
             # VRAM sanity check. The transformer sequence length is
             # latent_frames * (H/32) * (W/32); attention cost is quadratic in it.
             # ~50k tokens is about where 16GB of VRAM stops being comfortable.
+            # Under Auto Duration the model picks the length, so size the check
+            # against the worst case it's allowed to choose.
             scale = 2 if upscale_var.get() else 1
-            latent_frames = (aligned_frames - 1) // 8 + 1
+            check_frames = int(auto_max_val * fps) if auto_dur_var.get() else aligned_frames
+            latent_frames = (check_frames - 1) // 8 + 1
             tokens = latent_frames * ((h_adj * scale) // 32) * ((w_adj * scale) // 32)
             if tokens > 50000:
                 if not messagebox.askokcancel(
                     "Large sequence",
                     f"Final stage would run {tokens:,} latent tokens "
-                    f"({w_adj*scale}x{h_adj*scale}, {aligned_frames} frames).\n\n"
+                    f"({w_adj*scale}x{h_adj*scale}, {check_frames} frames"
+                    f"{' worst-case under Auto Duration' if auto_dur_var.get() else ''}).\n\n"
                     "Above ~50,000 tokens this is likely to exhaust 16GB of VRAM or trip "
                     "the AMDGPU ring-timeout watchdog.\n\nContinue anyway?",
                 ):
@@ -1003,6 +1090,8 @@ def main():
                 'upscale': upscale_var.get(),
                 'mode': mode_var.get(),
                 'image_path': image_path_var.get().strip(),
+                'auto_duration': auto_dur_var.get(),
+                'auto_max_seconds': auto_max_val,
             })
             save_config(config)
             
