@@ -9,10 +9,6 @@
 !requirements.txt
 !ltx2_config.json
 
-# Archived/reference-only scripts
-!archive/
-!archive/gen_test.py
-
 # Un-ignore the directory container, ignore its contents, but allow model_index.json
 !local_ltx25_model/
 local_ltx25_model/*
