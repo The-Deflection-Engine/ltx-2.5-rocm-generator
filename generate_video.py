@@ -64,14 +64,17 @@ class LinuxHardwareMonitor:
         self.last_cpu_total = None
         self.last_cpu_cores = {}
         
+        max_vram = 0
         for i in range(10):
             path = f"/sys/class/drm/card{i}/device"
             vram_path = os.path.join(path, "mem_info_vram_total")
             if os.path.exists(vram_path):
                 try:
                     with open(vram_path, "r") as f:
-                        if int(f.read().strip()) > 0:
-                            self.sysfs_gpu_path = path
+                        vram = int(f.read().strip())
+                    if vram > max_vram:
+                        max_vram = vram
+                        self.sysfs_gpu_path = path
                 except Exception:
                     pass
         self.get_cpu_stats()
@@ -515,6 +518,11 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 stage1_latents, audio_latents = stage1[0], stage1[1]
 
                 print(f"--- [4/4] Latent upsample -> {out_w}x{out_h}, then {len(STAGE_2_DISTILLED_SIGMA_VALUES)}-sigma refinement ---")
+                # Group-offload uses non_blocking transfers on a separate stream, so
+                # stage 1's last block-eviction copies may still be in flight when
+                # we start allocating for the upsampler below. Sync first so we're
+                # not racing that transfer for VRAM.
+                torch.cuda.synchronize()
                 latent_upsampler = _build_latent_upsampler(torch).to(onload_device)
                 upscale_pipe = LTX2LatentUpsamplePipeline(vae=pipe.vae, latent_upsampler=latent_upsampler)
 
@@ -619,7 +627,7 @@ def main():
             "frames": 121,
             "fps": 24.0,
             "seed": "42",
-            "upscale": True,
+            "upscale": False,
             # 48 transformer blocks. 4 => 12 offload groups; raise to 6-8 for a bit
             # more speed at the cost of VRAM, drop to 2 if stage 2 OOMs.
             "blocks_per_group": 4

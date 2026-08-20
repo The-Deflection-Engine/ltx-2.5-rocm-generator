@@ -1,12 +1,12 @@
 {
-    "prompt": "Camera motion: Slow panning tracking shot, cinematic slow-motion.\n\nScene: A hyper-realistic, fluffy sloth wearing a shiny, silver retro-futuristic1 disco suit and oversized neon-pink sunglasses. The sloth is floating gracefully in zero gravity through the sleek, metallic cabin of a spaceship. A spinning disco ball on the ceiling casts vibrant, dynamic laser lights (purple, cyan, and gold) across the room, reflecting off the sloth's silver suit. The sloth slowly extends one claw to catch a floating, glowing neon-green cocktail. Tiny liquid bubbles float through the air around it. Volumetric lighting, 4k resolution, photorealistic, incredibly detailed fur and reflections.A high-quality cinematic shot of a classic sports car driving along a coastal highway at sunset, vibrant orange horizon, clear ocean view.\n\nMusic: An upbeat, funky 1970s retro-wave disco track with a driving, groovy bassline and spacey synthesizer chords.\n\nSound Effects: A futuristic, smooth whoosh as the sloth glides past the camera lens. The muffled, rhythmic thump-thump of a heavy bass speaker echoing in a metallic room. A gentle, resonant clink as the sloth\u2019s claw taps the floating glass, followed by the soft, high-pitched pop of floating liquid bubbles bursting.",
+    "prompt": "A grumpy orange tabby cat wearing tiny aviator sunglasses, riding a skateboard down a sunlit suburban driveway, ears back, tail flicking for balance. Golden hour lighting, shallow depth of field, wobbling camera tracking alongside at cat height. Cinematic, photorealistic fur detail.\n\nSound: wheels rattling over pavement cracks, a distant lawnmower, a kid laughing off-camera, light acoustic guitar strumming.",
     "negative_prompt": "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, wrong hand count, artifacts around text, inconsistent perspective, camera shake, incorrect depth of field, background too sharp, background clutter, distracting reflections, harsh shadows, inconsistent lighting direction, color banding, cartoonish rendering, 3D CGI look, unrealistic materials, uncanny valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong gaze direction, mismatched lip sync, silent or muted audio, distorted voice, robotic voice, echo, background noise, off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts.",
     "width": 960,
     "height": 544,
-    "frames": 121,
+    "frames": 193,
     "fps": 24.0,
     "seed": "42",
-    "upscale": true,
+    "upscale": false,
     "blocks_per_group": 4,
     "active_seed": 42,
     "attention_backend": "native"
