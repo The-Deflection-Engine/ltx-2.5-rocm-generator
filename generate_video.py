@@ -10,7 +10,7 @@ import hashlib
 import threading
 import multiprocessing as mp
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, filedialog
 
 # =========================================================================
 # 1. Environment Configuration
@@ -268,7 +268,12 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         import torch
         import torch.nn.functional as F
         import diffusers
-        from diffusers import LTX2Pipeline, LTX2VideoTransformer3DModel, LTX2LatentUpsamplePipeline
+        from diffusers import (
+            LTX2Pipeline,
+            LTX2VideoTransformer3DModel,
+            LTX2LatentUpsamplePipeline,
+            LTX2ImageToVideoPipeline,
+        )
         from diffusers.hooks import apply_group_offloading
         from diffusers.pipelines.ltx2.utils import (
             DISTILLED_SIGMA_VALUES,
@@ -310,6 +315,16 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             pass
 
         use_upscale = bool(config.get("upscale"))
+        use_image = config.get("mode") == "image2video"
+
+        input_image = None
+        if use_image:
+            from PIL import Image
+
+            image_path = config.get("image_path", "")
+            if not image_path or not os.path.exists(image_path):
+                raise ValueError(f"Image-to-video mode selected but no valid image path was given: '{image_path}'")
+            input_image = Image.open(image_path).convert("RGB")
 
         # The distilled LTX-2.5 schedule is guidance-free. Leaving
         # `audio_guidance_scale` at its 7.0 default silently turns CFG back ON
@@ -466,7 +481,8 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
 
         # --- Stage 3: Generation ---
         generation_start_time = time.time()
-        print(f"--- [3/4] Generating Base Video ({stage1_w}x{stage1_h}, {config['frames']} frames) ---")
+        mode_label = "Image-to-Video" if use_image else "Text-to-Video"
+        print(f"--- [3/4] Generating Base Video, {mode_label} ({stage1_w}x{stage1_h}, {config['frames']} frames) ---")
 
         steps_done = [0]
 
@@ -496,15 +512,32 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         generator = torch.Generator("cuda").manual_seed(config["active_seed"])
 
         with torch.inference_mode():
-            stage1 = pipe(
-                width=stage1_w,
-                height=stage1_h,
-                num_frames=config["frames"],
-                sigmas=DISTILLED_SIGMA_VALUES,
-                generator=generator,
-                output_type="latent" if use_upscale else "np",
-                **shared_call,
-            )
+            if use_image:
+                # Shares the already-loaded/onloaded transformer, VAE, text
+                # encoder etc with `pipe` -- this just wraps the same resident
+                # component instances in the image-conditioned __call__, no
+                # extra weights are loaded or moved.
+                i2v_pipe = LTX2ImageToVideoPipeline(**pipe.components)
+                stage1 = i2v_pipe(
+                    image=input_image,
+                    width=stage1_w,
+                    height=stage1_h,
+                    num_frames=config["frames"],
+                    sigmas=DISTILLED_SIGMA_VALUES,
+                    generator=generator,
+                    output_type="latent" if use_upscale else "np",
+                    **shared_call,
+                )
+            else:
+                stage1 = pipe(
+                    width=stage1_w,
+                    height=stage1_h,
+                    num_frames=config["frames"],
+                    sigmas=DISTILLED_SIGMA_VALUES,
+                    generator=generator,
+                    output_type="latent" if use_upscale else "np",
+                    **shared_call,
+                )
 
             if cancel_flag:
                 raise CancellationError("Cancelled before video export.")
@@ -558,7 +591,8 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         audio = output[1] if len(output) > 1 else None
 
         print("  --> Exporting final video...")
-        output_file = f"output_{out_w}x{out_h}_{config['frames']}f_seed{config['active_seed']}.mp4"
+        mode_tag = "i2v_" if use_image else ""
+        output_file = f"output_{mode_tag}{out_w}x{out_h}_{config['frames']}f_seed{config['active_seed']}.mp4"
         sample_rate = 24000
         if getattr(pipe, "vocoder", None) is not None:
             sample_rate = getattr(pipe.vocoder.config, "output_sampling_rate", 24000)
@@ -628,6 +662,8 @@ def main():
             "fps": 24.0,
             "seed": "42",
             "upscale": False,
+            "mode": "text2video",
+            "image_path": "",
             # 48 transformer blocks. 4 => 12 offload groups; raise to 6-8 for a bit
             # more speed at the cost of VRAM, drop to 2 if stage 2 OOMs.
             "blocks_per_group": 4
@@ -719,6 +755,43 @@ def main():
     main_frame = ttk.Frame(root, padding="15")
     main_frame.pack(fill=tk.BOTH, expand=True)
     
+    # --- Generation mode ---
+    mode_frame = ttk.LabelFrame(main_frame, text=" Generation Mode ", padding="8")
+    mode_frame.pack(fill=tk.X, pady=(0, 12))
+
+    mode_var = tk.StringVar(value=config.get("mode", "text2video"))
+    image_path_var = tk.StringVar(value=config.get("image_path", ""))
+
+    mode_row = ttk.Frame(mode_frame)
+    mode_row.pack(fill=tk.X)
+    ttk.Radiobutton(mode_row, text="Text → Video", variable=mode_var, value="text2video").pack(side=tk.LEFT)
+    ttk.Radiobutton(mode_row, text="Image → Video", variable=mode_var, value="image2video").pack(side=tk.LEFT, padx=(12, 0))
+
+    image_row = ttk.Frame(mode_frame)
+    image_row.pack(fill=tk.X, pady=(6, 0))
+    lbl_image = ttk.Label(image_row, textvariable=image_path_var, foreground="#666666")
+
+    def browse_image():
+        path = filedialog.askopenfilename(
+            title="Select conditioning image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp"), ("All files", "*.*")],
+        )
+        if path:
+            image_path_var.set(path)
+
+    btn_browse = ttk.Button(image_row, text="📁 Choose Image...", command=browse_image)
+
+    def on_mode_switch(*_args):
+        if mode_var.get() == "image2video":
+            btn_browse.pack(side=tk.LEFT)
+            lbl_image.pack(side=tk.LEFT, padx=(8, 0))
+        else:
+            btn_browse.pack_forget()
+            lbl_image.pack_forget()
+
+    mode_var.trace_add("write", on_mode_switch)
+    on_mode_switch()
+
     ttk.Label(main_frame, text="Positive Prompt:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
     text_prompt = tk.Text(main_frame, height=3, wrap=tk.WORD, font=("Arial", 10))
     text_prompt.pack(fill=tk.X, pady=(0, 12))
@@ -882,6 +955,12 @@ def main():
                 messagebox.showerror("Error", "Positive prompt cannot be empty.")
                 return
                 
+            if mode_var.get() == "image2video":
+                img = image_path_var.get().strip()
+                if not img or not os.path.exists(img):
+                    messagebox.showerror("Error", "Image-to-Video mode needs a valid image. Click 'Choose Image...'.")
+                    return
+
             np_val = text_np.get("1.0", tk.END).strip()
             if not np_val:
                 try:
@@ -921,7 +1000,9 @@ def main():
                 'prompt': p, 'negative_prompt': np_val,
                 'width': w_adj, 'height': h_adj, 'fps': fps, 'frames': aligned_frames, 'seed': s_val,
                 'active_seed': active_seed,
-                'upscale': upscale_var.get()
+                'upscale': upscale_var.get(),
+                'mode': mode_var.get(),
+                'image_path': image_path_var.get().strip(),
             })
             save_config(config)
             
