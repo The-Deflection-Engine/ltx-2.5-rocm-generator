@@ -89,3 +89,4 @@ System RAM is no longer the limiting factor **on a 128GB machine** (peak usage i
 * Pre-quantized FP8 weights in `./local_ltx25_fp8` (run `quant_transformer_fp8.py` once if you don't have these)
 * The base LTX-2.5 model directory (`./local_ltx25_model`) for the latent upsampler config used by the 2-stage upscale path
 ### PLEASE FEEL FREE TO CONTRIBUTE TO MY "Buy Euan an RTX 5090 Fund" ;-)
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/S6I125FYNB)
