@@ -41,7 +41,20 @@ Both front-ends share the same `ltx2_config.json` and the same pipeline, so a fi
 
 ### First-time setup
 
-The engine loads pre-quantized FP8 weights from `./local_ltx25_fp8`. That directory is **not** part of this repo — you build it once, locally:
+Nothing here ships weights — you build the environment and the FP8 model once, locally. Budget ~50GB of disk and an hour, most of it downloading.
+
+0. **Environment.** Python 3.12, and a ROCm build of PyTorch. Install torch from AMD's index *first*, since the PyPI default is a CUDA build and will not work:
+   ```bash
+   python3 -m venv venv && source venv/bin/activate
+   pip install --pre torch torchvision torchaudio \
+       --index-url https://download.pytorch.org/whl/nightly/rocm6.3
+   pip install -r requirements.txt
+   ```
+   Check ROCm actually sees the card before going further — if this prints `False`, nothing below will work:
+   ```bash
+   python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+   ```
+   `requirements.txt` pins diffusers to a **git commit**, not a release: LTX-2.5 support landed after 0.35, so a PyPI wheel will not do. The GUI additionally needs `tkinter` (`sudo apt install python3-tk` on Debian/Ubuntu); the CLI does not.
 
 1. **Get the LTX-2.5 checkpoint** into `./local_ltx25_model`:
    ```bash

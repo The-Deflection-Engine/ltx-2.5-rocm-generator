@@ -1,0 +1,27 @@
+# Known-good versions for the RX 9070 XT (gfx1201) / ROCm 6.3 setup this repo
+# was built on. Python 3.12.
+#
+# torch/torchvision/torchaudio are NOT installed from here -- they come from
+# AMD's ROCm nightly index. See "Environment setup" in the README:
+#
+#   pip install --pre torch torchvision torchaudio \
+#       --index-url https://download.pytorch.org/whl/nightly/rocm6.3
+#
+# Pinned for reference; these were the working versions:
+#   torch        2.10.0.dev20250926+rocm6.3
+#   torchvision  0.25.0.dev20250929+rocm6.3
+#   torchaudio   2.8.0.dev20250929+rocm6.3
+
+# LTX-2.5 support landed after 0.35, so a release wheel will not work.
+diffusers @ git+https://github.com/huggingface/diffusers.git@9284607295a09f759aadd65ed08f48b35feea6d9
+
+transformers>=5.15.0
+accelerate>=1.14.0
+huggingface_hub>=1.27.0
+safetensors>=0.8.0
+sentencepiece>=0.2.2
+
+numpy>=2.5.0
+pillow>=12.0.0
+imageio-ffmpeg>=0.6.0
+av>=18.0.0
