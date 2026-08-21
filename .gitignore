@@ -9,6 +9,10 @@
 !cli_gen_vid.py
 !ltx_engine.py
 !bench_vae_tiles.py
+
+# Test harness lives in its own directory; /* only matches root entries, so
+# un-ignoring the directory is enough to include what is inside it.
+!tests/
 !README.md
 !requirements.txt
 # ltx2_config.json is deliberately NOT tracked: the GUI rewrites it on every
