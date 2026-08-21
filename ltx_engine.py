@@ -1021,7 +1021,24 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                     raise CancellationError("Cancelled before refinement pass.")
 
                 # Stage 2 infers its resolution from the 5D latents, so no height/width.
-                output = pipe(
+                #
+                # i2v runs this through i2v_pipe, not the plain T2V `pipe` --
+                # using T2V here was silently dropping the image conditioning
+                # for the refinement pass. i2v_pipe.prepare_latents() special-
+                # cases 5D `latents` input (pipeline_ltx2_image2video.py:798-809):
+                # it builds a conditioning_mask marking frame 0 as clean and only
+                # re-noises the *other* frames (`noise_scale * (1 - mask)`),
+                # matching what the upstream two-stage recipe does
+                # (ltx_pipelines/ti2vid_two_stages.py:301-327). The plain T2V
+                # pipeline has no such mask and re-noises every frame including
+                # 0, so a T2V-refined i2v stage 1 drifts off the source image in
+                # a way i2v single-stage never does. No `image=` needed here --
+                # that branch of prepare_latents is only reached when `latents`
+                # is None, so passing 5D latents skips it entirely (and CRF
+                # re-compression along with it, correctly: the image was
+                # already conditioned once, in stage 1).
+                stage2_pipe = i2v_pipe if use_image else pipe
+                output = stage2_pipe(
                     num_frames=realized_frames,
                     sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
                     latents=upsampled_latents,
