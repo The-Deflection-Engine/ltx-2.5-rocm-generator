@@ -46,7 +46,7 @@ os.environ["HIP_FORCE_DEV_KERN_LAZY_COMPILE"] = "0"
 os.environ["TORCH_ROCM_AOTXN_ENABLE"] = "1"
 os.environ["AMD_SERIALIZE_KERNEL"] = "0"
 os.environ["HIP_VISIBLE_DEVICES"] = "0"
-# 124GB RAM / 16 threads: let the CPU-side maths (text encode, pinning,
+# 16 threads: let the CPU-side maths (text encode, pinning,
 # numpy postprocess, ffmpeg staging) actually use the box.
 os.environ.setdefault("OMP_NUM_THREADS", "16")
 os.environ.setdefault("MKL_NUM_THREADS", "16")
@@ -104,7 +104,8 @@ def token_warn_threshold(config=None):
     return max(2000, int(tokens))
 
 # --- Process-lifetime caches -------------------------------------------------
-# With 124GB of RAM there is no reason to re-read 18GB of transformer weights
+# Peak RAM use is ~45GB, so on anything comfortably above that there is no
+# reason to re-read 18GB of transformer weights
 # (or 23GB of text encoder) from disk on every click of "Generate".
 _MODEL_CACHE = {"pipe": None, "transformer": None, "path": None, "opts": None}
 _UPSAMPLER_CACHE = {"model": None, "path": None}

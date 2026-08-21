@@ -3,7 +3,7 @@
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/S6I125FYNB)
 
-A GUI control panel and a headless CLI for running the **LTX-2.5 video diffusion model** on a single AMD consumer GPU via ROCm — built and tuned on an RX 9070 XT (16GB VRAM) with 128GB system RAM.
+A GUI control panel and a headless CLI for running the **LTX-2.5 video diffusion model** on a single AMD consumer GPU via ROCm — developed on an RX 9070 XT (16GB VRAM) with 128GB system RAM, but the RAM figure is not a requirement — more than 32GB is what matters, and 32GB itself works for smaller generations.
 
 It keeps the FP8 model resident in memory between generations, runs the distilled guidance-free schedule correctly, tiles the VAE decode to avoid AMDGPU driver timeouts, and supports a working two-stage generate-then-upscale pipeline.
 
@@ -105,7 +105,7 @@ Settings come from `ltx2_config.json`; every flag overrides it for that run only
 
 Unlike the GUI, the VRAM warning is a **hard stop** rather than a prompt — it exits with status 2 and needs `--force` to proceed, which suits unattended runs. `--dry-run` prints the resolved resolution, length, seed, token count and estimated VRAM without generating anything. Ctrl-C sets the same cancel flag the GUI's button does, so it stops cleanly between diffusion steps.
 
-### Recommended settings for this hardware (16GB VRAM / 128GB RAM)
+### Recommended settings (16GB VRAM / >32GB RAM)
 
 > ⚠️ **This has only been tested on an RX 9070 XT (16GB VRAM), and headroom on that card is tight.** A 960x544 (2-stage) run at 193 frames — the upper end of what the token-count math below suggested should fit — became unrecoverable during testing here, taking down the desktop session rather than failing cleanly. That's a single observation on one GPU, driver and desktop combination; yours may behave quite differently, better or worse. Treat the figures below as a starting point rather than a validated limit. **2-stage upscaling defaults to off in the GUI** — enable it deliberately, and work up gradually until you know how your own system responds.
 
@@ -121,7 +121,7 @@ Going past the maximum recommended row (e.g. full-res 1280x704 direct at 2x, or 
 
 > ⚠️ **Free up VRAM before a large run: close unneeded GUI programs and run a single monitor.** This is real, not superstition — on this machine the desktop compositor alone (four connected outputs, one active) was holding ~1GB of VRAM at idle before any generation started, and every extra display and GPU-accelerated app (browsers especially — WebGL/video-decode tabs are heavy) adds to that. With only ~1-2GB of headroom above the "maximum recommended" row, that 1GB+ matters. Close browsers/other GPU-heavy apps and disable extra monitors before pushing toward the higher end of the table above.
 
-> ⚠️ **On 32GB RAM (the minimum), do not attempt the "Pushing it" row or the highest resolution/frame settings.** Those figures assume the 128GB this script was tuned for — resident model caching (~18GB pinned) plus a transient 23GB text-encoder subprocess plus VAE/upsampler staging can exceed 32GB well before VRAM becomes the limit, causing a system-RAM OOM rather than a clean VRAM error. At 32GB, stick to the default 960x544 → 1920x1088 preset at the lower end of the frame range (121f), click **🧹 Unload Models** between runs (this is the one configuration where it's part of the normal workflow rather than an escape hatch), and consider dropping `blocks_per_group` to 2.
+> ⚠️ **At 32GB RAM, stick to smaller generations.** 32GB works, but it is the floor rather than a comfortable margin: resident model caching (~18GB pinned) plus a transient 23GB text-encoder subprocess plus VAE/upsampler staging can exceed it before VRAM becomes the limit, giving a system-RAM OOM rather than a clean VRAM error. At 32GB, keep to shorter clips and the lower resolutions, click **🧹 Unload Models** between runs (the one configuration where that is normal workflow rather than an escape hatch), and have swap available. Above ~48GB the resident cache stops being a constraint and you can work through the table below normally.
 
 ### Tuning knobs (in `ltx2_config.json`)
 
@@ -194,20 +194,20 @@ Less often than you'd think. VRAM is already released after every run — the ge
 
 Reach for it when:
 
-* **You're on 32GB RAM** (the supported minimum) — here it *is* routine. ~18GB pinned plus a transient 23GB text-encoder subprocess doesn't leave room to keep models resident between runs.
+* **You're at or near 32GB RAM** — here it *is* routine. ~18GB pinned plus a transient 23GB text-encoder subprocess doesn't leave room to keep models resident between runs.
 * **You want the GPU and RAM back for something else** — a game, another ML job — without closing the control panel.
 * **Something went wrong** and you'd rather start the next attempt from a clean pipeline than debug a half-torn-down one.
 
 The cost is one slow run afterwards: the next generation re-reads ~18GB from disk. The log line tells you how much it actually freed.
 
-System RAM is no longer the limiting factor **on a 128GB machine** (peak usage is roughly 45GB — the resident 18GB transformer plus a transient text-encoder subprocess), so a large swap file there is optional insurance rather than a hard requirement. On a 32GB machine it's the opposite: that same 45GB peak won't fit in RAM alone, so a swap file (16GB+) is required, not optional, and you should still expect to stay off the higher resolution/frame settings — see the warning above.
+Peak RAM usage is roughly 45GB — the resident 18GB transformer plus a transient text-encoder subprocess. **Comfortably above that (~48GB+) and RAM stops being a factor**, so swap is optional insurance. At 32GB that 45GB peak won't fit in RAM alone, so a swap file (16GB+) is required rather than optional, and you should keep to smaller generations — see the warning above.
 
 ---
 
 ## Requirements
 
 * AMD GPU with ROCm support (developed/tested on RX 9070 XT, gfx1201)
-* **System RAM: 32GB minimum.** This is a hard floor, not a comfortable one — see the RAM warning under Recommended Settings above. At 32GB, keep to the lower end of resolution/frame settings and expect to rely on swap; the higher-end presets (large 2-stage output, longer clips) were tuned for and tested on 128GB and are not safe to attempt at 32GB.
+* **System RAM: more than 32GB recommended; 32GB is the working minimum.** Peak usage is ~45GB, so anything comfortably above that (~48GB+) removes RAM as a constraint. 32GB works for smaller generations provided you have swap and use **🧹 Unload Models** between runs — see the RAM warning under Recommended Settings. Development happened on 128GB, but that is not a requirement.
 * Pre-quantized FP8 weights in `./local_ltx25_fp8` — built once by `quant_transformer_fp8.py`, see [First-time setup](#first-time-setup)
 * The base LTX-2.5 model directory (`./local_ltx25_model`) for the latent upsampler config used by the 2-stage upscale path
 * *(Optional, for the prompt enhancer)* `google/gemma-4-E2B-it` in `./local_ltx25_enhancer` — ungated, Apache-2.0, ~10GB, no HF token needed. The LTX-2.5 checkpoints ship `prompt_enhancer` and `processor` as nulls, so this is a separate download:

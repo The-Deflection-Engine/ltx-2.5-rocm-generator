@@ -835,7 +835,7 @@ def main():
             "Models stay resident, so the next run starts immediately.")
 
     # Models stay resident in RAM between runs (18GB transformer + 1.8GB decoders).
-    # On a 124GB box that is free speed; this button gives it back if needed.
+    # With RAM to spare that is free speed; this button gives it back if needed.
     btn_free = ttk.Button(btn_frame, text="🧹 Unload Models (~18GB)", command=free_resident_models)
     btn_free.pack(side=tk.RIGHT, ipady=8, padx=(4, 0))
     tooltip(btn_free,
