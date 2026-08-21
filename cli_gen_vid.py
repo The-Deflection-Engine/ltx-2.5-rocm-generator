@@ -150,7 +150,7 @@ def main():
         "frames": 121, "fps": 24.0, "seed": "42", "upscale": False,
         "mode": "text2video", "image_path": "", "auto_duration": False,
         "auto_min_seconds": 2.0, "auto_max_seconds": 5.0, "image_crf": None,
-        "cfg_mode": False, "cfg_steps": 30, "cfg_scale": 3.0, "audio_cfg_scale": 7.0,
+        "cfg_mode": False, "cfg_steps": 30, "cfg_scale": 3.0, "audio_cfg_scale": 7.0, "cfg_modality_scale": 1.0,
         "stg_mode": False, "stg_scale": 1.0,
         "blocks_per_group": 4, "attention_backend": "native",
     }

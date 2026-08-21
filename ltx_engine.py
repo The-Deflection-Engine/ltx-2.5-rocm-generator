@@ -617,6 +617,20 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         # less than half the reference strength. Costs nothing extra: audio
         # CFG rides the same doubled forward pass as video CFG.
         audio_cfg_scale = float(config.get("audio_cfg_scale", 7.0))
+        # Modality-isolation guidance: a third guidance term the reference CFG
+        # presets always run alongside CFG (LTX_2_PARAMS and the HQ preset both
+        # set modality_scale=3.0 for video AND audio -- constants.py:54,64,
+        # :102,110). Unlike audio_cfg_scale this is NOT free: do_modality_isolation
+        # _guidance (pipeline_ltx2.py:907-908) adds its own extra, *unbatched*
+        # transformer call each step (the "uncond_modality" pass, :1509-1524) --
+        # a third full forward pass on top of CFG's doubled one, so a real VRAM
+        # and time cost on a 16GB card that's already paying for CFG.
+        # Off by default (1.0, i.e. do_modality_isolation_guidance stays False)
+        # rather than matching the reference's 3.0: unlike the audio_cfg_scale
+        # fix, defaulting this on would silently make every existing CFG-mode
+        # run slower and heavier. Opt in via cfg_modality_scale in the config
+        # once you have headroom to spare.
+        cfg_modality_scale = float(config.get("cfg_modality_scale", 1.0))
 
         # --- Spatio-Temporal Guidance ----------------------------------------
         # STG runs a second pass with one transformer block perturbed and pushes
@@ -650,8 +664,8 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 # the `or` as itself and is numerically off (it only scales a
                 # delta that gets added in, see :1505).
                 audio_stg_scale=1e-8,
-                modality_scale=1.0,
-                audio_modality_scale=1.0,
+                modality_scale=cfg_modality_scale,
+                audio_modality_scale=cfg_modality_scale,
             )
             stage1_schedule = dict(num_inference_steps=cfg_steps)
             need_negative = True        # the negative prompt is finally encoded and used
@@ -895,11 +909,14 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         dbg(f"seq={_lat_f * (stage1_h // 32) * (stage1_w // 32):,} tokens "
             f"(latent {_lat_f}x{stage1_h // 32}x{stage1_w // 32}), "
             f"blocks_per_group={config.get('blocks_per_group', 4)}, seed={config['active_seed']}")
-        _passes = 1 + (1 if use_cfg else 0) + (1 if use_stg else 0)
+        use_modality = use_cfg and cfg_modality_scale > 1.0
+        _passes = 1 + (1 if use_cfg else 0) + (1 if use_stg else 0) + (1 if use_modality else 0)
         dbg(f"guidance: CFG {'on' if use_cfg else 'off'}"
             f"{f' (scale {cfg_scale}, audio {audio_cfg_scale})' if use_cfg else ''}, "
             f"STG {'on' if use_stg else 'off'}"
-            f"{f' (scale {stg_scale}, blocks {stg_blocks})' if use_stg else ''} "
+            f"{f' (scale {stg_scale}, blocks {stg_blocks})' if use_stg else ''}, "
+            f"modality {'on' if use_modality else 'off'}"
+            f"{f' (scale {cfg_modality_scale})' if use_modality else ''} "
             f"-> {_passes} transformer pass{'es' if _passes > 1 else ''} per step")
 
         steps_done = [0]

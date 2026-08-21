@@ -134,6 +134,11 @@ def main():
             # so there's nothing to trade off by exposing it; edit the config
             # directly if you want to experiment.
             "audio_cfg_scale": 7.0,
+            # Modality-isolation guidance: costs a THIRD full transformer pass
+            # per step (unlike audio_cfg_scale, not free), so off (1.0) by
+            # default even with CFG on. Reference recipe runs this at 3.0
+            # alongside CFG; opt in here once you have VRAM/time to spare.
+            "cfg_modality_scale": 1.0,
             "auto_min_seconds": 2.0,
             "auto_max_seconds": 5.0,
             # Conditioning-image compression for image-to-video. null = model
