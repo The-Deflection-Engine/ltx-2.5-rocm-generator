@@ -609,6 +609,14 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         use_cfg = bool(config.get("cfg_mode"))
         cfg_steps = max(8, int(config.get("cfg_steps", 30)))
         cfg_scale = float(config.get("cfg_scale", 3.0))
+        # Audio CFG is a separate, much stronger knob in the reference recipe --
+        # LTX_2_PARAMS.audio_guider_params.cfg_scale is 7.0 against 3.0 for
+        # video (packages/ltx-pipelines/.../utils/constants.py:51,61), and
+        # diffusers' own __call__ default for audio_guidance_scale is 7.0 too.
+        # This used to reuse cfg_scale for both, running audio guidance at
+        # less than half the reference strength. Costs nothing extra: audio
+        # CFG rides the same doubled forward pass as video CFG.
+        audio_cfg_scale = float(config.get("audio_cfg_scale", 7.0))
 
         # --- Spatio-Temporal Guidance ----------------------------------------
         # STG runs a second pass with one transformer block perturbed and pushes
@@ -630,7 +638,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         if use_cfg:
             stage1_guidance = dict(
                 guidance_scale=cfg_scale,
-                audio_guidance_scale=cfg_scale,
+                audio_guidance_scale=audio_cfg_scale,
                 # STG on top of CFG would be a third pass per step. Allowed, but
                 # it is the user asking for it explicitly.
                 stg_scale=stg_scale if use_stg else 0.0,
@@ -889,7 +897,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             f"blocks_per_group={config.get('blocks_per_group', 4)}, seed={config['active_seed']}")
         _passes = 1 + (1 if use_cfg else 0) + (1 if use_stg else 0)
         dbg(f"guidance: CFG {'on' if use_cfg else 'off'}"
-            f"{f' (scale {cfg_scale})' if use_cfg else ''}, "
+            f"{f' (scale {cfg_scale}, audio {audio_cfg_scale})' if use_cfg else ''}, "
             f"STG {'on' if use_stg else 'off'}"
             f"{f' (scale {stg_scale}, blocks {stg_blocks})' if use_stg else ''} "
             f"-> {_passes} transformer pass{'es' if _passes > 1 else ''} per step")

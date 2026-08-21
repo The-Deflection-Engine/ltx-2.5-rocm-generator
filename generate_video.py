@@ -128,6 +128,12 @@ def main():
             "enhance_max_words": 0,
             "cfg_steps": 30,
             "cfg_scale": 3.0,
+            # Separate from cfg_scale: the reference recipe runs audio CFG
+            # much stronger than video (7.0 vs 3.0). No GUI control -- costs
+            # nothing extra since it rides the same doubled pass as video CFG,
+            # so there's nothing to trade off by exposing it; edit the config
+            # directly if you want to experiment.
+            "audio_cfg_scale": 7.0,
             "auto_min_seconds": 2.0,
             "auto_max_seconds": 5.0,
             # Conditioning-image compression for image-to-video. null = model
