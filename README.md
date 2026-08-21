@@ -3,18 +3,34 @@
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/S6I125FYNB)
 
-A GUI control panel (`generate_video.py`) for running the **LTX-2.5 video diffusion model** on a single AMD consumer GPU via ROCm — built and tuned on an RX 9070 XT (16GB VRAM) with 128GB system RAM.
+A GUI control panel and a headless CLI for running the **LTX-2.5 video diffusion model** on a single AMD consumer GPU via ROCm — built and tuned on an RX 9070 XT (16GB VRAM) with 128GB system RAM.
 
 It keeps the FP8 model resident in memory between generations, runs the distilled guidance-free schedule correctly, tiles the VAE decode to avoid AMDGPU driver timeouts, and supports a working two-stage generate-then-upscale pipeline.
+
+### Layout
+
+| file | what it is |
+|---|---|
+| `ltx_engine.py` | The generation pipeline. No UI of any kind. |
+| `generate_video.py` | Tk control panel — imports the engine. |
+| `cli_gen_vid.py` | Headless CLI — imports the engine. Needs no `tkinter`. |
+| `quant_transformer_fp8.py` | One-time FP8 conversion, see [First-time setup](#first-time-setup). |
+| `bench_vae_tiles.py` | VAE decode timing harness, see [VAE tile geometry](#vae-tile-geometry--measured-dont-guess). |
+
+Both front-ends share the same `ltx2_config.json` and the same pipeline, so a fix in one reaches both.
+
+*An unashamed joint programming collaboration between a human and Claude.*
 
 ---
 
 ## ✨ Key Features
 
-* **Resident model cache:** the ~18GB FP8 transformer and prompt-embedding cache (in-RAM + on-disk) survive across generations, so only the first click of a session pays the disk-load cost. A **🧹 Free Models** button releases them when you're done.
+* **Resident model cache:** the ~18GB FP8 transformer and prompt-embedding cache (in-RAM + on-disk) survive across generations, so only the first click of a session pays the disk-load cost. VRAM is returned automatically after every run, and changing an offload setting rebuilds the pipeline by itself — so on a large-RAM machine you can generally ignore this. A **🧹 Unload Models** button is there for when you want the ~18GB back anyway (see [when to use it](#when-to-use-unload-models)).
 * **Guidance-free distilled schedule, correctly disabled:** `audio_guidance_scale` defaults to 7.0 in the underlying pipeline, which silently re-enables classifier-free guidance (doubling every step) if you only zero out `guidance_scale`. This script zeroes all guidance/STG scales, so every step actually runs once — roughly 2x fewer FLOPs than a naive guidance-scale-1.0 setup.
 * **Real VAE tiling:** spatial tiling (`enable_tiling`) plus framewise (temporal) decoding, which is what actually bounds VRAM and prevents the AMDGPU ring-timeout watchdog from firing on longer clips.
 * **Working two-stage upscale (off by default):** generate at a lower base resolution, then run a 2x latent upsample + short refinement pass at the target resolution — faster than generating at full resolution directly, with one noise generator threaded through both stages per the LTX-2.5 reference recipe. Off by default because it pushes VRAM harder — see the hardware warning below before enabling it.
+* **Prompt enhancer (optional):** click **✨ Enhance Now** to rewrite a short prompt into the long, detailed caption style LTX-2.5 was trained on, using `google/gemma-4-E2B-it`. The result replaces the prompt box, so you read and edit it before spending minutes on a render — no hidden rewrites. It runs in a throwaway subprocess and frees itself on exit, so it costs **zero resident VRAM or RAM during generation**. Works for image-to-video too (the enhancer is conditioned on your reference frame). Requires the one-off download below.
+* **CFG quality mode (off by default):** the distilled schedule is guidance-free, which is fast but drops secondary prompt details. Ticking **CFG quality mode** runs classifier-free guidance on stage 1 — the transformer runs twice per step and pushes away from the negative prompt, which is what forces adherence. Costs roughly **7-8x the compute** (30 steps instead of 8, doubled per step) and about **2x the activation VRAM**, so on 16GB it is realistically single-stage only. Confirmation dialog spells this out before it turns on.
 * **Live hardware telemetry:** CPU/RAM/GPU/VRAM usage and per-core load, read directly from sysfs/procfs (no extra dependencies).
 * **Auto-saved config:** every setting (prompt, resolution, frames, seed, offload tuning) is persisted to `ltx2_config.json` and reloaded on next launch.
 * **Cancel support:** stop a run cleanly between diffusion steps.
@@ -23,42 +39,106 @@ It keeps the FP8 model resident in memory between generations, runs the distille
 
 ## 🚀 Usage
 
+### First-time setup
+
+The engine loads pre-quantized FP8 weights from `./local_ltx25_fp8`. That directory is **not** part of this repo — you build it once, locally:
+
+1. **Get the LTX-2.5 checkpoint** into `./local_ltx25_model`:
+   ```bash
+   hf download Lightricks/LTX-2.5-Diffusers --local-dir local_ltx25_model
+   ```
+   It must be the **`-Diffusers`** repo — `LTX2Pipeline.from_pretrained()` needs the `model_index.json` + per-component subfolder layout that only that one ships. The plain `Lightricks/LTX-2.5` repo is a different format and will not load.
+
+2. **Check `local_ltx25_model/model_index.json`.** If `text_encoder` names `Gemma3ForConditionalGeneration`, change it to `Gemma4UnifiedForConditionalGeneration` — the stock file points at the wrong class for these weights and loading fails with a class/shape mismatch. See `local_ltx25_model/README.md`.
+
+3. **Quantize to FP8** (one time, ~10 min, needs the ~35GB bf16 model in RAM):
+   ```bash
+   python quant_transformer_fp8.py
+   ```
+   This casts every `nn.Linear` in the transformer to `float8_e4m3fn` and writes `./local_ltx25_fp8` (~18GB). Keep `./local_ltx25_model` afterwards — the 2-stage upscale path still reads its `latent_upsampler` config.
+
+4. *(Optional)* the prompt enhancer — see [Requirements](#requirements).
+
+### Running
+
 ```bash
 python generate_video.py
 ```
 
 This opens the control panel. Fill in:
 
-* **Positive / Negative Prompt** — negative prompt is accepted but unused; the distilled schedule runs guidance-free.
-* **Resolution** — pick a preset or choose *Custom* and enter width/height directly (must be multiples of 32).
-* **2-stage upscale checkbox** — when on, output is 2x the selected resolution (e.g. select 960x544 to get a 1920x1088 final video).
+* **Positive / Negative Prompt** — the negative prompt only takes effect with **CFG quality mode** on; the distilled schedule is guidance-free and never evaluates it. The label above the box says which state you're in. Both boxes have **✕ Clear**.
+* **Resolution** — landscape and portrait presets, or *Custom* for any size (snapped to multiples of 32, minimum 256 — the GUI tells you when it adjusts your input). A live readout under the checkbox shows the actual output size and whether the run is single- or 2-stage.
+* **2-stage upscale checkbox** — when on, the dropdown is the *base* resolution and the output is 2x it (960x544 → 1920x1088). Off means single-stage at the size shown.
 * **Length** — enter as frames or seconds; frame count is auto-aligned to LTX-2.5's `8k + 1` rule.
 * **Seed** — a number, or `r` for random.
 
 Click **🚀 Generate Video**. Progress and logs stream into the console pane; **🛑 Cancel** stops between steps.
 
+Tick **🐞 Debug** for per-step timing, latent geometry, token count and a VRAM/RAM reading on every line, plus diffusers' own offload/tiling warnings. It can be toggled mid-run — the next step picks it up, so you never have to restart and reload 18GB to diagnose something.
+
+### Headless CLI
+
+Same engine, no GUI, no `tkinter` required — useful over SSH or in a script:
+
+```bash
+python cli_gen_vid.py                              # run what's in the config
+python cli_gen_vid.py --prompt "a red car" --seconds 4
+python cli_gen_vid.py --dry-run                    # resolve settings, print, exit
+python cli_gen_vid.py --image frame.png --debug    # image-to-video
+```
+
+Settings come from `ltx2_config.json`; every flag overrides it for that run only. `--save` writes the resolved settings back, `--config other.json` points at a different file.
+
+Unlike the GUI, the VRAM warning is a **hard stop** rather than a prompt — it exits with status 2 and needs `--force` to proceed, which suits unattended runs. `--dry-run` prints the resolved resolution, length, seed, token count and estimated VRAM without generating anything. Ctrl-C sets the same cancel flag the GUI's button does, so it stops cleanly between diffusion steps.
+
 ### Recommended settings for this hardware (16GB VRAM / 128GB RAM)
 
-> ⚠️ **This has only been tested on an RX 9070 XT (16GB VRAM), and headroom on that card is tight.** A 960x544 (2-stage) run at 193 frames — the upper end of what the token-count math below suggested should fit — locked up the entire machine during testing, not just the generation process. Treat the figures below as the practical ceiling, not a floor to push past, until proven otherwise on your own hardware. **For this reason 2-stage upscaling now defaults to off in the GUI** — enable it deliberately, and start well below the maximum until you've confirmed your system handles it.
+> ⚠️ **This has only been tested on an RX 9070 XT (16GB VRAM), and headroom on that card is tight.** A 960x544 (2-stage) run at 193 frames — the upper end of what the token-count math below suggested should fit — became unrecoverable during testing here, taking down the desktop session rather than failing cleanly. That's a single observation on one GPU, driver and desktop combination; yours may behave quite differently, better or worse. Treat the figures below as a starting point rather than a validated limit. **2-stage upscaling defaults to off in the GUI** — enable it deliberately, and work up gradually until you know how your own system responds.
 
-The binding constraint is VRAM, not RAM — the transformer's attention cost scales with `latent_frames × (H/32) × (W/32)`, which the script tracks as a "token count" and warns you about above ~50,000 (with the option to continue anyway). That warning threshold is a rough estimate, not a guarantee — the 193-frame lockup above was inside it.
+The binding constraint is VRAM, not RAM — the transformer's attention cost scales with `latent_frames × (H/32) × (W/32)`, which the script tracks as a "token count". Before generating, it estimates peak VRAM from that count and warns if the estimate is close to your card's capacity (with the option to continue anyway). The threshold is derived from your reported VRAM, so a larger card raises it automatically; see [Tuning knobs](#tuning-knobs-in-ltx2_configjson) to override it. It is a fitted estimate from a single GPU, not a guarantee — don't rely on it as a safety net.
 
 | Mode | Base resolution | Frames | Final output | Notes |
 |---|---|---|---|---|
 | **Maximum recommended** | 960x544 (2-stage) | up to 121 (5s @24fps) | **1920x1088** | The practical ceiling on 16GB VRAM — don't go higher without headroom to spare |
 | Single-stage, no upscale | 1280x704 | up to ~121f | 1280x704 | Skip the checkbox for a direct full-res render |
-| ~~Pushing it~~ — do not use | ~~960x544 (2-stage), up to 193f~~ | | ~~1920x1088~~ | **Locked up the whole machine during testing. Not recommended at any frame count above the row on this GPU.** |
+| ~~Pushing it~~ — not recommended | ~~960x544 (2-stage), up to 193f~~ | | ~~1920x1088~~ | **Failed unrecoverably during testing here.** Untested above the row above; approach with caution on any GPU. |
 
-Going past the maximum recommended row (e.g. full-res 1280x704 direct at 2x, or frame counts above 121 with upscaling on) risks exhausting 16GB of VRAM, tripping the ring-timeout watchdog, or freezing the system outright — the token-count warning dialog is a rough guide, not a safety guarantee, so don't rely on it alone.
+Going past the maximum recommended row (e.g. full-res 1280x704 direct at 2x, or frame counts above 121 with upscaling on) risks exhausting VRAM or tripping the driver's timeout watchdog. How your system reacts to that — a clean error, a stalled render, or something worse — depends on your driver and desktop. The token-count warning is a fitted guide, not a safety guarantee, so don't rely on it alone.
 
-> ⚠️ **Free up VRAM before a large run: close unneeded GUI programs and run a single monitor.** This is real, not superstition — on this machine the desktop compositor alone (four connected outputs, one active) was holding ~1GB of VRAM at idle before any generation started, and every extra display and GPU-accelerated app (browsers especially — WebGL/video-decode tabs are heavy) adds to that. With only ~1-2GB of headroom above the "maximum recommended" row before you're back in lockup territory, that 1GB+ matters. Close browsers/other GPU-heavy apps and disable extra monitors before pushing toward the higher end of the table above.
+> ⚠️ **Free up VRAM before a large run: close unneeded GUI programs and run a single monitor.** This is real, not superstition — on this machine the desktop compositor alone (four connected outputs, one active) was holding ~1GB of VRAM at idle before any generation started, and every extra display and GPU-accelerated app (browsers especially — WebGL/video-decode tabs are heavy) adds to that. With only ~1-2GB of headroom above the "maximum recommended" row, that 1GB+ matters. Close browsers/other GPU-heavy apps and disable extra monitors before pushing toward the higher end of the table above.
 
-> ⚠️ **On 32GB RAM (the minimum), do not attempt the "Pushing it" row or the highest resolution/frame settings.** Those figures assume the 128GB this script was tuned for — resident model caching (~18GB pinned) plus a transient 23GB text-encoder subprocess plus VAE/upsampler staging can exceed 32GB well before VRAM becomes the limit, causing a system-RAM OOM rather than a clean VRAM error. At 32GB, stick to the default 960x544 → 1920x1088 preset at the lower end of the frame range (121f), click **🧹 Free Models** between runs, and consider dropping `blocks_per_group` to 2.
+> ⚠️ **On 32GB RAM (the minimum), do not attempt the "Pushing it" row or the highest resolution/frame settings.** Those figures assume the 128GB this script was tuned for — resident model caching (~18GB pinned) plus a transient 23GB text-encoder subprocess plus VAE/upsampler staging can exceed 32GB well before VRAM becomes the limit, causing a system-RAM OOM rather than a clean VRAM error. At 32GB, stick to the default 960x544 → 1920x1088 preset at the lower end of the frame range (121f), click **🧹 Unload Models** between runs (this is the one configuration where it's part of the normal workflow rather than an escape hatch), and consider dropping `blocks_per_group` to 2.
 
 ### Tuning knobs (in `ltx2_config.json`)
 
 * `blocks_per_group` — offload group size for the transformer's 48 blocks (default 4 → 12 groups). Raise to 6–8 for more speed at the cost of steady-state VRAM; drop to 2 if the upscale/refinement stage runs out of memory.
 * `attention_backend` — defaults to `native` (PyTorch SDPA auto-dispatch, which picks the right kernel for gfx1201 automatically). Only override this if you're deliberately experimenting — a forced kernel can hard-fail on masked cross-attention.
+
+* `vae_tile_size` / `vae_tile_stride` (default 512 / 448) and `vae_tile_frames` / `vae_tile_stride_frames` (default 24 / 16) — VAE decode tile geometry. **The defaults are measured optimal; leave them alone unless you need the low-VRAM fallback below.**
+* `token_warn_threshold` — latent-token count above which the GUI warns before generating. Unset by default, in which case it is computed from your card's reported VRAM using a fitted model (`VRAM_GB ≈ 7.68 + 1.814e-4 × tokens`, with 15% headroom) — roughly 32k tokens on a 16GB card, 70k on 24GB. That fit comes from **one GPU and one run**, so if it proves too cautious or too permissive on your hardware, set an explicit number here to override it.
+
+Both `blocks_per_group` and `attention_backend` are baked into the pipeline when it is built, so they're part of the resident cache's identity: **edit either one and the next run rebuilds automatically** — no restart, no manual unload. (Everything else in `ltx2_config.json` is written by the GUI and read fresh each run.)
+
+> ⚠️ `blocks_per_group` is currently **inert**: `use_stream=True` forces diffusers to a group size of 1 (it logs *"Using streams is only supported for num_blocks_per_group=1"*). That is the faster arrangement anyway — the weight transfer overlaps compute instead of stalling it — so there is no GUI control for it. It only takes effect if you also set `use_stream=False` in the source.
+
+#### VAE tile geometry — measured, don't guess
+
+Decoding 1536x1024 x 49 frames on an RX 9070 XT, timing only the VAE (`bench_vae_tiles.py`):
+
+| spatial | temporal | tile decodes | time | peak VRAM |
+|---|---|---|---|---|
+| 256px | 24f | 105 | 112.0s | **3.26GB** |
+| **512px** | **24f** | **36** | **24.8s** | 6.63GB |
+| 512px | 48f | 24 | 225.9s | 12.42GB |
+| 1024px | 24f | 6 | 653.1s | 15.03GB |
+| 1024px | 48f | — | **OOM** | — |
+
+The defaults (512/24) win by 4.5x over smaller tiles and 26x over larger ones. Bigger tiles are the *worse* direction on both axes: peak VRAM tracks the largest single tile's working set rather than the tile count, and once a tile stops fitting the allocator thrashes far more than the saved overlap-blending is worth. 1024px peaks at 15.03GB of 15.9GB — close enough to capacity to be risky.
+
+**Strides must land on a latent boundary** (spatial compression is 32, temporal is 8). A ragged stride is punished hard: a 384px tile with a 336px stride (10.5 latent px) ran 3x slower than a 512px tile *despite decoding fewer tiles*. Keep `vae_tile_size` a multiple of 32 and `vae_tile_frames` a multiple of 8, with strides likewise.
+
+**Low-VRAM fallback:** `vae_tile_size: 256`, `vae_tile_stride: 224` halves decode VRAM (6.63 → 3.26GB) for ~4.5x the decode time. Worth it only if you want to push resolution or frame count past what currently fits.
 
 ---
 
@@ -76,10 +156,36 @@ sudo update-initramfs -u
 ```
 *(Requires a reboot.)*
 
+### Slow VAE decode? Check `MIOPEN_FIND_MODE`
+
+This script used to force `MIOPEN_FIND_MODE=1` (NORMAL = exhaustive kernel search). On an RX 9070 XT that cost **13.8x on the VAE decode**:
+
+| `MIOPEN_FIND_MODE` | vae.decode (1536x1024, 49f) | peak VRAM |
+|---|---|---|
+| `1` (exhaustive) | 342.5s | 6.63GB |
+| unset (MIOpen heuristic) | **24.8s** | 6.63GB |
+
+Identical shape, tiles and peak VRAM — the same computation, just a different kernel-selection strategy. The penalty **recurs on every run**: exhaustive mode re-searches even once MIOpen's perf database is populated, so it is not a one-off warm-up cost. It is now left unset; export it yourself only if you have a specific reason to force a mode.
+
+On a 2-stage 97-frame run this was roughly six minutes of the ten.
+
 ### Out of Memory (VRAM) Errors
-1. Drop `blocks_per_group` to 2 in `ltx2_config.json`.
+1. Drop `blocks_per_group` to 2 in `ltx2_config.json`. This takes effect on the next run on its own — the pipeline rebuilds because the setting changed.
 2. Reduce resolution or frame count (see table above).
-3. Click **🧹 Free Models** before a large run if you've been experimenting with other settings — a stale resident pipeline plus a big new allocation can add up.
+3. Close GPU-heavy apps and extra monitors (see the VRAM warning above — the compositor alone can hold ~1GB).
+
+<a id="when-to-use-unload-models"></a>
+### When to use 🧹 Unload Models
+
+Less often than you'd think. VRAM is already released after every run — the generation path runs `gc.collect()` + `empty_cache()` in a `finally` block, success or failure — and the two build-time knobs above now rebuild the pipeline by themselves when changed. So on a large-RAM machine it is an escape hatch, not part of the loop.
+
+Reach for it when:
+
+* **You're on 32GB RAM** (the supported minimum) — here it *is* routine. ~18GB pinned plus a transient 23GB text-encoder subprocess doesn't leave room to keep models resident between runs.
+* **You want the GPU and RAM back for something else** — a game, another ML job — without closing the control panel.
+* **Something went wrong** and you'd rather start the next attempt from a clean pipeline than debug a half-torn-down one.
+
+The cost is one slow run afterwards: the next generation re-reads ~18GB from disk. The log line tells you how much it actually freed.
 
 System RAM is no longer the limiting factor **on a 128GB machine** (peak usage is roughly 45GB — the resident 18GB transformer plus a transient text-encoder subprocess), so a large swap file there is optional insurance rather than a hard requirement. On a 32GB machine it's the opposite: that same 45GB peak won't fit in RAM alone, so a swap file (16GB+) is required, not optional, and you should still expect to stay off the higher resolution/frame settings — see the warning above.
 
@@ -89,7 +195,11 @@ System RAM is no longer the limiting factor **on a 128GB machine** (peak usage i
 
 * AMD GPU with ROCm support (developed/tested on RX 9070 XT, gfx1201)
 * **System RAM: 32GB minimum.** This is a hard floor, not a comfortable one — see the RAM warning under Recommended Settings above. At 32GB, keep to the lower end of resolution/frame settings and expect to rely on swap; the higher-end presets (large 2-stage output, longer clips) were tuned for and tested on 128GB and are not safe to attempt at 32GB.
-* Pre-quantized FP8 weights in `./local_ltx25_fp8` (run `quant_transformer_fp8.py` once if you don't have these)
+* Pre-quantized FP8 weights in `./local_ltx25_fp8` — built once by `quant_transformer_fp8.py`, see [First-time setup](#first-time-setup)
 * The base LTX-2.5 model directory (`./local_ltx25_model`) for the latent upsampler config used by the 2-stage upscale path
+* *(Optional, for the prompt enhancer)* `google/gemma-4-E2B-it` in `./local_ltx25_enhancer` — ungated, Apache-2.0, ~10GB, no HF token needed. The LTX-2.5 checkpoints ship `prompt_enhancer` and `processor` as nulls, so this is a separate download:
+  ```bash
+  hf download google/gemma-4-E2B-it --local-dir local_ltx25_enhancer
+  ```
 ### PLEASE FEEL FREE TO CONTRIBUTE TO MY "Buy Euan an RTX 5090 Fund" ;-)
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/S6I125FYNB)

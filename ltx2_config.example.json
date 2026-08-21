@@ -1,0 +1,22 @@
+{
+    "prompt": "A high-quality cinematic shot of a classic sports car driving along a coastal highway at sunset, vibrant orange horizon, clear ocean view.",
+    "negative_prompt": "",
+    "width": 960,
+    "height": 544,
+    "frames": 121,
+    "fps": 24.0,
+    "seed": "42",
+    "upscale": false,
+    "mode": "text2video",
+    "image_path": "",
+    "auto_duration": false,
+    "auto_min_seconds": 2.0,
+    "auto_max_seconds": 5.0,
+    "image_crf": null,
+    "blocks_per_group": 4,
+    "attention_backend": "native",
+    "vae_tile_size": 512,
+    "vae_tile_stride": 448,
+    "vae_tile_frames": 24,
+    "vae_tile_stride_frames": 16
+}

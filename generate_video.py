@@ -1,147 +1,84 @@
 #!/usr/bin/env python3
+"""Tk control panel for LTX-2.5. All generation logic lives in ltx_engine."""
 import os
-import gc
 import sys
-import time
 import json
-import glob
 import random
-import hashlib
 import threading
 import multiprocessing as mp
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 
-# =========================================================================
-# 1. Environment Configuration
-# =========================================================================
-# VRAM is still the binding constraint (16GB), so allocator tuning stays.
-# `expandable_segments` is the modern ROCm/CUDA fix for the fragmentation that
-# `max_split_size_mb` used to paper over; it copes far better with the large,
-# variable-sized tensors that VAE tiling and group-offload produce.
-os.environ.setdefault(
-    "PYTORCH_ALLOC_CONF",
-    "expandable_segments:True,garbage_collection_threshold:0.9",
+import ltx_engine as eng
+# Read-only constants and functions can be bound directly. `cancel_flag` and
+# `debug_flag` deliberately are NOT: the GUI mutates them and the worker reads
+# them, so they must be touched as eng.<name> or the two modules would end up
+# with independent copies.
+from ltx_engine import (
+    AUTO_DURATION_CAP_S,
+    CONFIG_FILE,
+    EMBED_CACHE_DIR,
+    ENHANCER_PATH,
+    MIN_DIMENSION,
+    SPATIAL_COMPRESSION,
+    VRAM_BASE_GB,
+    VRAM_GB_PER_TOKEN,
+    free_resident_models,
+    generation_worker,
+    hw_monitor,
+    run_subprocess_logged,
+    set_diffusers_verbosity,
+    token_warn_threshold,
 )
-os.environ["MIOPEN_LOG_LEVEL"] = "3"
-os.environ["MIOPEN_FIND_MODE"] = "1"
-os.environ["AMD_DIRECT_DISPATCH"] = "1"
-os.environ["HIP_FORCE_DEV_KERN_LAZY_COMPILE"] = "0"
-os.environ["TORCH_ROCM_AOTXN_ENABLE"] = "1"
-os.environ["AMD_SERIALIZE_KERNEL"] = "0"
-os.environ["HIP_VISIBLE_DEVICES"] = "0"
-# 124GB RAM / 16 threads: let the CPU-side maths (text encode, pinning,
-# numpy postprocess, ffmpeg staging) actually use the box.
-os.environ.setdefault("OMP_NUM_THREADS", "16")
-os.environ.setdefault("MKL_NUM_THREADS", "16")
 
-CONFIG_FILE = "ltx2_config.json"
-MODEL_PATH = os.path.abspath("./local_ltx25_fp8")
-# LTX-2.5 model dir: holds the *correct* latent_upsampler config (the standalone
-# ./local_ltx25_upscaler dir is an LTX-1 / 0.9.x upsampler and is NOT compatible).
-BASE_MODEL_PATH = os.path.abspath("./local_ltx25_model")
-UPSCALER_PATH = os.path.abspath("./local_ltx25_upscaler")  # legacy, unused
-EMBED_CACHE_DIR = os.path.abspath("./.embed_cache")
+def tooltip(widget, text, delay=500):
+    """Hover tip. ttk has no tooltip widget, and `idlelib.tooltip.Hovertip`
+    (which would do) isn't dependable -- Debian/Ubuntu ship idlelib in a
+    separate idle-python3.x package that often isn't installed. This is the
+    whole feature in a few lines, so it needs neither."""
+    state = {"win": None, "after": None}
 
-# Auto Duration can predict up to 20s; at these resolutions that is far past
-# what 16GB of VRAM survives. Hard ceiling on what the model is allowed to pick.
-AUTO_DURATION_CAP_S = 6.0
+    def show():
+        state["after"] = None
+        if state["win"] or not widget.winfo_viewable():
+            return
+        win = tk.Toplevel(widget)
+        win.wm_overrideredirect(True)      # no title bar / border
+        win.wm_attributes("-topmost", True)  # else it can hide behind the app
+        tk.Label(win, text=text, justify=tk.LEFT, background="#ffffe0",
+                 foreground="#000000", relief=tk.SOLID, borderwidth=1,
+                 font=("Arial", 9), padx=6, pady=4, wraplength=380).pack()
 
-# --- Process-lifetime caches -------------------------------------------------
-# With 124GB of RAM there is no reason to re-read 18GB of transformer weights
-# (or 23GB of text encoder) from disk on every click of "Generate".
-_MODEL_CACHE = {"pipe": None, "transformer": None, "path": None}
-_UPSAMPLER_CACHE = {"model": None, "path": None}
-_EMBED_MEM_CACHE = {}
+        # Measure before placing: controls in the bottom button row would
+        # otherwise draw their tip below the screen edge and appear "broken".
+        win.update_idletasks()
+        tw, th = win.winfo_reqwidth(), win.winfo_reqheight()
+        x = widget.winfo_rootx() + 12
+        y = widget.winfo_rooty() + widget.winfo_height() + 4
+        if y + th > widget.winfo_screenheight():
+            y = widget.winfo_rooty() - th - 4        # flip above
+        if x + tw > widget.winfo_screenwidth():
+            x = widget.winfo_screenwidth() - tw - 8  # nudge left
+        win.wm_geometry(f"+{max(0, x)}+{max(0, y)}")
+        state["win"] = win
 
-cancel_flag = False
+    def enter(_e=None):
+        state["after"] = widget.after(delay, show)
 
-class CancellationError(Exception):
-    pass
+    def leave(_e=None):
+        if state["after"]:
+            widget.after_cancel(state["after"])
+            state["after"] = None
+        if state["win"]:
+            state["win"].destroy()
+            state["win"] = None
 
-# =========================================================================
-# 2. Hardware Monitoring 
-# =========================================================================
-class LinuxHardwareMonitor:
-    def __init__(self):
-        self.sysfs_gpu_path = None
-        self.last_cpu_total = None
-        self.last_cpu_cores = {}
-        
-        max_vram = 0
-        for i in range(10):
-            path = f"/sys/class/drm/card{i}/device"
-            vram_path = os.path.join(path, "mem_info_vram_total")
-            if os.path.exists(vram_path):
-                try:
-                    with open(vram_path, "r") as f:
-                        vram = int(f.read().strip())
-                    if vram > max_vram:
-                        max_vram = vram
-                        self.sysfs_gpu_path = path
-                except Exception:
-                    pass
-        self.get_cpu_stats()
+    widget.bind("<Enter>", enter, add="+")
+    widget.bind("<Leave>", leave, add="+")
+    # A click shouldn't leave a tip orphaned over the window.
+    widget.bind("<ButtonPress>", leave, add="+")
+    return widget
 
-    def get_cpu_stats(self):
-        try:
-            with open("/proc/stat", "r") as f:
-                lines = f.readlines()
-            core_pcts, avg_pct = [], 0.0
-            for line in lines:
-                parts = line.split()
-                if not parts: continue
-                name = parts[0]
-                if name == "cpu":
-                    times = [float(x) for x in parts[1:8]]
-                    idle, total = times[3] + times[4], sum(times)
-                    if self.last_cpu_total is not None:
-                        diff_idle = idle - self.last_cpu_total[0]
-                        diff_total = total - self.last_cpu_total[1]
-                        if diff_total > 0:
-                            avg_pct = max(0.0, min(100.0, (1.0 - (diff_idle / diff_total)) * 100.0))
-                    self.last_cpu_total = (idle, total)
-                elif name.startswith("cpu") and name[3:].isdigit():
-                    idx = int(name[3:])
-                    times = [float(x) for x in parts[1:8]]
-                    idle, total = times[3] + times[4], sum(times)
-                    pct = 0.0
-                    if idx in self.last_cpu_cores:
-                        diff_idle = idle - self.last_cpu_cores[idx][0]
-                        diff_total = total - self.last_cpu_cores[idx][1]
-                        if diff_total > 0:
-                            pct = max(0.0, min(100.0, (1.0 - (diff_idle / diff_total)) * 100.0))
-                    self.last_cpu_cores[idx] = (idle, total)
-                    core_pcts.append(pct)
-            return avg_pct, core_pcts
-        except Exception:
-            return 0.0, []
-
-    def get_ram_stats(self):
-        try:
-            with open("/proc/meminfo", "r") as f:
-                lines = f.readlines()
-            mem_data = {p.split(":")[0].strip(): int(p.split(":")[1].strip().split()[0]) for p in lines if ":" in p}
-            total_kb = mem_data.get("MemTotal", 0)
-            avail_kb = mem_data.get("MemAvailable", mem_data.get("MemFree", 0))
-            return (total_kb - avail_kb) / (1024**2), total_kb / (1024**2)
-        except Exception:
-            return 0.0, 0.0
-
-    def get_gpu_stats(self):
-        if not self.sysfs_gpu_path: return None, None, None
-        try:
-            with open(os.path.join(self.sysfs_gpu_path, "gpu_busy_percent"), "r") as f:
-                gpu_usage = int(f.read().strip())
-            with open(os.path.join(self.sysfs_gpu_path, "mem_info_vram_used"), "r") as f:
-                vram_used = int(f.read().strip()) / (1024**3)
-            with open(os.path.join(self.sysfs_gpu_path, "mem_info_vram_total"), "r") as f:
-                vram_total = int(f.read().strip()) / (1024**3)
-            return gpu_usage, vram_used, vram_total
-        except Exception:
-            return None, None, None
-
-hw_monitor = LinuxHardwareMonitor()
 
 class TextRedirector:
     def __init__(self, widget):
@@ -149,546 +86,17 @@ class TextRedirector:
     def write(self, text):
         self.widget.after(0, self._write, text)
     def _write(self, text):
+        # Only follow the tail if the view is already at the bottom. Otherwise a
+        # running generation yanks the viewport away mid-selection, which makes
+        # the log impossible to read or copy from while it's still writing.
+        at_bottom = self.widget.yview()[1] >= 0.999
         self.widget.configure(state="normal")
         self.widget.insert(tk.END, text)
-        self.widget.see(tk.END)
+        if at_bottom:
+            self.widget.see(tk.END)
         self.widget.configure(state="disabled")
     def flush(self):
         pass
-
-# =========================================================================
-# 3. Stage 1 Subprocess: Text Encoding 
-# =========================================================================
-def _embed_cache_key(model_path, p, np_text, need_negative):
-    h = hashlib.sha256()
-    for part in (model_path, p, np_text or "", "neg" if need_negative else "noneg"):
-        h.update(part.encode("utf-8"))
-        h.update(b"\x00")
-    return h.hexdigest()
-
-
-def encode_in_subprocess(model_path, p, np_text, need_negative, out_path):
-    import torch
-    import warnings
-    warnings.filterwarnings("ignore", category=FutureWarning)
-    from diffusers import LTX2Pipeline
-    print("  -> Booting Text Encoder in isolated process...")
-    pipe_text = LTX2Pipeline.from_pretrained(
-        model_path,
-        transformer=None, vae=None, audio_vae=None, vocoder=None,
-        torch_dtype=torch.bfloat16, local_files_only=True,
-    )
-    with torch.no_grad():
-        # When CFG is disabled (distilled schedule) the negative branch is never
-        # evaluated, so skip encoding it entirely -- that halves this stage.
-        embeds = pipe_text.encode_prompt(
-            prompt=p,
-            negative_prompt=np_text if need_negative else None,
-            do_classifier_free_guidance=need_negative,
-            device="cpu",
-        )
-    torch.save(embeds, out_path)
-    print("  -> Encoding complete. Terminating process to release RAM.")
-
-# =========================================================================
-# 4. Background Generation Thread
-# =========================================================================
-def _build_latent_upsampler(torch, local_files_only=True):
-    """
-    Load the LTX-2.5 spatial x2 latent upsampler.
-
-    NOTE: ./local_ltx25_upscaler is an *LTX-1 / 0.9.x* upsampler
-    (`LTXLatentUpsamplerModel` + `AutoencoderKLLTXVideo`) and is architecturally
-    incompatible with the LTX-2.5 VAE. The real LTX-2.5 weights live in
-    ./local_ltx25_fp8/latent_upscale_models/*spatial-upscaler*.safetensors and the
-    matching config in ./local_ltx25_model/latent_upsampler/config.json.
-    """
-    import json as _json
-    from safetensors.torch import load_file
-    from diffusers.pipelines.ltx2.latent_upsampler import LTX2LatentUpsamplerModel
-
-    if _UPSAMPLER_CACHE["model"] is not None:
-        return _UPSAMPLER_CACHE["model"]
-
-    model = None
-    # Preferred: a proper diffusers subfolder with weights next to the config.
-    for root_dir in (BASE_MODEL_PATH, MODEL_PATH):
-        sub = os.path.join(root_dir, "latent_upsampler")
-        if glob.glob(os.path.join(sub, "*.safetensors")) or glob.glob(os.path.join(sub, "*.bin")):
-            model = LTX2LatentUpsamplerModel.from_pretrained(
-                root_dir, subfolder="latent_upsampler",
-                torch_dtype=torch.bfloat16, local_files_only=local_files_only,
-            )
-            break
-
-    if model is None:
-        # Fallback: raw checkpoint + standalone config (this is the layout we have).
-        cfg_path = None
-        for root_dir in (BASE_MODEL_PATH, MODEL_PATH):
-            candidate = os.path.join(root_dir, "latent_upsampler", "config.json")
-            if os.path.exists(candidate):
-                cfg_path = candidate
-                break
-
-        weights = []
-        for root_dir in (MODEL_PATH, BASE_MODEL_PATH):
-            weights += sorted(glob.glob(os.path.join(root_dir, "latent_upscale_models", "*spatial*.safetensors")))
-        if not weights:
-            raise FileNotFoundError(
-                "Could not find an LTX-2.5 spatial latent upscaler .safetensors under "
-                f"{MODEL_PATH}/latent_upscale_models or {BASE_MODEL_PATH}/latent_upscale_models."
-            )
-        weight_path = weights[0]
-
-        if cfg_path is not None:
-            cfg = {k: v for k, v in _json.load(open(cfg_path)).items() if not k.startswith("_")}
-        else:
-            # Every LTX-2.5 x2 spatial upscaler ships these dims.
-            cfg = dict(in_channels=128, mid_channels=1024, num_blocks_per_stage=4, dims=3,
-                       spatial_upsample=True, temporal_upsample=False,
-                       rational_spatial_scale=2.0, use_rational_resampler=False)
-
-        model = LTX2LatentUpsamplerModel(**cfg)
-        state = load_file(weight_path)
-        model.load_state_dict(state, strict=True)
-        model = model.to(torch.bfloat16)
-        print(f"  -> Latent upsampler loaded from {os.path.basename(weight_path)}")
-
-    model.eval()
-    _UPSAMPLER_CACHE["model"] = model
-    return model
-
-
-def generation_worker(config, root, progress_var, progress_bar, btn_generate, btn_cancel):
-    global cancel_flag
-
-    pipe = None
-    upscale_pipe = None
-    try:
-        print("\n[*] Initializing PyTorch and ROCm backends...")
-        script_start_time = time.time()
-
-        import warnings
-        import torch
-        import torch.nn.functional as F
-        import diffusers
-        from diffusers import (
-            LTX2Pipeline,
-            LTX2VideoTransformer3DModel,
-            LTX2LatentUpsamplePipeline,
-            LTX2ImageToVideoPipeline,
-        )
-        from diffusers.hooks import apply_group_offloading
-        from diffusers.pipelines.ltx2.utils import (
-            DISTILLED_SIGMA_VALUES,
-            STAGE_2_DISTILLED_SIGMA_VALUES,
-        )
-        from diffusers.utils import encode_video
-
-        warnings.filterwarnings("ignore", category=FutureWarning)
-        diffusers.logging.set_verbosity_error()
-
-        # FP8 Dynamic Patching (weights stay fp8 in RAM *and* on the PCIe wire;
-        # only the active block is upcast to bf16 on-GPU inside the linear).
-        fp8_types = {torch.float8_e4m3fn}
-        if hasattr(torch, "float8_e4m3fnuz"):
-            fp8_types.add(torch.float8_e4m3fnuz)
-
-        def dynamic_fp8_linear_forward(self, input):
-            weight = self.weight
-            if weight.dtype in fp8_types:
-                weight = weight.to(input.dtype)
-            bias = self.bias.to(input.dtype) if self.bias is not None else None
-            return F.linear(input, weight, bias)
-
-        torch.nn.Linear.forward = dynamic_fp8_linear_forward
-
-        def patch_transformer_fp8_params(module, target_dtype=torch.bfloat16):
-            if isinstance(module, torch.nn.Linear):
-                return
-            for _name, param in module.named_parameters(recurse=False):
-                if param.dtype in fp8_types:
-                    param.data = param.data.to(target_dtype)
-            for _child_name, child_module in module.named_children():
-                patch_transformer_fp8_params(child_module, target_dtype)
-
-        try:
-            torch.set_num_threads(16)
-            torch.set_num_interop_threads(16)
-        except RuntimeError:
-            pass
-
-        use_upscale = bool(config.get("upscale"))
-        use_image = config.get("mode") == "image2video"
-
-        input_image = None
-        if use_image:
-            from PIL import Image
-
-            image_path = config.get("image_path", "")
-            if not image_path or not os.path.exists(image_path):
-                raise ValueError(f"Image-to-video mode selected but no valid image path was given: '{image_path}'")
-            input_image = Image.open(image_path).convert("RGB")
-
-        # The distilled LTX-2.5 schedule is guidance-free. Leaving
-        # `audio_guidance_scale` at its 7.0 default silently turns CFG back ON
-        # (`do_classifier_free_guidance` ORs the video and audio scales), which
-        # doubles the transformer batch => ~2x the time and ~2x the activation VRAM.
-        distilled_guidance = dict(
-            guidance_scale=1.0,
-            audio_guidance_scale=1.0,
-            stg_scale=0.0,
-            audio_stg_scale=0.0,
-            modality_scale=1.0,
-            audio_modality_scale=1.0,
-        )
-        need_negative = False  # CFG off => negative branch is never evaluated
-
-        stage1_w, stage1_h = int(config["width"]), int(config["height"])
-        out_w, out_h = (stage1_w * 2, stage1_h * 2) if use_upscale else (stage1_w, stage1_h)
-
-        # Auto Duration: with a `duration_head` present the model predicts clip
-        # length from the prompt when `num_frames` is omitted. Left unbounded it
-        # will happily pick up to 20s, which no 16GB card survives at these
-        # resolutions -- so max_seconds is clamped hard (see AUTO_DURATION_CAP_S).
-        want_auto_duration = bool(config.get("auto_duration"))
-        auto_min_s = float(config.get("auto_min_seconds", 2.0))
-        auto_max_s = min(float(config.get("auto_max_seconds", 5.0)), AUTO_DURATION_CAP_S)
-        auto_min_s = min(auto_min_s, auto_max_s - 0.1)
-
-        total_steps = len(DISTILLED_SIGMA_VALUES) + (len(STAGE_2_DISTILLED_SIGMA_VALUES) if use_upscale else 0)
-        root.after(0, lambda: progress_bar.config(maximum=total_steps))
-        root.after(0, progress_var.set, 0)
-
-        # --- Stage 1: Prompt embeddings (memory -> disk -> subprocess) ---
-        print("\n--- [1/4] Resolving Prompt Embeddings ---")
-        key = _embed_cache_key(MODEL_PATH, config["prompt"], config["negative_prompt"], need_negative)
-        embeds = _EMBED_MEM_CACHE.get(key)
-
-        if embeds is not None:
-            print("  -> Reusing embeddings from RAM cache (text encoder not loaded).")
-        else:
-            os.makedirs(EMBED_CACHE_DIR, exist_ok=True)
-            cache_path = os.path.join(EMBED_CACHE_DIR, key + ".pt")
-            if os.path.exists(cache_path):
-                print("  -> Reusing embeddings from disk cache (text encoder not loaded).")
-                embeds = torch.load(cache_path, weights_only=False)
-            else:
-                p_proc = mp.Process(
-                    target=encode_in_subprocess,
-                    args=(MODEL_PATH, config["prompt"], config["negative_prompt"], need_negative, cache_path),
-                )
-                p_proc.start()
-                while p_proc.is_alive():
-                    p_proc.join(timeout=0.5)
-                    if cancel_flag:
-                        p_proc.terminate()
-                        p_proc.join()
-                        raise CancellationError("Cancelled during text encoding.")
-                if not os.path.exists(cache_path):
-                    raise RuntimeError("Text encoding failed. Check subprocess output.")
-                embeds = torch.load(cache_path, weights_only=False)
-            _EMBED_MEM_CACHE[key] = embeds
-
-        prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask = embeds
-
-        if cancel_flag:
-            raise CancellationError("Cancelled after text encoding.")
-
-        # --- Stage 2: Models (kept resident in RAM across runs) ---
-        onload_device = torch.device("cuda")
-        offload_device = torch.device("cpu")
-
-        if _MODEL_CACHE["pipe"] is not None and _MODEL_CACHE["path"] == MODEL_PATH:
-            pipe = _MODEL_CACHE["pipe"]
-            print("--- [2/4] Reusing resident FP8 pipeline (no disk reload) ---")
-        else:
-            print("--- [2/4] Loading FP8 Transformer & Enabling VRAM Protections ---")
-            transformer = LTX2VideoTransformer3DModel.from_pretrained(
-                MODEL_PATH,
-                subfolder="transformer",
-                torch_dtype=torch.float8_e4m3fn,
-                local_files_only=True,
-            )
-            patch_transformer_fp8_params(transformer, target_dtype=torch.bfloat16)
-
-            if cancel_flag:
-                raise CancellationError("Cancelled during model load.")
-
-            pipe = LTX2Pipeline.from_pretrained(
-                MODEL_PATH,
-                transformer=transformer,
-                text_encoder=None,
-                tokenizer=None,
-                torch_dtype=torch.bfloat16,
-                local_files_only=True,
-            )
-            pipe.set_progress_bar_config(disable=True)
-
-            # "native" = torch SDPA auto-dispatch. On this GPU (gfx1201) the flash,
-            # mem-efficient and math kernels are all available, and auto-dispatch
-            # picks flash/efficient where the mask allows and falls back safely
-            # where it does not. Force "_native_flash" / "_native_efficient" via
-            # config only if you want to experiment -- a forced kernel will hard-fail
-            # on the masked cross-attention calls.
-            if hasattr(pipe.transformer, "set_attention_backend"):
-                backend = config.get("attention_backend", "native")
-                try:
-                    pipe.transformer.set_attention_backend(backend)
-                    print(f"  -> Attention backend: {backend}")
-                except Exception as exc:
-                    print(f"  -> Attention backend '{backend}' unavailable ({exc}); using default.")
-
-            # Group offload: 48 transformer blocks. 2 blocks/group was a *RAM*-era
-            # setting; with 124GB we can pin the whole 18GB checkpoint and use
-            # bigger groups + stream prefetch + record_stream (no per-group sync).
-            offload_kwargs = dict(
-                onload_device=onload_device,
-                offload_device=offload_device,
-                offload_type="block_level",
-                num_blocks_per_group=int(config.get("blocks_per_group", 4)),
-                use_stream=True,
-                record_stream=True,
-                non_blocking=True,
-                low_cpu_mem_usage=False,   # False => pinned (page-locked) host buffers
-            )
-            if hasattr(pipe.transformer, "enable_group_offload"):
-                pipe.transformer.enable_group_offload(**offload_kwargs)
-            else:
-                apply_group_offloading(pipe.transformer, **offload_kwargs)
-
-            # VAE tiling. The old `tile_sample_min_size` / `tile_latent_min_size`
-            # assignments did nothing at all -- AutoencoderKLLTX2Video has no such
-            # attributes, so tiling silently ran at its 512/448 defaults. These are
-            # the real knobs, plus framewise (temporal) decoding, which is what
-            # actually bounds VRAM on long clips.
-            if hasattr(pipe.vae, "enable_slicing"):
-                pipe.vae.enable_slicing()
-            if hasattr(pipe.vae, "enable_tiling"):
-                pipe.vae.enable_tiling(
-                    tile_sample_min_height=512,
-                    tile_sample_min_width=512,
-                    tile_sample_min_num_frames=24,
-                    tile_sample_stride_height=448,
-                    tile_sample_stride_width=448,
-                    tile_sample_stride_num_frames=16,
-                )
-            # Temporal tiling of the decoder; composes with the spatial tiling above.
-            pipe.vae.use_framewise_decoding = True
-            pipe.vae.use_framewise_encoding = True
-
-            # The decoders are small (VAE 1.4GB + audio VAE 0.1GB + vocoder 0.25GB)
-            # and `_execution_device` is cuda because of the transformer's offload
-            # hooks, so they MUST be on the GPU before pipe() runs -- the old code
-            # moved them *after* the call, i.e. never in time for the decode.
-            pipe.vae.to(onload_device)
-            if getattr(pipe, "audio_vae", None) is not None:
-                pipe.audio_vae.to(onload_device)
-            if getattr(pipe, "vocoder", None) is not None:
-                pipe.vocoder.to(onload_device)
-
-            _MODEL_CACHE.update({"pipe": pipe, "transformer": transformer, "path": MODEL_PATH})
-
-        if cancel_flag:
-            raise CancellationError("Cancelled before generation.")
-
-        # --- Stage 3: Generation ---
-        generation_start_time = time.time()
-        # duration_head is what makes Auto Duration possible; fall back to the
-        # explicit frame count if this checkpoint doesn't ship one.
-        use_auto_duration = want_auto_duration and getattr(pipe, "duration_head", None) is not None
-        if want_auto_duration and not use_auto_duration:
-            print("  -> Auto Duration requested but this checkpoint has no duration_head; using frame count.")
-        if use_auto_duration:
-            length_call = dict(min_seconds=auto_min_s, max_seconds=auto_max_s)
-            print(f"  -> Auto Duration: model picks length within {auto_min_s:.1f}-{auto_max_s:.1f}s.")
-        else:
-            length_call = dict(num_frames=config["frames"])
-
-        mode_label = "Image-to-Video" if use_image else "Text-to-Video"
-        len_label = "auto length" if use_auto_duration else f"{config['frames']} frames"
-        print(f"--- [3/4] Generating Base Video, {mode_label} ({stage1_w}x{stage1_h}, {len_label}) ---")
-
-        steps_done = [0]
-
-        def step_callback(pipe_instance, step_index, timestep, callback_kwargs):
-            if cancel_flag:
-                raise CancellationError("Cancelled by user during diffusion process.")
-            steps_done[0] += 1
-            done = steps_done[0]
-            elapsed = time.time() - generation_start_time
-            print(f"  --> Completed Step {done}/{total_steps} ({elapsed:.1f}s elapsed)")
-            root.after(0, progress_var.set, done)
-            return callback_kwargs
-
-        shared_call = dict(
-            prompt_embeds=prompt_embeds,
-            prompt_attention_mask=prompt_attention_mask,
-            negative_prompt_embeds=negative_prompt_embeds,
-            negative_prompt_attention_mask=negative_prompt_attention_mask,
-            frame_rate=config["fps"],
-            callback_on_step_end=step_callback,
-            return_dict=False,
-            **distilled_guidance,
-        )
-
-        # One generator threaded through both stages so stage 2 continues the
-        # noise stream (this is what the LTX-2.5 reference two-stage recipe does).
-        generator = torch.Generator("cuda").manual_seed(config["active_seed"])
-
-        with torch.inference_mode():
-            if use_image:
-                # Shares the already-loaded/onloaded transformer, VAE, text
-                # encoder etc with `pipe` -- this just wraps the same resident
-                # component instances in the image-conditioned __call__, no
-                # extra weights are loaded or moved.
-                i2v_pipe = LTX2ImageToVideoPipeline(**pipe.components)
-                # image_crf: LTX-2.5 re-compresses the conditioning image to CRF
-                # 18 by default to match training. 0 skips it and keeps the
-                # source detail; None uses the model default.
-                crf = config.get("image_crf", None)
-                stage1 = i2v_pipe(
-                    image=input_image,
-                    width=stage1_w,
-                    height=stage1_h,
-                    sigmas=DISTILLED_SIGMA_VALUES,
-                    generator=generator,
-                    output_type="latent" if use_upscale else "np",
-                    **({} if crf is None else {"image_crf": int(crf)}),
-                    **length_call,
-                    **shared_call,
-                )
-            else:
-                stage1 = pipe(
-                    width=stage1_w,
-                    height=stage1_h,
-                    sigmas=DISTILLED_SIGMA_VALUES,
-                    generator=generator,
-                    output_type="latent" if use_upscale else "np",
-                    **length_call,
-                    **shared_call,
-                )
-
-            if cancel_flag:
-                raise CancellationError("Cancelled before video export.")
-
-            if use_upscale:
-                # --- Stage 4: 2x latent upsample + short refinement tail ---
-                # stage1[0] = denormalised video latents [B, C, F, H, W]
-                # stage1[1] = *audio latents* (NOT a waveform) -- the old code fed
-                #             these straight to the muxer, which is why "upscale"
-                #             produced broken output.
-                stage1_latents, audio_latents = stage1[0], stage1[1]
-
-                # Under Auto Duration the realized length is whatever the model
-                # picked, not config["frames"], so read it back off the latents
-                # (VAE temporal compression is 8: frames = (F - 1) * 8 + 1).
-                if stage1_latents.ndim == 5:
-                    realized_frames = (stage1_latents.shape[2] - 1) * 8 + 1
-                else:
-                    realized_frames = config["frames"]
-
-                print(f"--- [4/4] Latent upsample -> {out_w}x{out_h}, then {len(STAGE_2_DISTILLED_SIGMA_VALUES)}-sigma refinement ---")
-                # Group-offload uses non_blocking transfers on a separate stream, so
-                # stage 1's last block-eviction copies may still be in flight when
-                # we start allocating for the upsampler below. Sync first so we're
-                # not racing that transfer for VRAM.
-                torch.cuda.synchronize()
-                latent_upsampler = _build_latent_upsampler(torch).to(onload_device)
-                upscale_pipe = LTX2LatentUpsamplePipeline(vae=pipe.vae, latent_upsampler=latent_upsampler)
-
-                upsampled_latents = upscale_pipe(
-                    latents=stage1_latents,
-                    output_type="latent",
-                    return_dict=False,
-                )[0]
-
-                # Free the upsampler's ~1GB before the (larger) stage-2 denoise.
-                latent_upsampler.to(offload_device)
-                torch.cuda.empty_cache()
-
-                if cancel_flag:
-                    raise CancellationError("Cancelled before refinement pass.")
-
-                # Stage 2 infers its resolution from the 5D latents, so no height/width.
-                output = pipe(
-                    num_frames=realized_frames,
-                    sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
-                    latents=upsampled_latents,
-                    audio_latents=audio_latents,
-                    noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0],
-                    generator=generator,
-                    output_type="np",
-                    **shared_call,
-                )
-            else:
-                print("--- [4/4] Skipping Upscaler (Native Resolution selected) ---")
-                output = stage1
-
-        video = output[0]
-        audio = output[1] if len(output) > 1 else None
-
-        print("  --> Exporting final video...")
-        mode_tag = "i2v_" if use_image else ""
-        # Report what was actually produced -- under Auto Duration this is the
-        # model's chosen length, not config["frames"].
-        final_frames = len(video[0])
-        if use_auto_duration:
-            print(f"  --> Auto Duration produced {final_frames} frames ({final_frames / float(config['fps']):.2f}s).")
-        output_file = f"output_{mode_tag}{out_w}x{out_h}_{final_frames}f_seed{config['active_seed']}.mp4"
-        sample_rate = 24000
-        if getattr(pipe, "vocoder", None) is not None:
-            sample_rate = getattr(pipe.vocoder.config, "output_sampling_rate", 24000)
-
-        encode_video(
-            video[0],  # first video in the batch
-            audio=audio[0].float().cpu() if audio is not None else None,
-            audio_sample_rate=sample_rate,
-            output_path=output_file,
-            fps=int(config["fps"]),
-        )
-
-        print(f"\nSUCCESS! Video saved as: {output_file}")
-        total_elapsed = time.time() - script_start_time
-        gen_elapsed = time.time() - generation_start_time
-        print(f"Generation pass time: {gen_elapsed:.1f}s ({gen_elapsed/60:.2f}m)")
-        print(f"Total time to completion: {total_elapsed:.1f}s ({total_elapsed/60:.2f}m)")
-
-    except CancellationError as e:
-        print(f"\n[!] {str(e)}")
-        print("[!] Memory is being cleared. Ready for new input.")
-    except Exception as e:
-        print(f"\n[!] AN ERROR OCCURRED:\n{str(e)}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        # NOTE: `pipe` / the upsampler are deliberately NOT deleted -- they live in
-        # _MODEL_CACHE so the next run skips ~18GB of disk reads. Use the
-        # "Free Models" button to drop them.
-        try:
-            del upscale_pipe
-        except Exception:
-            pass
-
-        import torch
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        root.after(0, btn_generate.config, {"state": "normal"})
-        root.after(0, btn_cancel.config, {"state": "disabled"})
-        print("-" * 60)
-
-
-def free_resident_models():
-    """Drop the cached pipeline/upsampler and hand the RAM+VRAM back."""
-    import torch
-    _MODEL_CACHE.update({"pipe": None, "transformer": None, "path": None})
-    _UPSAMPLER_CACHE.update({"model": None, "path": None})
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    print("[*] Resident models released.")
 
 # =========================================================================
 # 5. Main Application / GUI
@@ -710,6 +118,11 @@ def main():
             # Auto Duration: let the model pick clip length from the prompt.
             # Capped at AUTO_DURATION_CAP_S regardless of what's set here.
             "auto_duration": False,
+            # CFG quality mode: much better prompt adherence, ~7-8x the compute
+            # and ~2x activation VRAM. See the warning on the GUI checkbox.
+            "cfg_mode": False,
+            "cfg_steps": 30,
+            "cfg_scale": 3.0,
             "auto_min_seconds": 2.0,
             "auto_max_seconds": 5.0,
             # Conditioning-image compression for image-to-video. null = model
@@ -736,12 +149,27 @@ def main():
     
     root = tk.Tk()
     root.title("🎬 LTX-2.5 Control Panel")
-    root.geometry("740x980")
-    root.resizable(False, False)
+    # Opening size: 1080 tall pays for the 7-row prompt box (Arial-10 is 16px
+    # per row). Resizable both ways; spare height goes to the log pane, the only
+    # widget packed with expand=True, and spare width to everything on fill=X.
+    # minsize is set once the layout has been measured, further down -- below it
+    # the bottom button row starts clipping.
+    WIN_W, WIN_H = 740, 1080
+    root.geometry(f"{WIN_W}x{WIN_H}")
+    root.resizable(True, True)
     
     style = ttk.Style(root)
     style.theme_use('clam')
-    
+
+    # messagebox/showerror dialogs are Tk's own (tk::MessageBox) on X11, and
+    # take their font from the option database rather than any per-call
+    # argument. Default is a large serif face, which makes the multi-paragraph
+    # token/CFG warnings enormous. wrapLength has to grow as the font shrinks,
+    # or the dialog just gets tall and narrow instead.
+    root.option_add("*Dialog.msg.font", "Arial 9")
+    root.option_add("*Dialog.msg.wrapLength", "560")
+
+
     # Telemetry Panel
     telemetry_frame = tk.Frame(root, bg="#111111", pady=8, padx=12)
     telemetry_frame.pack(fill=tk.X)
@@ -764,16 +192,26 @@ def main():
     cores_box = tk.Frame(telemetry_frame, bg="#222222", padx=6, pady=5, relief=tk.SUNKEN, bd=1)
     cores_box.pack(fill=tk.X, pady=(6, 0))
     
+    # One label per core so each can be coloured independently. Built lazily on
+    # the first sample, because the core count comes from /proc/stat, not us.
     lbl_cores_text = tk.Label(
-        cores_box, 
-        text="Reading CPU Core states...", 
-        bg="#222222", 
-        fg="#00ff88", 
-        font=("Consolas", 8, "bold"), 
+        cores_box,
+        text="Reading CPU Core states...",
+        bg="#222222",
+        fg="#00ff88",
+        font=("Consolas", 8, "bold"),
         justify=tk.LEFT,
         anchor=tk.W
     )
     lbl_cores_text.pack(fill=tk.X)
+    core_labels = []
+
+    def core_colour(pct):
+        if pct >= 75:
+            return "#ff4444"   # red    - saturated
+        if pct >= 50:
+            return "#ffaa00"   # orange - working hard
+        return "#00ff88"       # green  - idle/light
 
     def update_telemetry():
         cpu_avg, cores = hw_monitor.get_cpu_stats()
@@ -791,12 +229,17 @@ def main():
             lbl_vram.config(text=f"VRAM: {vram_used:.1f}/{vram_total:.1f} GB")
             
         if cores:
-            row_chunks = []
-            for i in range(0, len(cores), 8):
-                chunk = cores[i:i + 8]
-                row_str = "   ".join([f"C{i + idx:02d}:{int(p):2d}%" for idx, p in enumerate(chunk)])
-                row_chunks.append(row_str)
-            lbl_cores_text.config(text="\n".join(row_chunks))
+            if not core_labels:
+                # pack() and grid() can't share a parent, so the placeholder goes
+                # before the grid of per-core labels is built.
+                lbl_cores_text.destroy()
+                for i in range(len(cores)):
+                    lab = tk.Label(cores_box, bg="#222222", font=("Consolas", 8, "bold"),
+                                   width=8, anchor=tk.W)
+                    lab.grid(row=i // 8, column=i % 8, sticky=tk.W, padx=(0, 4))
+                    core_labels.append(lab)
+            for i, pct in enumerate(cores):
+                core_labels[i].config(text=f"C{i:02d}:{int(pct):2d}%", fg=core_colour(pct))
             
         root.after(500, update_telemetry)
 
@@ -843,20 +286,96 @@ def main():
     mode_var.trace_add("write", on_mode_switch)
     on_mode_switch()
 
-    ttk.Label(main_frame, text="Positive Prompt:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
-    text_prompt = tk.Text(main_frame, height=3, wrap=tk.WORD, font=("Arial", 10))
-    text_prompt.pack(fill=tk.X, pady=(0, 12))
+    pp_header = ttk.Frame(main_frame)
+    pp_header.pack(fill=tk.X)
+    ttk.Label(pp_header, text="Positive Prompt:", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
+
+    # 7 rows: an enhanced prompt is ~850 chars, which is about 8 lines at this width.
+    text_prompt = tk.Text(main_frame, height=7, wrap=tk.WORD, font=("Arial", 10))
+
+    btn_clear_pp = ttk.Button(pp_header, text="✕ Clear",
+                              command=lambda: text_prompt.delete("1.0", tk.END))
+    btn_clear_pp.pack(side=tk.RIGHT)
+    tooltip(btn_clear_pp, "Empty the positive prompt box.")
+
+    text_prompt.pack(fill=tk.X, pady=(4, 12))
     text_prompt.insert(tk.END, config['prompt'])
-    
+
+    enhance_row = ttk.Frame(main_frame)
+    enhance_row.pack(fill=tk.X, pady=(0, 12))
+
+    ttk.Label(
+        enhance_row,
+        text="Rewrite the prompt in LTX-2.5's trained caption style:",
+        foreground="#666666",
+    ).pack(side=tk.LEFT)
+
+    def enhance_now():
+        """Rewrite the prompt box in place so it can be reviewed/edited before
+        generating. Runs in the same throwaway subprocess the generate path uses."""
+        p = text_prompt.get("1.0", tk.END).strip()
+        if not p:
+            messagebox.showerror("Error", "Positive prompt cannot be empty.")
+            return
+        if not os.path.isdir(ENHANCER_PATH):
+            messagebox.showerror("Error", f"Prompt enhancer not found at {ENHANCER_PATH}.")
+            return
+        img = image_path_var.get().strip() if mode_var.get() == "image2video" else ""
+
+        btn_enhance.config(state="disabled", text="✨ Enhancing...")
+
+        def work():
+            out_path = os.path.join(EMBED_CACHE_DIR, "enhanced_prompt.txt")
+            try:
+                os.makedirs(EMBED_CACHE_DIR, exist_ok=True)
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+                print("\n--- Enhancing prompt ---")
+                run_subprocess_logged("enhance_in_subprocess", (p, img, out_path))
+                if not os.path.exists(out_path):
+                    raise RuntimeError("Enhancement failed -- see the output above.")
+                with open(out_path) as f:
+                    enhanced = f.read().strip()
+                # Printed here, in the parent, so it reaches the GUI log. The
+                # child's stdout is forwarded too, but the prompt is the one
+                # thing worth showing verbatim next to the box it lands in.
+                print(f"  -> Enhanced prompt ({len(enhanced)} chars):\n{enhanced}\n")
+            except Exception as exc:
+                msg = str(exc)   # exc is unbound once this block exits
+                root.after(0, lambda m=msg: messagebox.showerror("Enhance failed", m))
+                enhanced = None
+
+            def done():
+                if enhanced:
+                    text_prompt.delete("1.0", tk.END)
+                    text_prompt.insert(tk.END, enhanced)
+                btn_enhance.config(state="normal", text="✨ Enhance Now")
+            root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    btn_enhance = ttk.Button(enhance_row, text="✨ Enhance Now", command=enhance_now)
+    btn_enhance.pack(side=tk.RIGHT)
+    tooltip(btn_enhance,
+            "Rewrite the prompt above into the long, detailed caption style\n"
+            "LTX-2.5 was trained on, using Gemma-4.\n\n"
+            "The result replaces the box so you can read and edit it before\n"
+            "generating. Takes ~1 min; runs in a throwaway subprocess, so it\n"
+            "costs no VRAM during the actual render.")
+
+
     np_header = ttk.Frame(main_frame)
     np_header.pack(fill=tk.X)
+    # Whether this box does anything depends on CFG quality mode, so the label
+    # tracks it rather than asserting one state. Updated by update_np_label().
+    np_label_var = tk.StringVar()
     ttk.Label(
         np_header,
-        text="Negative Prompt (unused: distilled schedule runs guidance-free):",
+        textvariable=np_label_var,
         font=("Arial", 10, "bold"),
     ).pack(side=tk.LEFT)
     
-    text_np = tk.Text(main_frame, height=3, wrap=tk.WORD, font=("Arial", 10))
+    text_np = tk.Text(main_frame, height=5, wrap=tk.WORD, font=("Arial", 10))
     
     def reset_np():
         text_np.delete("1.0", tk.END)
@@ -870,7 +389,18 @@ def main():
         text_np.delete("1.0", tk.END)
         text_np.insert(tk.END, real_default)
         
-    ttk.Button(np_header, text="↺ Reset Default", command=reset_np).pack(side=tk.RIGHT)
+    btn_reset_np = ttk.Button(np_header, text="↺ Reset Default", command=reset_np)
+    btn_reset_np.pack(side=tk.RIGHT)
+    tooltip(btn_reset_np, "Load the stock LTX-2.5 negative prompt into the box.\n\n"
+                          "Only has an effect with CFG quality mode on -- the\n"
+                          "distilled schedule is guidance-free and never evaluates\n"
+                          "the negative branch.")
+
+    btn_clear_np = ttk.Button(np_header, text="✕ Clear",
+                              command=lambda: text_np.delete("1.0", tk.END))
+    btn_clear_np.pack(side=tk.RIGHT, padx=(0, 4))
+    tooltip(btn_clear_np, "Empty the negative prompt box.")
+
     text_np.pack(fill=tk.X, pady=(4, 12))
     text_np.insert(tk.END, config.get('negative_prompt', ""))
         
@@ -881,15 +411,28 @@ def main():
     res_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
     
     res_var = tk.StringVar(value=f"{config['width']}x{config['height']}")
-    res_combo = ttk.Combobox(res_frame, textvariable=res_var, state="readonly", width=18)
+    res_combo = ttk.Combobox(res_frame, textvariable=res_var, state="readonly", width=26)
+    # Portrait entries are the landscape ones transposed. Attention cost is
+    # latent_frames * (H/32) * (W/32), which is symmetric, so a portrait preset
+    # costs exactly the same VRAM as its landscape twin -- the token warning and
+    # the README's frame-count guidance carry over unchanged.
     res_combo['values'] = (
-        "1280x704 (High)",
-        "1024x576 (Medium)",
-        "960x544 (2-stage base)",
-        "768x512 (Low)",
+        "1280x704 (Landscape, High)",
+        "1024x576 (Landscape, Medium)",
+        "960x544 (Landscape, 2x = 1920x1088)",
+        "768x512 (Landscape, Low)",
+        "704x1280 (Portrait, High)",
+        "576x1024 (Portrait, Medium)",
+        "544x960 (Portrait, 2x = 1088x1920)",
+        "512x768 (Portrait, Low)",
         "Custom",
     )
     res_combo.pack(pady=(0, 4))
+    tooltip(res_combo,
+            "Portrait presets are the landscape ones transposed, so they cost\n"
+            "identical VRAM -- attention scales with (H/32)x(W/32), which is\n"
+            "symmetric. Frame-count limits apply the same either way.\n\n"
+            "Custom lets you type any size; both must be multiples of 32.")
     
     custom_frame = ttk.Frame(res_frame)
     custom_frame.pack()
@@ -904,12 +447,92 @@ def main():
 
     # The Restored Upscaler Checkbox
     upscale_var = tk.BooleanVar(value=config.get('upscale', False))
-    ttk.Checkbutton(
+    chk_upscale = ttk.Checkbutton(
         res_frame,
-        text="2-stage: 2x latent upscale + refine\n(output = 2x the size above)",
+        text="2-stage: 2x latent upscale + refine",
         variable=upscale_var,
-    ).pack(pady=(5, 0))
-    
+        command=lambda: update_output_label(),
+    )
+    chk_upscale.pack(pady=(5, 0))
+
+    # The dropdown lists *base* resolutions; whether a run is 1- or 2-stage is
+    # decided by the checkbox above, not by the preset. Spell out the actual
+    # output so the two can't be confused.
+    lbl_output = ttk.Label(res_frame, foreground="#0a7", font=("Arial", 9, "bold"))
+    lbl_output.pack(pady=(2, 0))
+
+    def update_output_label(*_a):
+        try:
+            w = max(MIN_DIMENSION, round(int(entry_w.get()) / SPATIAL_COMPRESSION) * SPATIAL_COMPRESSION)
+            h = max(MIN_DIMENSION, round(int(entry_h.get()) / SPATIAL_COMPRESSION) * SPATIAL_COMPRESSION)
+        except ValueError:
+            lbl_output.config(text="Output: —")
+            return
+        if upscale_var.get():
+            lbl_output.config(text=f"Output: {w*2}x{h*2}  (2-stage from {w}x{h})")
+        else:
+            lbl_output.config(text=f"Output: {w}x{h}  (single-stage)")
+
+    tooltip(chk_upscale,
+            "Generate at the resolution above, then 2x latent upsample and\n"
+            "run a short refinement pass -- faster than rendering at full\n"
+            "size directly.\n\nCosts VRAM: stage 2 runs 4x the latent tokens.\n"
+            "A measured 145-frame 2-stage run reserved 12.04GB, so watch the\n"
+            "token warning before pushing resolution or length.")
+
+    # --- CFG quality mode ---
+    cfg_var = tk.BooleanVar(value=config.get("cfg_mode", False))
+
+    def update_np_label():
+        """The negative prompt is only encoded when CFG mode is on; say which."""
+        if cfg_var.get():
+            np_label_var.set("Negative Prompt (ACTIVE: CFG quality mode is on):")
+        else:
+            np_label_var.set("Negative Prompt (unused: distilled schedule runs guidance-free):")
+
+    def on_cfg_toggle():
+        if not cfg_var.get():
+            update_np_label()
+            return
+        est_steps = int(config.get("cfg_steps", 30))
+        if not messagebox.askokcancel(
+            "CFG quality mode",
+            "Classifier-free guidance improves how closely the video follows "
+            "your prompt -- especially secondary details the distilled schedule "
+            "tends to drop.\n\n"
+            "IT IS MUCH SLOWER AND USES MUCH MORE VRAM:\n\n"
+            f"  • {est_steps} steps instead of 8, and each step runs the\n"
+            "    transformer TWICE (prompt + negative). Roughly 7-8x the\n"
+            "    compute of a normal run.\n"
+            "  • Activation VRAM roughly doubles. On a 16GB card this is\n"
+            "    realistically single-stage only -- combining it with 2-stage\n"
+            "    upscaling at any real length is likely to run out of memory.\n"
+            "  • Your negative prompt becomes live (it is ignored otherwise).\n\n"
+            "Recommended: leave 2-stage upscale OFF, start at a modest "
+            "resolution and frame count, and increase only once you know how "
+            "your GPU copes.\n\nEnable it?",
+        ):
+            cfg_var.set(False)
+        update_np_label()
+
+    chk_cfg = ttk.Checkbutton(
+        res_frame,
+        text="CFG quality mode (slow, VRAM-hungry)",
+        variable=cfg_var,
+        command=on_cfg_toggle,
+    )
+    chk_cfg.pack(pady=(5, 0))
+    update_np_label()   # reflect the restored cfg_mode setting at startup
+    tooltip(chk_cfg,
+            "Runs the transformer twice per step and pushes away from the\n"
+            "negative prompt -- the standard way to force prompt adherence.\n\n"
+            "~7-8x the compute (30 steps vs 8, doubled per step) and roughly\n"
+            "double the activation VRAM. Applied to stage 1 only; the stage-2\n"
+            "refinement stays guidance-free to limit the cost.\n\n"
+            "Intended for a bigger card. On 16GB, single-stage only.\n"
+            "Steps and strength: cfg_steps / cfg_scale in ltx2_config.json.")
+
+
     def on_res_select(event):
         val = res_combo.get()
         entry_w.config(state="normal"); entry_h.config(state="normal")
@@ -918,8 +541,12 @@ def main():
             entry_w.delete(0, tk.END); entry_w.insert(0, w)
             entry_h.delete(0, tk.END); entry_h.insert(0, h)
             entry_w.config(state="disabled"); entry_h.config(state="disabled")
-            
+        update_output_label()
+
     res_combo.bind("<<ComboboxSelected>>", on_res_select)
+    # Custom W/H are typed, so follow keystrokes too.
+    entry_w.bind("<KeyRelease>", update_output_label, add="+")
+    entry_h.bind("<KeyRelease>", update_output_label, add="+")
     if f"{config['width']}x{config['height']}" not in [v.split(" ")[0] for v in res_combo['values'][:-1]]:
         res_combo.set("Custom")
     on_res_select(None)
@@ -1008,15 +635,49 @@ def main():
     ttk.Label(seed_frame, text="Seed ('r' for Random):", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
     entry_seed = ttk.Entry(seed_frame, width=15)
     entry_seed.pack(side=tk.LEFT, padx=10)
+    tooltip(entry_seed,
+            "A number for a reproducible render, or 'r' for a random one.\n"
+            "The seed used is written into the output filename.")
     entry_seed.insert(0, str(config['seed']))
 
     progress_var = tk.IntVar(value=0)
     progress_bar = ttk.Progressbar(main_frame, variable=progress_var, maximum=8, mode='determinate')
     progress_bar.pack(fill=tk.X, pady=(0, 8))
     
-    log_text = scrolledtext.ScrolledText(main_frame, height=10, state="disabled", bg="#1e1e1e", fg="#00ff00", font=("Consolas", 9))
+    # `state="disabled"` keeps the log read-only, but it also stops the widget
+    # taking focus -- so Ctrl+C never reaches it. takefocus + a click-to-focus
+    # binding restore copying without making the log editable.
+    log_text = scrolledtext.ScrolledText(main_frame, height=10, state="disabled", bg="#1e1e1e",
+                                         fg="#00ff00", font=("Consolas", 9), takefocus=True)
     log_text.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
-    
+
+    def copy_log(_event=None):
+        try:
+            sel = log_text.get(tk.SEL_FIRST, tk.SEL_LAST)
+        except tk.TclError:
+            sel = log_text.get("1.0", tk.END)   # nothing selected -> copy it all
+        sel = sel.strip()
+        if sel:
+            root.clipboard_clear()
+            root.clipboard_append(sel)
+        return "break"
+
+    def select_all_log(_event=None):
+        log_text.tag_add(tk.SEL, "1.0", tk.END)
+        return "break"
+
+    log_text.bind("<Button-1>", lambda e: log_text.focus_set())
+    log_text.bind("<Control-c>", copy_log)
+    log_text.bind("<Control-C>", copy_log)
+    log_text.bind("<Control-a>", select_all_log)
+    log_text.bind("<Control-A>", select_all_log)
+
+    log_menu = tk.Menu(log_text, tearoff=0)
+    log_menu.add_command(label="Copy  (Ctrl+C)", command=copy_log)
+    log_menu.add_command(label="Select All  (Ctrl+A)", command=select_all_log)
+    log_text.bind("<Button-3>", lambda e: log_menu.tk_popup(e.x_root, e.y_root))
+
+
     sys.stdout = TextRedirector(log_text)
     sys.stderr = TextRedirector(log_text)
 
@@ -1024,8 +685,7 @@ def main():
     btn_frame.pack(fill=tk.X)
     
     def start_generation():
-        global cancel_flag
-        cancel_flag = False 
+        eng.cancel_flag = False 
         
         try:
             p = text_prompt.get("1.0", tk.END).strip()
@@ -1039,20 +699,34 @@ def main():
                     messagebox.showerror("Error", "Image-to-Video mode needs a valid image. Click 'Choose Image...'.")
                     return
 
+            # Store exactly what's in the box, empty included. Substituting the
+            # library default here used to get saved straight back to the config,
+            # so clearing the box never stuck -- it refilled on the next launch.
+            # Nothing is lost: the distilled schedule is guidance-free, so the
+            # negative branch is never evaluated. Use "Reset Default" to load
+            # the stock text if you ever want to see or edit it.
             np_val = text_np.get("1.0", tk.END).strip()
-            if not np_val:
-                try:
-                    from diffusers.pipelines.ltx2.utils import DEFAULT_NEGATIVE_PROMPT
-                    np_val = DEFAULT_NEGATIVE_PROMPT
-                except ImportError:
-                    np_val = "worst quality, inconsistent, deformed, blurry, watermark"
-                    
-            w_adj = max(256, round(int(entry_w.get()) / 32) * 32)
-            h_adj = max(256, round(int(entry_h.get()) / 32) * 32)
+
+            # The VAE compresses 32:1 spatially, so width/height must be
+            # multiples of 32; anything else is snapped. Say so rather than
+            # silently rewriting what was typed -- "I asked for 810 and got
+            # 800" is otherwise invisible until you inspect the output file.
+            w_raw, h_raw = int(entry_w.get()), int(entry_h.get())
+            w_adj = max(MIN_DIMENSION, round(w_raw / SPATIAL_COMPRESSION) * SPATIAL_COMPRESSION)
+            h_adj = max(MIN_DIMENSION, round(h_raw / SPATIAL_COMPRESSION) * SPATIAL_COMPRESSION)
+            if (w_adj, h_adj) != (w_raw, h_raw):
+                print(f"  [!] Resolution {w_raw}x{h_raw} -> {w_adj}x{h_adj} "
+                      f"(must be multiples of {SPATIAL_COMPRESSION}, min {MIN_DIMENSION}).")
+                entry_w.delete(0, tk.END); entry_w.insert(0, str(w_adj))
+                entry_h.delete(0, tk.END); entry_h.insert(0, str(h_adj))
+
             fps = float(entry_fps.get())
             val = float(entry_len.get())
             target_frames = int(val * fps) if length_type.get() == "seconds" else int(val)
+            # Same idea temporally: the VAE is 8:1, hence the 8k+1 frame rule.
             aligned_frames = (max(1, round((target_frames - 1) / 8)) * 8) + 1
+            if aligned_frames != target_frames:
+                print(f"  [!] Frames {target_frames} -> {aligned_frames} (8k+1 rule).")
             
             s_val = entry_seed.get().strip().lower()
             active_seed = random.randint(0, 2**32 - 1) if s_val == 'r' else int(s_val)
@@ -1062,23 +736,35 @@ def main():
             except ValueError:
                 auto_max_val = AUTO_DURATION_CAP_S
 
-            # VRAM sanity check. The transformer sequence length is
-            # latent_frames * (H/32) * (W/32); attention cost is quadratic in it.
-            # ~50k tokens is about where 16GB of VRAM stops being comfortable.
-            # Under Auto Duration the model picks the length, so size the check
-            # against the worst case it's allowed to choose.
+            # VRAM sanity check. Transformer sequence length is
+            # latent_frames * (H/32) * (W/32), and the threshold now scales with
+            # whatever card is present -- see token_warn_threshold().
             scale = 2 if upscale_var.get() else 1
             check_frames = int(auto_max_val * fps) if auto_dur_var.get() else aligned_frames
             latent_frames = (check_frames - 1) // 8 + 1
             tokens = latent_frames * ((h_adj * scale) // 32) * ((w_adj * scale) // 32)
-            if tokens > 50000:
+            threshold = token_warn_threshold(config)
+            # CFG runs the transformer twice per step, so the activation term
+            # (but not the fixed base) roughly doubles. Compare against an
+            # effective token count so the warning stays honest in that mode.
+            eff_tokens = tokens * 2 if cfg_var.get() else tokens
+            if eff_tokens > threshold:
+                _, _, vram_total = hw_monitor.get_gpu_stats()
+                est = VRAM_BASE_GB + VRAM_GB_PER_TOKEN * eff_tokens
+                card = f"{vram_total:.1f}GB card" if vram_total else "this card"
+                cfg_note = ("\n\nCFG quality mode is ON: each step runs the transformer "
+                            "twice, so the activation cost above is doubled and the run "
+                            "will take roughly 7-8x as long.") if cfg_var.get() else ""
                 if not messagebox.askokcancel(
                     "Large sequence",
                     f"Final stage would run {tokens:,} latent tokens "
                     f"({w_adj*scale}x{h_adj*scale}, {check_frames} frames"
                     f"{' worst-case under Auto Duration' if auto_dur_var.get() else ''}).\n\n"
-                    "Above ~50,000 tokens this is likely to exhaust 16GB of VRAM or trip "
-                    "the AMDGPU ring-timeout watchdog.\n\nContinue anyway?",
+                    f"Estimated peak VRAM: ~{est:.1f}GB on a {card}.\n"
+                    f"Warning threshold for this GPU: {threshold:,} tokens.{cfg_note}\n\n"
+                    "Beyond this you risk exhausting VRAM or tripping the GPU "
+                    "driver's timeout watchdog.\n\n"
+                    "Continue anyway?",
                 ):
                     return
 
@@ -1091,6 +777,7 @@ def main():
                 'mode': mode_var.get(),
                 'image_path': image_path_var.get().strip(),
                 'auto_duration': auto_dur_var.get(),
+                'cfg_mode': cfg_var.get(),
                 'auto_max_seconds': auto_max_val,
             })
             save_config(config)
@@ -1110,25 +797,60 @@ def main():
             messagebox.showerror("Error", "Please ensure numbers are valid.")
             
     def cancel_generation():
-        global cancel_flag
-        cancel_flag = True
+        eng.cancel_flag = True
         btn_cancel.config(state="disabled")
         print("\n[!] Cancelling... waiting for current step to yield.")
 
     btn_generate = ttk.Button(btn_frame, text="🚀 Generate Video", command=start_generation)
     btn_generate.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8, padx=(0, 4))
+    tooltip(btn_generate,
+            "Render with the settings above. Progress streams into the log.\n\n"
+            "First run of a session reloads ~18GB from disk; later runs reuse\n"
+            "the resident pipeline. A warning appears first if the sequence is\n"
+            "large enough to risk exhausting VRAM.")
     
     btn_cancel = ttk.Button(btn_frame, text="🛑 Cancel", command=cancel_generation, state="disabled")
     btn_cancel.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8, padx=(4, 4))
+    tooltip(btn_cancel,
+            "Stop cleanly at the end of the current diffusion step.\n"
+            "Models stay resident, so the next run starts immediately.")
 
     # Models stay resident in RAM between runs (18GB transformer + 1.8GB decoders).
     # On a 124GB box that is free speed; this button gives it back if needed.
-    btn_free = ttk.Button(btn_frame, text="🧹 Free Models", command=free_resident_models)
+    btn_free = ttk.Button(btn_frame, text="🧹 Unload Models (~18GB)", command=free_resident_models)
     btn_free.pack(side=tk.RIGHT, ipady=8, padx=(4, 0))
+    tooltip(btn_free,
+            "Drop the resident pipeline and hand back ~18GB of RAM.\n"
+            "The next run reloads from disk (one slow generation).\n\n"
+            "Rarely needed: VRAM is already freed after every run, and\n"
+            "changing an offload setting rebuilds by itself. Use it to\n"
+            "free the machine for other work, or on a 32GB system.")
+
+    def on_debug_toggle():
+        eng.debug_flag = debug_var.get()
+        # diffusers is muted to `error` in the worker; follow the checkbox so its
+        # own warnings (offload, attention backend, tiling) show up too.
+        set_diffusers_verbosity(eng.debug_flag)
+        print(f"[dbg] debug output {'ON' if eng.debug_flag else 'OFF'}")
+
+    debug_var = tk.BooleanVar(value=False)
+    chk_debug = ttk.Checkbutton(btn_frame, text="🐞 Debug", variable=debug_var,
+                                command=on_debug_toggle)
+    chk_debug.pack(side=tk.RIGHT, padx=(8, 0))
+    tooltip(chk_debug,
+            "Per-step timing, latent geometry, token count and a VRAM/RAM\n"
+            "reading on every line, plus diffusers' own offload and tiling\n"
+            "warnings.\n\nSafe to toggle mid-run: the next step picks it up,\n"
+            "so you never restart and reload 18GB to diagnose something.")
 
     root.update_idletasks()
-    x = (root.winfo_screenwidth() // 2) - (740 // 2)
-    y = (root.winfo_screenheight() // 2) - (980 // 2)
+    # Floor the window at whatever the packed layout actually needs, measured
+    # rather than hardcoded -- font metrics and CPU core count (the telemetry
+    # grid wraps at 8 per row) both change the requirement per machine.
+    root.minsize(max(640, root.winfo_reqwidth()), min(root.winfo_reqheight(),
+                                                      root.winfo_screenheight()))
+    x = (root.winfo_screenwidth() // 2) - (WIN_W // 2)
+    y = (root.winfo_screenheight() // 2) - (WIN_H // 2)
     root.geometry(f"+{x}+{y}")
     
     print("Welcome to LTX-2.5 Control Panel.")

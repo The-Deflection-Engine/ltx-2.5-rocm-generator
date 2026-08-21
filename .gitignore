@@ -5,9 +5,17 @@
 # Whitelist root files
 !.gitignore
 !generate_video.py
+!quant_transformer_fp8.py
+!cli_gen_vid.py
+!ltx_engine.py
+!bench_vae_tiles.py
 !README.md
 !requirements.txt
-!ltx2_config.json
+# ltx2_config.json is deliberately NOT tracked: the GUI rewrites it on every
+# Generate, so it holds live working state (prompt, seed, local absolute image
+# paths) rather than anything shareable. Ship the documented defaults instead;
+# generate_video.py falls back to its in-code defaults when the file is absent.
+!ltx2_config.example.json
 
 # Un-ignore the directory container, ignore its contents, but allow model_index.json + README
 !local_ltx25_model/
