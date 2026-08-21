@@ -98,12 +98,16 @@ def summarise(config):
     else:
         check_frames = f
     tokens = gv.latent_tokens(w, h, check_frames, up)
-    eff = tokens * 2 if config.get("cfg_mode") else tokens
+    # Every extra guidance pass (CFG, STG, modality) costs close to another
+    # full forward call, so scale the estimate by the actual pass count --
+    # not a hardcoded x2, which used to under-count STG-only and CFG+STG runs.
+    passes = gv.guidance_pass_count(config.get("cfg_mode"), config.get("stg_mode"),
+                                    config.get("cfg_modality_scale", 1.0))
+    eff = tokens * passes
     est = gv.VRAM_BASE_GB + gv.VRAM_GB_PER_TOKEN * eff
     _, _, vram_total = gv.hw_monitor.get_gpu_stats()
     threshold = gv.token_warn_threshold(config)
 
-    passes = 1 + (1 if config.get("cfg_mode") else 0) + (1 if config.get("stg_mode") else 0)
     print(f"  mode       : {config.get('mode', 'text2video')}"
           f"{' + CFG quality' if config.get('cfg_mode') else ''}"
           f"{' + STG' if config.get('stg_mode') else ''}"
@@ -115,7 +119,7 @@ def summarise(config):
     else:
         print(f"  length     : {f} frames @ {config['fps']}fps ({f / float(config['fps']):.2f}s)")
     print(f"  seed       : {config['active_seed']}")
-    print(f"  tokens     : {tokens:,}{f'  (x2 under CFG = {eff:,})' if eff != tokens else ''}")
+    print(f"  tokens     : {tokens:,}{f'  ({passes}x passes = {eff:,} effective)' if eff != tokens else ''}")
     print(f"  est. VRAM  : ~{est:.1f}GB"
           f"{f' of {vram_total:.1f}GB' if vram_total else ''}"
           f"   [warn above {threshold:,} tokens]")

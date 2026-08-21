@@ -319,6 +319,23 @@ def latent_tokens(width, height, frames, upscale):
     return lat_f * ((height * scale) // 32) * ((width * scale) // 32)
 
 
+def guidance_pass_count(cfg_mode, stg_mode, cfg_modality_scale=1.0):
+    """How many full transformer forward passes stage 1 runs per step.
+
+    Base is 1. CFG and STG each add one (see the comments in
+    generation_worker for why -- CFG batches cond+uncond into one doubled
+    call, STG and modality guidance are each their own separate call).
+    Shared by the pre-flight VRAM estimate in both front-ends and the engine's
+    own debug line, so a config that trips STG or modality guidance can't be
+    under-estimated in one place and correctly estimated in another --
+    exactly the drift the "eff_tokens = tokens*2 if cfg else tokens" shortcut
+    used to have: STG alone, or CFG+STG, were both estimated as if they cost
+    what plain CFG costs.
+    """
+    return 1 + (1 if cfg_mode else 0) + (1 if stg_mode else 0) + \
+        (1 if (cfg_mode and cfg_modality_scale > 1.0) else 0)
+
+
 def _embed_cache_key(model_path, p, np_text, need_negative):
     h = hashlib.sha256()
     # The negative text only belongs in the key when it is actually encoded.
@@ -931,7 +948,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             f"{', worst-case under Auto Duration' if use_auto_duration else ''}), "
             f"blocks_per_group={config.get('blocks_per_group', 4)}, seed={config['active_seed']}")
         use_modality = use_cfg and cfg_modality_scale > 1.0
-        _passes = 1 + (1 if use_cfg else 0) + (1 if use_stg else 0) + (1 if use_modality else 0)
+        _passes = guidance_pass_count(use_cfg, use_stg, cfg_modality_scale)
         dbg(f"guidance: CFG {'on' if use_cfg else 'off'}"
             f"{f' (scale {cfg_scale}, audio {audio_cfg_scale})' if use_cfg else ''}, "
             f"STG {'on' if use_stg else 'off'}"

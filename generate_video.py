@@ -26,6 +26,7 @@ from ltx_engine import (
     align_frames,
     free_resident_models,
     generation_worker,
+    guidance_pass_count,
     hw_monitor,
     latent_tokens,
     run_subprocess_logged,
@@ -880,17 +881,28 @@ def main():
             check_frames = int(auto_max_val * fps) if auto_dur_var.get() else aligned_frames
             tokens = latent_tokens(w_adj, h_adj, check_frames, upscale_var.get())
             threshold = token_warn_threshold(config)
-            # CFG runs the transformer twice per step, so the activation term
-            # (but not the fixed base) roughly doubles. Compare against an
-            # effective token count so the warning stays honest in that mode.
-            eff_tokens = tokens * 2 if cfg_var.get() else tokens
+            # Each extra guidance pass (CFG, STG, modality) is close to
+            # another full forward call, so its activation cost scales the
+            # same way -- multiply the token count by the pass count rather
+            # than a hardcoded x2. This used to only ever double for CFG, so
+            # STG alone (2 passes) was compared as if it were the 1-pass
+            # baseline, and CFG+STG (3 passes) was under-counted as 2.
+            # cfg_modality_scale has no GUI control, so read it from the last
+            # loaded/saved config -- same as everywhere else it's used.
+            passes = guidance_pass_count(cfg_var.get(), stg_var.get(),
+                                         config.get("cfg_modality_scale", 1.0))
+            eff_tokens = tokens * passes
             if eff_tokens > threshold:
                 _, _, vram_total = hw_monitor.get_gpu_stats()
                 est = VRAM_BASE_GB + VRAM_GB_PER_TOKEN * eff_tokens
                 card = f"{vram_total:.1f}GB card" if vram_total else "this card"
-                cfg_note = ("\n\nCFG quality mode is ON: each step runs the transformer "
-                            "twice, so the activation cost above is doubled and the run "
-                            "will take roughly 7-8x as long.") if cfg_var.get() else ""
+                cfg_note = (f"\n\n{passes} transformer passes per step (CFG"
+                            f"{'+STG' if stg_var.get() else ''}"
+                            f"{'+modality' if config.get('cfg_modality_scale', 1.0) > 1.0 else ''}"
+                            f"), roughly {passes}x the compute of a plain run."
+                            ) if cfg_var.get() else (
+                            "\n\n2 transformer passes per step (STG), roughly "
+                            "2x the compute of a plain run.") if stg_var.get() else ""
                 if not messagebox.askokcancel(
                     "Large sequence",
                     f"Final stage would run {tokens:,} latent tokens "
