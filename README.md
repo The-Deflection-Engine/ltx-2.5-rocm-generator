@@ -4,7 +4,7 @@
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/S6I125FYNB)
 
 *An unashamed joint programming collaboration between a human and AI.*
-I started this project with my VERY limited programming skills, and help from Qwen3-Coder:30B. It was a great help and got me to a "working" state. There's no way I would have got there without it. As Daniel from LTX said to me, most people would give up at the first OOM, and I would have, but AI intervention kept me motivated. 
+I started this project with my VERY limited programming skills, and help from Qwen3-Coder:30B. It was a great help and got me to a "working" state. There's no way I would have got there without it. As Daniel from LTX said to me, most people would give up at the first OOM (that inspired me even more), and I would have, but AI intervention kept me motivated. 
 I actually got some sleep one night, and in a fit of new-found inspiration I paid up for Claude Pro. I threw my code at it and quickly realised I had been pretty damn lucky to have anything working at all! The way I was instructing Qwen, and my own poor decisions, backed by lack of development knowledge, had me in a bit of a hole. Claude was a breath of fresh air, and I'm now fully embracing the "vibe coding" scene. Speed of development has gone through the roof and provided me a never-quite-final product that doesn't frustrate me nearly as much as my own work. I know my limits. Anyway, hope this is useful for at least one person. And any bugs are entirely Claude's and not mine ;-)
 
 ## What is this?!
