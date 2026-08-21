@@ -14,10 +14,8 @@ import sys
 import time
 import json
 import glob
-import random
 import hashlib
 import tempfile
-import threading
 import multiprocessing as mp
 
 
@@ -108,8 +106,14 @@ def token_warn_threshold(config=None):
 # Peak RAM use is ~45GB, so on anything comfortably above that there is no
 # reason to re-read 18GB of transformer weights
 # (or 23GB of text encoder) from disk on every click of "Generate".
-_MODEL_CACHE = {"pipe": None, "transformer": None, "path": None, "opts": None}
-_UPSAMPLER_CACHE = {"model": None, "path": None}
+_MODEL_CACHE = {"pipe": None, "path": None, "opts": None}
+_UPSAMPLER_CACHE = {"model": None}
+# Bounded: each entry is a full set of prompt embeddings, ~385MB (770MB with a
+# negative prompt encoded, e.g. under CFG mode). Editing the prompt a few times
+# in one GUI session used to grow this without limit. The disk cache in
+# EMBED_CACHE_DIR still backs everything evicted here, so dropping an entry
+# only costs a torch.load on reuse, not a re-encode.
+_EMBED_MEM_CACHE_MAX = 3
 _EMBED_MEM_CACHE = {}
 
 cancel_flag = False
@@ -554,6 +558,13 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             bias = self.bias.to(input.dtype) if self.bias is not None else None
             return F.linear(input, weight, bias)
 
+        # NOTE: this patches the *class*, so it applies process-wide to every
+        # torch.nn.Linear -- not just the transformer's, also the VAE's, audio
+        # VAE's, vocoder's, connectors' and duration head's. Harmless today
+        # (the branch is a dtype check that's a no-op for bf16 weights), but
+        # it's a global mutation with no way back inside a long-lived worker
+        # thread, and it silently forecloses relying on the stock fast path
+        # for any Linear anywhere in the process from this point on.
         torch.nn.Linear.forward = dynamic_fp8_linear_forward
 
         def patch_transformer_fp8_params(module, target_dtype=torch.bfloat16):
@@ -685,7 +696,9 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             stage1_schedule = dict(sigmas=DISTILLED_SIGMA_VALUES)
             need_negative = False
         else:
-            stage1_guidance = distilled_guidance
+            stage1_guidance = dict(distilled_guidance)  # copy: stage 2 reuses
+            # distilled_guidance directly (**distilled_guidance below), so an
+            # in-place edit of stage1_guidance here would leak into stage 2
             stage1_schedule = dict(sigmas=DISTILLED_SIGMA_VALUES)
             need_negative = False       # CFG off => negative branch is never evaluated
 
@@ -731,6 +744,8 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 if not os.path.exists(cache_path):
                     raise RuntimeError("Text encoding failed -- see the subprocess output above.")
                 embeds = torch.load(cache_path, weights_only=False)
+            if len(_EMBED_MEM_CACHE) >= _EMBED_MEM_CACHE_MAX:
+                _EMBED_MEM_CACHE.pop(next(iter(_EMBED_MEM_CACHE)))  # oldest inserted
             _EMBED_MEM_CACHE[key] = embeds
 
         prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask = embeds
@@ -759,7 +774,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 # settings tweak just looks like the cache broke.
                 print(f"  -> Offload settings changed {_MODEL_CACHE['opts']} -> {build_opts}; "
                       "rebuilding pipeline (one slow load).")
-                _MODEL_CACHE.update({"pipe": None, "transformer": None, "path": None, "opts": None})
+                _MODEL_CACHE.update({"pipe": None, "path": None, "opts": None})
                 gc.collect()
                 torch.cuda.empty_cache()
             print("--- [2/4] Loading FP8 Transformer & Enabling VRAM Protections ---")
@@ -834,8 +849,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             if getattr(pipe, "vocoder", None) is not None:
                 pipe.vocoder.to(onload_device)
 
-            _MODEL_CACHE.update({"pipe": pipe, "transformer": transformer, "path": MODEL_PATH,
-                                 "opts": build_opts})
+            _MODEL_CACHE.update({"pipe": pipe, "path": MODEL_PATH, "opts": build_opts})
 
         # VAE tiling. The old `tile_sample_min_size` / `tile_latent_min_size`
         # assignments did nothing at all -- AutoencoderKLLTX2Video has no such
@@ -905,9 +919,16 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         mode_label = "Image-to-Video" if use_image else "Text-to-Video"
         len_label = "auto length" if use_auto_duration else f"{config['frames']} frames"
         print(f"--- [3/4] Generating Base Video, {mode_label} ({stage1_w}x{stage1_h}, {len_label}) ---")
-        _lat_f = (int(config["frames"]) - 1) // 8 + 1
+        # Under Auto Duration the model picks the length, so config["frames"]
+        # was never actually run -- reporting a token count derived from it
+        # was reporting a sequence length that doesn't correspond to anything.
+        # Use the worst case Auto Duration is allowed to pick instead (same
+        # figure the GUI's pre-flight VRAM warning is built on).
+        _dbg_frames = int(auto_max_s * float(config["fps"])) if use_auto_duration else int(config["frames"])
+        _lat_f = (_dbg_frames - 1) // 8 + 1
         dbg(f"seq={_lat_f * (stage1_h // 32) * (stage1_w // 32):,} tokens "
-            f"(latent {_lat_f}x{stage1_h // 32}x{stage1_w // 32}), "
+            f"(latent {_lat_f}x{stage1_h // 32}x{stage1_w // 32}"
+            f"{', worst-case under Auto Duration' if use_auto_duration else ''}), "
             f"blocks_per_group={config.get('blocks_per_group', 4)}, seed={config['active_seed']}")
         use_modality = use_cfg and cfg_modality_scale > 1.0
         _passes = 1 + (1 if use_cfg else 0) + (1 if use_stg else 0) + (1 if use_modality else 0)
@@ -1137,15 +1158,19 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         # NOTE: `pipe` / the upsampler are deliberately NOT deleted -- they live in
         # _MODEL_CACHE so the next run skips ~18GB of disk reads. Use the
         # "Unload Models" button to drop them.
-        try:
-            del upscale_pipe
-        except Exception:
-            pass
-
-        import torch
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        try:
+            # Guarded: if the very first `import torch` above is what raised
+            # the exception being handled, this would raise the identical
+            # ImportError -- and an exception here would abort the rest of
+            # finally, permanently leaving Generate/Cancel disabled with no
+            # way to recover short of restarting. Not hypothetical enough to
+            # skip guarding for a two-line cost.
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as exc:
+            print(f"[!] (cleanup warning, continuing anyway: {exc})")
 
         root.after(0, btn_generate.config, {"state": "normal"})
         root.after(0, btn_cancel.config, {"state": "disabled"})
@@ -1160,8 +1185,8 @@ def free_resident_models():
     """
     import torch
     ram_before, _ = hw_monitor.get_ram_stats()
-    _MODEL_CACHE.update({"pipe": None, "transformer": None, "path": None, "opts": None})
-    _UPSAMPLER_CACHE.update({"model": None, "path": None})
+    _MODEL_CACHE.update({"pipe": None, "path": None, "opts": None})
+    _UPSAMPLER_CACHE.update({"model": None})
     # Embeddings are also RAM-resident; the disk cache still backs them, so
     # dropping these only costs a torch.load on reuse.
     _EMBED_MEM_CACHE.clear()

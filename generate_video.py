@@ -23,11 +23,14 @@ from ltx_engine import (
     SPATIAL_COMPRESSION,
     VRAM_BASE_GB,
     VRAM_GB_PER_TOKEN,
+    align_frames,
     free_resident_models,
     generation_worker,
     hw_monitor,
+    latent_tokens,
     run_subprocess_logged,
     set_diffusers_verbosity,
+    snap_dimension,
     token_warn_threshold,
 )
 
@@ -152,14 +155,19 @@ def main():
             try:
                 with open(CONFIG_FILE, "r") as f:
                     defaults.update(json.load(f))
-            except: pass
+            except Exception as exc:
+                # A silently-discarded prompt/settings load looks like "the
+                # app forgot everything" with no clue why. A corrupt file or a
+                # read-only directory both land here; both are worth a line.
+                print(f"[!] Could not load {CONFIG_FILE}, using defaults: {exc}")
         return defaults
 
     def save_config(config):
         try:
             with open(CONFIG_FILE, "w") as f:
                 json.dump(config, f, indent=4)
-        except: pass
+        except Exception as exc:
+            print(f"[!] Could not save {CONFIG_FILE}: {exc}")
 
     config = load_saved_config()
     
@@ -515,8 +523,7 @@ def main():
 
     def update_output_label(*_a):
         try:
-            w = max(MIN_DIMENSION, round(int(entry_w.get()) / SPATIAL_COMPRESSION) * SPATIAL_COMPRESSION)
-            h = max(MIN_DIMENSION, round(int(entry_h.get()) / SPATIAL_COMPRESSION) * SPATIAL_COMPRESSION)
+            w, h = snap_dimension(int(entry_w.get())), snap_dimension(int(entry_h.get()))
         except ValueError:
             lbl_output.config(text="Output: —")
             return
@@ -587,7 +594,13 @@ def main():
     stg_var = tk.BooleanVar(value=False)
 
     def on_stg_toggle():
-        eng_scale = config.get("stg_scale", 1.0)
+        # From the live spinbox, not the saved config -- the dialog used to
+        # quote whatever was last saved, which goes stale the moment someone
+        # adjusts the spinbox before ticking the box.
+        try:
+            eng_scale = float(stg_scale_var.get())
+        except (ValueError, tk.TclError):
+            eng_scale = 1.0
         if not stg_var.get():
             return
         if not messagebox.askokcancel(
@@ -681,18 +694,18 @@ def main():
     
     def get_safe_fps():
         try: return max(1.0, float(entry_fps.get()))
-        except: return 24.0
+        except (ValueError, tk.TclError): return 24.0
 
     def on_mode_change():
         nonlocal base_frames
         fps = get_safe_fps()
         if length_type.get() == "seconds":
             try: base_frames = float(entry_len.get())
-            except: pass
+            except (ValueError, tk.TclError): pass
             entry_len.delete(0, tk.END); entry_len.insert(0, f"{base_frames/fps:.2f}".rstrip('0').rstrip('.'))
         else:
             try: base_frames = round(float(entry_len.get()) * fps)
-            except: pass
+            except (ValueError, tk.TclError): pass
             entry_len.delete(0, tk.END); entry_len.insert(0, str(int(base_frames)))
 
     def on_fps_typing(event=None):
@@ -706,7 +719,7 @@ def main():
         try:
             val = float(entry_len.get())
             base_frames = val if length_type.get() == "frames" else val * fps
-        except: pass
+        except (ValueError, tk.TclError): pass
 
     mode_sub = ttk.Frame(time_frame)
     mode_sub.pack(anchor=tk.W, pady=4)
@@ -826,8 +839,7 @@ def main():
             # silently rewriting what was typed -- "I asked for 810 and got
             # 800" is otherwise invisible until you inspect the output file.
             w_raw, h_raw = int(entry_w.get()), int(entry_h.get())
-            w_adj = max(MIN_DIMENSION, round(w_raw / SPATIAL_COMPRESSION) * SPATIAL_COMPRESSION)
-            h_adj = max(MIN_DIMENSION, round(h_raw / SPATIAL_COMPRESSION) * SPATIAL_COMPRESSION)
+            w_adj, h_adj = snap_dimension(w_raw), snap_dimension(h_raw)
             if (w_adj, h_adj) != (w_raw, h_raw):
                 print(f"  [!] Resolution {w_raw}x{h_raw} -> {w_adj}x{h_adj} "
                       f"(must be multiples of {SPATIAL_COMPRESSION}, min {MIN_DIMENSION}).")
@@ -838,7 +850,7 @@ def main():
             val = float(entry_len.get())
             target_frames = int(val * fps) if length_type.get() == "seconds" else int(val)
             # Same idea temporally: the VAE is 8:1, hence the 8k+1 frame rule.
-            aligned_frames = (max(1, round((target_frames - 1) / 8)) * 8) + 1
+            aligned_frames = align_frames(target_frames)
             if aligned_frames != target_frames:
                 print(f"  [!] Frames {target_frames} -> {aligned_frames} (8k+1 rule).")
             
@@ -853,10 +865,9 @@ def main():
             # VRAM sanity check. Transformer sequence length is
             # latent_frames * (H/32) * (W/32), and the threshold now scales with
             # whatever card is present -- see token_warn_threshold().
-            scale = 2 if upscale_var.get() else 1
+            scale = 2 if upscale_var.get() else 1  # for the dialog text below
             check_frames = int(auto_max_val * fps) if auto_dur_var.get() else aligned_frames
-            latent_frames = (check_frames - 1) // 8 + 1
-            tokens = latent_frames * ((h_adj * scale) // 32) * ((w_adj * scale) // 32)
+            tokens = latent_tokens(w_adj, h_adj, check_frames, upscale_var.get())
             threshold = token_warn_threshold(config)
             # CFG runs the transformer twice per step, so the activation term
             # (but not the fixed base) roughly doubles. Compare against an

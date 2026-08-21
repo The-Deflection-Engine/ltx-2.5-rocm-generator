@@ -89,7 +89,15 @@ def summarise(config):
     up = bool(config.get("upscale"))
     w, h, f = int(config["width"]), int(config["height"]), int(config["frames"])
     out_w, out_h = (w * 2, h * 2) if up else (w, h)
-    tokens = gv.latent_tokens(w, h, f, up)
+    # Under Auto Duration the model picks the length, so f above is never what
+    # actually runs -- size the token/VRAM estimate against the worst case it's
+    # allowed to pick instead, same as the GUI's pre-flight check does.
+    if config.get("auto_duration"):
+        auto_max = min(float(config.get("auto_max_seconds", 5.0)), gv.AUTO_DURATION_CAP_S)
+        check_frames = int(auto_max * float(config["fps"]))
+    else:
+        check_frames = f
+    tokens = gv.latent_tokens(w, h, check_frames, up)
     eff = tokens * 2 if config.get("cfg_mode") else tokens
     est = gv.VRAM_BASE_GB + gv.VRAM_GB_PER_TOKEN * eff
     _, _, vram_total = gv.hw_monitor.get_gpu_stats()
@@ -101,7 +109,11 @@ def summarise(config):
           f"{' + STG' if config.get('stg_mode') else ''}"
           f"{f'   ({passes} passes/step)' if passes > 1 else ''}")
     print(f"  output     : {out_w}x{out_h}  ({'2-stage' if up else 'single-stage'} from {w}x{h})")
-    print(f"  length     : {f} frames @ {config['fps']}fps ({f / float(config['fps']):.2f}s)")
+    if config.get("auto_duration"):
+        print(f"  length     : auto ({config.get('auto_min_seconds', 2.0):.1f}-"
+              f"{auto_max:.1f}s) -- tokens below are the worst case")
+    else:
+        print(f"  length     : {f} frames @ {config['fps']}fps ({f / float(config['fps']):.2f}s)")
     print(f"  seed       : {config['active_seed']}")
     print(f"  tokens     : {tokens:,}{f'  (x2 under CFG = {eff:,})' if eff != tokens else ''}")
     print(f"  est. VRAM  : ~{est:.1f}GB"
