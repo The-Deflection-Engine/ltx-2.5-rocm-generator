@@ -213,20 +213,35 @@ def main():
             return "#ffaa00"   # orange - working hard
         return "#00ff88"       # green  - idle/light
 
+    # The primary readouts are white/cyan by default rather than green, so they
+    # get their own "normal" colour but share the 50/75 thresholds.
+    def load_colour(pct, normal):
+        if pct >= 76:
+            return "#ff4444"
+        if pct >= 50:
+            return "#ffaa00"
+        return normal
+
     def update_telemetry():
         cpu_avg, cores = hw_monitor.get_cpu_stats()
         ram_used, ram_total = hw_monitor.get_ram_stats()
         gpu_usage, vram_used, vram_total = hw_monitor.get_gpu_stats()
-        
-        lbl_cpu.config(text=f"CPU: {cpu_avg:.0f}% (Avg)")
-        lbl_ram.config(text=f"RAM: {ram_used:.1f}/{ram_total:.1f} GB")
-        
+
+        lbl_cpu.config(text=f"CPU: {cpu_avg:.0f}% (Avg)",
+                       fg=load_colour(cpu_avg, "#ffffff"))
+        ram_pct = (ram_used / ram_total * 100) if ram_total else 0
+        lbl_ram.config(text=f"RAM: {ram_used:.1f}/{ram_total:.1f} GB",
+                       fg=load_colour(ram_pct, "#ffffff"))
+
         if gpu_usage is None:
-            lbl_gpu.config(text="GPU: N/A")
-            lbl_vram.config(text="VRAM: N/A")
+            lbl_gpu.config(text="GPU: N/A", fg="#00ffcc")
+            lbl_vram.config(text="VRAM: N/A", fg="#00ffcc")
         else:
-            lbl_gpu.config(text=f"GPU: {gpu_usage}%")
-            lbl_vram.config(text=f"VRAM: {vram_used:.1f}/{vram_total:.1f} GB")
+            lbl_gpu.config(text=f"GPU: {gpu_usage}%",
+                           fg=load_colour(gpu_usage, "#00ffcc"))
+            vram_pct = (vram_used / vram_total * 100) if vram_total else 0
+            lbl_vram.config(text=f"VRAM: {vram_used:.1f}/{vram_total:.1f} GB",
+                            fg=load_colour(vram_pct, "#00ffcc"))
             
         if cores:
             if not core_labels:
@@ -481,14 +496,18 @@ def main():
             "token warning before pushing resolution or length.")
 
     # --- CFG quality mode ---
-    cfg_var = tk.BooleanVar(value=config.get("cfg_mode", False))
+    # Always starts OFF, deliberately not restored from the config. CFG costs
+    # ~7-8x the compute, so it should be a decision you make for this run rather
+    # than something a previous session silently leaves armed. (The CLI still
+    # honours cfg_mode from the config -- there you are stating intent per run.)
+    cfg_var = tk.BooleanVar(value=False)
 
     def update_np_label():
         """The negative prompt is only encoded when CFG mode is on; say which."""
         if cfg_var.get():
             np_label_var.set("Negative Prompt (ACTIVE: CFG quality mode is on):")
         else:
-            np_label_var.set("Negative Prompt (unused: distilled schedule runs guidance-free):")
+            np_label_var.set("Negative Prompt (INACTIVE: CFG quality mode is off):")
 
     def on_cfg_toggle():
         if not cfg_var.get():
@@ -853,9 +872,45 @@ def main():
     y = (root.winfo_screenheight() // 2) - (WIN_H // 2)
     root.geometry(f"+{x}+{y}")
     
+    def on_close():
+        """Leave immediately, without running Python's finalisers.
+
+        Closing the window used to return from mainloop() and let the
+        interpreter finalise. With a resident pipeline, pinned host buffers and
+        live HIP streams still alive, it unwinds in an order the ROCm runtime
+        does not survive -- observed as:
+
+            segfault at 7f1789f16760 ip 00007f1789f16760 error 15
+
+        ip == fault address: a call through a function pointer into a library
+        that had already been unloaded. `os._exit()` skips the unwind entirely,
+        which is the fix.
+
+        Note what this deliberately does NOT do: free the models, synchronize,
+        or empty any cache. The kernel reclaims all of it -- host, pinned and
+        VRAM -- when the process dies, and the amdgpu driver tears down the
+        context when the fd closes. Doing it by hand first only delays the
+        window disappearing, which is what made closing feel slow.
+        """
+        if btn_cancel["state"] == "normal":     # a generation is in flight
+            if not messagebox.askokcancel(
+                    "Quit", "A generation is still running.\n\n"
+                            "Quitting now abandons it. Continue?"):
+                return
+        # os._exit skips atexit and buffer flushing, so flush the real streams
+        # (not the log widget's redirect) or trailing output is lost.
+        for stream in (sys.__stdout__, sys.__stderr__):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        os._exit(0)
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+
     print("Welcome to LTX-2.5 Control Panel.")
     print("System ready. Modify settings above and click Generate Video.")
-    
+
     root.mainloop()
 
 if __name__ == "__main__":
