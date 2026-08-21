@@ -3,9 +3,15 @@
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/S6I125FYNB)
 
-A GUI control panel and a headless CLI for running the **LTX-2.5 video diffusion model** on a single AMD consumer GPU via ROCm — developed on an RX 9070 XT (16GB VRAM) with 128GB system RAM, but the RAM figure is not a requirement — more than 32GB is what matters, and 32GB itself works for smaller generations.
+*An unashamed joint programming collaboration between a human and AI.*
+I started this project with my VERY limited programming skills, and help from Qwen3-Coder:30B. It was a great help and got me to a "working" state. There's no way I would have got there without it. As Daniel from LTX said to me, most people would give up at the first OOM, and I would have, but AI intervention kept me motivated. 
+I actually got some sleep one night, and in a fit of new-found inspiration I paid up for Claude Pro. I threw my code at it and quickly realised I had been pretty damn lucky to have anything working at all! The way I was instructing Qwen, and my own poor decisions, backed by lack of development knowledge, had me in a bit of a hole. Claude was a breath of fresh air, and I'm now fully embracing the "vibe coding" scene. Speed of development has gone through the roof and provided me a never-quite-final product that doesn't frustrate me nearly as much as my own work. I know my limits. Anyway, hope this is useful for at least one person. And any bugs are entirely Claude's and not mine ;-)
 
-It keeps the FP8 model resident in memory between generations, runs the distilled guidance-free schedule correctly, tiles the VAE decode to avoid AMDGPU driver timeouts, and supports a working two-stage generate-then-upscale pipeline.
+## What is this?!
+
+A GUI control panel and a headless CLI for running the **LTX-2.5 video diffusion model** on a single AMD consumer GPU via ROCm — developed on an RX 9070 XT (16GB VRAM) with 128GB system RAM (originally 32GB, but kept running out by about 2GB!), but the RAM figure is not a requirement — more than 32GB is what matters, and 32GB itself works for smaller generations.
+
+It keeps the FP8 model resident in memory between generations, runs the distilled guidance-free schedule correctly, tiles the VAE decode to avoid AMDGPU driver timeouts, and supports a working two-stage generate-then-upscale pipeline. Is FP8 the correct format? Yet to be seen, but it works for now, and at a decent speed, but I'm very open to constructive criticism!
 
 ### Layout
 
@@ -17,15 +23,13 @@ It keeps the FP8 model resident in memory between generations, runs the distille
 | `quant_transformer_fp8.py` | One-time FP8 conversion, see [First-time setup](#first-time-setup). |
 | `bench_vae_tiles.py` | VAE decode timing harness, see [VAE tile geometry](#vae-tile-geometry--measured-dont-guess). |
 
-Both front-ends share the same `ltx2_config.json` and the same pipeline, so a fix in one reaches both.
-
-*An unashamed joint programming collaboration between a human and Claude.*
+Both front-ends share the same `ltx2_config.json` and the same pipeline, so a fix/change in one reaches both.
 
 ---
 
 ## ✨ Key Features
 
-* **Resident model cache:** the ~18GB FP8 transformer and prompt-embedding cache (in-RAM + on-disk) survive across generations, so only the first click of a session pays the disk-load cost. VRAM is returned automatically after every run, and changing an offload setting rebuilds the pipeline by itself — so on a large-RAM machine you can generally ignore this. A **🧹 Unload Models** button is there for when you want the ~18GB back anyway (see [when to use it](#when-to-use-unload-models)).
+* **Resident model cache:** the ~18GB FP8 transformer and prompt-embedding cache (in-RAM + on-disk) survive across generations, so only the first click of a session pays the disk-load cost. VRAM is returned automatically after every run, and changing an offload setting rebuilds the pipeline by itself — so on a large-RAM machine you can generally ignore this. An **🧹 Unload Models** button is there for when you want the ~18GB back anyway - disabled during generation. (see [when to use it](#when-to-use-unload-models)).
 * **Guidance-free distilled schedule, correctly disabled:** `audio_guidance_scale` defaults to 7.0 in the underlying pipeline, which silently re-enables classifier-free guidance (doubling every step) if you only zero out `guidance_scale`. This script zeroes all guidance/STG scales, so every step actually runs once — roughly 2x fewer FLOPs than a naive guidance-scale-1.0 setup.
 * **Real VAE tiling:** spatial tiling (`enable_tiling`) plus framewise (temporal) decoding, which is what actually bounds VRAM and prevents the AMDGPU ring-timeout watchdog from firing on longer clips.
 * **Working two-stage upscale (off by default):** generate at a lower base resolution, then run a 2x latent upsample + short refinement pass at the target resolution — faster than generating at full resolution directly, with one noise generator threaded through both stages per the LTX-2.5 reference recipe. Off by default because it pushes VRAM harder — see the hardware warning below before enabling it.
