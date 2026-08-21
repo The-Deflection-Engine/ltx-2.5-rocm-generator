@@ -9,6 +9,7 @@
 !cli_gen_vid.py
 !ltx_engine.py
 !bench_vae_tiles.py
+!CLAUDE.md
 
 # Test harness lives in its own directory; /* only matches root entries, so
 # un-ignoring the directory is enough to include what is inside it.
