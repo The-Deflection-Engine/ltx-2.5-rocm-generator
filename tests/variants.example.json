@@ -1,0 +1,22 @@
+{
+  "_comment": "Template for tests/ab_render.py. `base` is shared config; each entry",
+  "_comment2": "under `variants` overlays on top of it and the run is named after its key.",
+
+  "base": {
+    "prompt": "A medium close-up, static camera, a street performer juggling three oranges in a steady cascade.",
+    "negative_prompt": "",
+    "width": 768,
+    "height": 512,
+    "frames": 145,
+    "fps": 24.0,
+    "upscale": false,
+    "mode": "text2video",
+    "image_path": ""
+  },
+
+  "variants": {
+    "baseline":  {"cfg_mode": false, "stg_mode": false},
+    "stg_1.0":   {"cfg_mode": false, "stg_mode": true, "stg_scale": 1.0},
+    "stg_0.5":   {"cfg_mode": false, "stg_mode": true, "stg_scale": 0.5}
+  }
+}

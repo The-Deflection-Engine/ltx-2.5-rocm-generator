@@ -14,6 +14,13 @@
 # Test harness lives in its own directory; /* only matches root entries, so
 # un-ignoring the directory is enough to include what is inside it.
 !tests/
+tests/__pycache__/
+# Real prompts/results from ad-hoc A/B sessions -- tests/variants.example.json
+# is the committed template, everything else here is scratch.
+tests/variants.*.json
+!tests/variants.example.json
+# A/B render harness output: multi-hundred-MB video files, per-run scratch.
+runs/
 !README.md
 !requirements.txt
 # ltx2_config.json is deliberately NOT tracked: the GUI rewrites it on every

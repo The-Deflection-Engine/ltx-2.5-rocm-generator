@@ -891,9 +891,25 @@ def main():
             btn_generate.config(state="disabled")
             btn_cancel.config(state="normal")
             progress_var.set(0)
-            
+
+            # Unload Models and Enhance Now both touch the GPU/pipeline and
+            # neither checks whether a generation is in flight. Unload would
+            # free_resident_models() out from under the worker's live
+            # references and pinned buffers mid-transfer; Enhance Now would
+            # launch the ~10GB enhancer onto a GPU already busy denoising,
+            # risking an OOM on a 16GB card. Disable both for the duration.
+            btn_free.config(state="disabled")
+            btn_enhance.config(state="disabled")
+
+            def run_and_reenable(*worker_args):
+                try:
+                    generation_worker(*worker_args)
+                finally:
+                    root.after(0, lambda: (btn_free.config(state="normal"),
+                                           btn_enhance.config(state="normal")))
+
             thread = threading.Thread(
-                target=generation_worker,
+                target=run_and_reenable,
                 args=(config, root, progress_var, progress_bar, btn_generate, btn_cancel),
             )
             thread.daemon = True

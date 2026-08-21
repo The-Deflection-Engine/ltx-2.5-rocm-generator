@@ -69,6 +69,7 @@ AUTO_DURATION_CAP_S = 6.0
 # From the VAE config: spatial_compression_ratio 32, temporal_compression_ratio 8.
 # Width/height must be multiples of 32; frame counts must satisfy 8k + 1.
 SPATIAL_COMPRESSION = 32
+TEMPORAL_COMPRESSION = 8
 MIN_DIMENSION = 256
 
 # --- VRAM model for the token warning -----------------------------------------
@@ -427,7 +428,16 @@ def encode_in_subprocess(model_path, p, np_text, need_negative, out_path):
             do_classifier_free_guidance=need_negative,
             device="cpu",
         )
-    torch.save(embeds, out_path)
+    # Write to a temp file and rename into place. A straight save to out_path
+    # left a truncated .pt behind if the process was killed mid-write --
+    # cancel does exactly that (run_subprocess_logged terminates on
+    # cancel_flag) -- and every later run for that same prompt would find the
+    # file present, load it, and fail with an unpickling error nowhere near
+    # the actual cause. os.replace is atomic on the same filesystem, so
+    # readers only ever see a complete file or none at all.
+    tmp_path = out_path + f".tmp{os.getpid()}"
+    torch.save(embeds, tmp_path)
+    os.replace(tmp_path, out_path)
     print("  -> Encoding complete. Terminating process to release RAM.")
 
 # =========================================================================
@@ -521,6 +531,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         from diffusers.pipelines.ltx2.utils import (
             DISTILLED_SIGMA_VALUES,
             STAGE_2_DISTILLED_SIGMA_VALUES,
+            LTX2_5_IMAGE_CRF,
         )
         from diffusers.utils import encode_video
 
@@ -623,7 +634,14 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 # STG on top of CFG would be a third pass per step. Allowed, but
                 # it is the user asking for it explicitly.
                 stg_scale=stg_scale if use_stg else 0.0,
-                audio_stg_scale=0.0,
+                # NOT 0.0: diffusers does `audio_stg_scale = audio_stg_scale or
+                # stg_scale` (pipeline_ltx2.py:1149), and `0.0 or X` is X in
+                # Python -- so 0.0 here gets silently replaced by the video
+                # stg_scale above whenever STG is on, applying full-strength
+                # audio STG we never asked for. A tiny nonzero value survives
+                # the `or` as itself and is numerically off (it only scales a
+                # delta that gets added in, see :1505).
+                audio_stg_scale=1e-8,
                 modality_scale=1.0,
                 audio_modality_scale=1.0,
             )
@@ -635,7 +653,10 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 guidance_scale=1.0,     # CFG stays off: no negative prompt involved
                 audio_guidance_scale=1.0,
                 stg_scale=stg_scale,
-                audio_stg_scale=0.0,
+                # See the comment on the CFG+STG branch above: 0.0 here gets
+                # silently replaced by `stg_scale` via diffusers' `or`
+                # fallback, applying audio STG we never asked for.
+                audio_stg_scale=1e-8,
                 modality_scale=1.0,
                 audio_modality_scale=1.0,
             )
@@ -778,32 +799,8 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             else:
                 apply_group_offloading(pipe.transformer, **offload_kwargs)
 
-            # VAE tiling. The old `tile_sample_min_size` / `tile_latent_min_size`
-            # assignments did nothing at all -- AutoencoderKLLTX2Video has no such
-            # attributes, so tiling silently ran at its 512/448 defaults. These are
-            # the real knobs, plus framewise (temporal) decoding, which is what
-            # actually bounds VRAM on long clips.
             if hasattr(pipe.vae, "enable_slicing"):
                 pipe.vae.enable_slicing()
-            # Tile geometry is config-driven: VAE decode dominates wall-clock on a
-            # 2-stage run (~2/3 of it), and bigger tiles mean fewer overlap-blend
-            # passes. Raising these trades VRAM and ring-timeout headroom for speed.
-            if hasattr(pipe.vae, "enable_tiling"):
-                tile = int(config.get("vae_tile_size", 512))
-                tile_stride = int(config.get("vae_tile_stride", int(tile * 0.875)))
-                pipe.vae.enable_tiling(
-                    tile_sample_min_height=tile,
-                    tile_sample_min_width=tile,
-                    tile_sample_min_num_frames=int(config.get("vae_tile_frames", 24)),
-                    tile_sample_stride_height=tile_stride,
-                    tile_sample_stride_width=tile_stride,
-                    tile_sample_stride_num_frames=int(config.get("vae_tile_stride_frames", 16)),
-                )
-                dbg(f"VAE tiling: {tile}px tiles, {tile_stride}px stride "
-                    f"({tile - tile_stride}px overlap)")
-            # Temporal tiling of the decoder; composes with the spatial tiling above.
-            pipe.vae.use_framewise_decoding = True
-            pipe.vae.use_framewise_encoding = True
 
             # The decoders are small (VAE 1.4GB + audio VAE 0.1GB + vocoder 0.25GB)
             # and `_execution_device` is cuda because of the transformer's offload
@@ -817,6 +814,52 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
 
             _MODEL_CACHE.update({"pipe": pipe, "transformer": transformer, "path": MODEL_PATH,
                                  "opts": build_opts})
+
+        # VAE tiling. The old `tile_sample_min_size` / `tile_latent_min_size`
+        # assignments did nothing at all -- AutoencoderKLLTX2Video has no such
+        # attributes, so tiling silently ran at its 512/448 defaults. These are
+        # the real knobs, plus framewise (temporal) decoding, which is what
+        # actually bounds VRAM on long clips.
+        #
+        # Deliberately OUTSIDE the cache-hit branch above, unlike blocks_per_group
+        # / attention_backend: enable_tiling() just sets attributes on the VAE
+        # (cheap, no rebuild needed), so re-applying it on every run means an
+        # edit to vae_tile_* in the config takes effect on the very next
+        # generation. It used to live inside the "build a fresh pipe" branch
+        # only, so editing tile settings while the pipe was resident did
+        # nothing -- silently, with no log line, while the README claimed every
+        # config key is "read fresh each run".
+        if hasattr(pipe.vae, "enable_tiling"):
+            tile = int(config.get("vae_tile_size", 512))
+            tframes = int(config.get("vae_tile_frames", 24))
+            # Strides MUST land on a latent boundary (spatial 32, temporal 8) --
+            # bench_vae_tiles.py measured a 3x penalty for a ragged stride, e.g.
+            # a 384px tile with an un-snapped 336px stride (10.5 latent px) ran
+            # slower than a 512px tile despite decoding fewer tiles. Snap
+            # whatever the config asks for rather than trusting it verbatim.
+            raw_stride = config.get("vae_tile_stride")
+            raw_stride = int(raw_stride) if raw_stride is not None else int(tile * 0.875)
+            tile_stride = max(SPATIAL_COMPRESSION,
+                              (raw_stride // SPATIAL_COMPRESSION) * SPATIAL_COMPRESSION)
+            raw_tstride = config.get("vae_tile_stride_frames", 16)
+            tstride = max(TEMPORAL_COMPRESSION,
+                          (int(raw_tstride) // TEMPORAL_COMPRESSION) * TEMPORAL_COMPRESSION)
+            if tile_stride != raw_stride or tstride != int(raw_tstride):
+                print(f"  -> VAE tile stride snapped to a latent boundary: "
+                      f"{raw_stride}->{tile_stride}px, {raw_tstride}->{tstride}f")
+            pipe.vae.enable_tiling(
+                tile_sample_min_height=tile,
+                tile_sample_min_width=tile,
+                tile_sample_min_num_frames=tframes,
+                tile_sample_stride_height=tile_stride,
+                tile_sample_stride_width=tile_stride,
+                tile_sample_stride_num_frames=tstride,
+            )
+            dbg(f"VAE tiling: {tile}px tiles, {tile_stride}px stride "
+                f"({tile - tile_stride}px overlap), {tframes}f/{tstride}f temporal")
+        # Temporal tiling of the decoder; composes with the spatial tiling above.
+        pipe.vae.use_framewise_decoding = True
+        pipe.vae.use_framewise_encoding = True
 
         if cancel_flag:
             raise CancellationError("Cancelled before generation.")
@@ -895,15 +938,27 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 i2v_pipe = LTX2ImageToVideoPipeline(**pipe.components)
                 # image_crf: LTX-2.5 re-compresses the conditioning image to CRF
                 # 18 by default to match training. 0 skips it and keeps the
-                # source detail; None uses the model default.
-                crf = config.get("image_crf", None)
+                # source detail.
+                #
+                # `None` does NOT mean "model default" here despite what this
+                # used to say: diffusers picks the default via
+                # resolve_default_image_crf(text_encoder), which keys off the
+                # text encoder's config.model_type -- and i2v_pipe's
+                # text_encoder is None (we never load it, on purpose, to save
+                # 23GB). That resolves to DEFAULT_IMAGE_CRF = 33, the LTX-2.3
+                # value, not this checkpoint's 18. So `None` silently
+                # over-compressed every i2v conditioning frame. Default to the
+                # correct constant explicitly instead of trusting auto-detect.
+                crf = config.get("image_crf")
+                if crf is None:
+                    crf = LTX2_5_IMAGE_CRF
                 stage1 = i2v_pipe(
                     image=input_image,
                     width=stage1_w,
                     height=stage1_h,
                     generator=generator,
                     output_type="latent" if use_upscale else "np",
-                    **({} if crf is None else {"image_crf": int(crf)}),
+                    image_crf=int(crf),
                     **stage1_schedule,
                     **stage1_guidance,
                     **length_call,
