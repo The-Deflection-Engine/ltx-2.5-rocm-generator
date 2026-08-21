@@ -206,7 +206,19 @@ Peak RAM usage is roughly 45GB — the resident 18GB transformer plus a transien
 
 ## Requirements
 
-* AMD GPU with ROCm support (developed/tested on RX 9070 XT, gfx1201)
+* **AMD GPU with ROCm support, bfloat16, and enough VRAM.** Developed and tested on exactly one card — an RX 9070 XT (gfx1201). Nothing here is architecture-specific, so other ROCm-capable AMD GPUs *should* work, but that is untested and not a promise. Two things decide it:
+
+  * **bfloat16 is a hard requirement** — the FP8 weights are upcast to bf16 in the patched linear layers, and the rest of the pipeline runs in bf16 throughout. Well supported on RDNA3/4 and CDNA; weak or emulated on older architectures.
+  * **VRAM is the binding constraint.** The fixed footprint is ~8GB before any activations, and the rest scales with `latent_frames × (H/32) × (W/32)`:
+
+  | VRAM | usable latent tokens | in practice |
+  |---|---|---|
+  | 8GB | ~0 | won't fit |
+  | 12GB | ~14,000 | short clips, low resolution only |
+  | **16GB** | ~32,000 | the tested configuration |
+  | 24GB | ~70,000 | comfortable; 2-stage + CFG together become viable |
+
+  Those figures come from a model fitted on one GPU (see [Tuning knobs](#tuning-knobs-in-ltx2_configjson)), so treat them as a guide for judging your own card rather than a specification. The GUI computes the same numbers at runtime from your reported VRAM and warns before a run that looks too large.
 * **System RAM: more than 32GB recommended; 32GB is the working minimum.** Peak usage is ~45GB, so anything comfortably above that (~48GB+) removes RAM as a constraint. 32GB works for smaller generations provided you have swap and use **🧹 Unload Models** between runs — see the RAM warning under Recommended Settings. Development happened on 128GB, but that is not a requirement.
 * Pre-quantized FP8 weights in `./local_ltx25_fp8` — built once by `quant_transformer_fp8.py`, see [First-time setup](#first-time-setup)
 * The base LTX-2.5 model directory (`./local_ltx25_model`) for the latent upsampler config used by the 2-stage upscale path
