@@ -94,7 +94,18 @@ class TextRedirector:
         # the log impossible to read or copy from while it's still writing.
         at_bottom = self.widget.yview()[1] >= 0.999
         self.widget.configure(state="normal")
-        self.widget.insert(tk.END, text)
+        # tqdm-style progress (checkpoint shards, "Loading pipeline
+        # components...", ffmpeg's encode progress) writes bare '\r' to
+        # overwrite the same line, the way a real terminal renders it. A plain
+        # insert() treats '\r' as just another character, so repeated updates
+        # piled up jammed together instead of overwriting -- this splits on
+        # '\r' and erases the current line before each subsequent part, which
+        # is what a terminal does. Text with no '\r' (the common case) takes
+        # the exact same single-insert path as before.
+        for i, part in enumerate(text.split("\r")):
+            if i > 0:
+                self.widget.delete("end-1c linestart", "end-1c")
+            self.widget.insert(tk.END, part)
         if at_bottom:
             self.widget.see(tk.END)
         self.widget.configure(state="disabled")
