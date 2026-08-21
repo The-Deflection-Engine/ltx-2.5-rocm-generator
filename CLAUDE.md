@@ -36,6 +36,21 @@ anyway. There is deliberately no GUI control for it.
 allocator holds them. `torch._C._host_emptyCache()` is what actually returns
 the ~18GB.
 
+**STG works with the distilled schedule.** `stg_scale=1.0` on the 8-step
+distilled sigmas visibly improved anatomy (finger count, hands merging) and
+object coherence (things floating unattached), despite that schedule being
+trained guidance-free. Costs one extra forward pass — 2x — but keeps the 8
+steps, so it is ~4x cheaper than CFG mode's 30 doubled steps. It uses **no
+negative prompt**: it perturbs transformer block 28 and steers away from the
+degraded prediction, so it targets structure, not prompt adherence. That is the
+answer to "can I use a negative prompt without CFG" — you can't, but STG is
+usually what was actually wanted. Caveat: one comparison, not a controlled
+measurement.
+
+**Output filenames encode guidance mode** (`_stg1`, `_cfg3`). Without that a
+same-seed A/B writes the same filename twice and the second run silently
+destroys the first — which happened before it was fixed.
+
 **Exit segfault.** Letting Python finalise after a GPU session crashes in the
 ROCm runtime (`ip == fault address`, i.e. a call into an unloaded library). The
 close handler calls `os._exit(0)`. It deliberately does *not* free models first

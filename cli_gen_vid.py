@@ -60,6 +60,8 @@ def resolve(config, args):
         config["upscale"] = args.upscale
     if args.cfg is not None:
         config["cfg_mode"] = args.cfg
+    if args.stg is not None:
+        config["stg_mode"] = args.stg
     if args.seed is not None:
         config["seed"] = args.seed
 
@@ -93,8 +95,11 @@ def summarise(config):
     _, _, vram_total = gv.hw_monitor.get_gpu_stats()
     threshold = gv.token_warn_threshold(config)
 
+    passes = 1 + (1 if config.get("cfg_mode") else 0) + (1 if config.get("stg_mode") else 0)
     print(f"  mode       : {config.get('mode', 'text2video')}"
-          f"{' + CFG quality' if config.get('cfg_mode') else ''}")
+          f"{' + CFG quality' if config.get('cfg_mode') else ''}"
+          f"{' + STG' if config.get('stg_mode') else ''}"
+          f"{f'   ({passes} passes/step)' if passes > 1 else ''}")
     print(f"  output     : {out_w}x{out_h}  ({'2-stage' if up else 'single-stage'} from {w}x{h})")
     print(f"  length     : {f} frames @ {config['fps']}fps ({f / float(config['fps']):.2f}s)")
     print(f"  seed       : {config['active_seed']}")
@@ -124,6 +129,9 @@ def main():
                     help="2-stage 2x latent upscale + refine")
     ap.add_argument("--cfg", action=argparse.BooleanOptionalAction,
                     help="CFG quality mode: better adherence, ~7-8x slower, ~2x VRAM")
+    ap.add_argument("--stg", action=argparse.BooleanOptionalAction,
+                    help="Spatio-Temporal Guidance: targets anatomy/floating objects, "
+                         "no negative prompt, ~2x slower")
     ap.add_argument("--debug", action="store_true", help="per-step timing and VRAM lines")
     ap.add_argument("--dry-run", action="store_true", help="print resolved settings and exit")
     ap.add_argument("--force", action="store_true", help="proceed past the VRAM warning")
@@ -143,6 +151,7 @@ def main():
         "mode": "text2video", "image_path": "", "auto_duration": False,
         "auto_min_seconds": 2.0, "auto_max_seconds": 5.0, "image_crf": None,
         "cfg_mode": False, "cfg_steps": 30, "cfg_scale": 3.0,
+        "stg_mode": False, "stg_scale": 1.0,
         "blocks_per_group": 4, "attention_backend": "native",
     }
     defaults.update(config)

@@ -121,6 +121,11 @@ def main():
             # CFG quality mode: much better prompt adherence, ~7-8x the compute
             # and ~2x activation VRAM. See the warning on the GUI checkbox.
             "cfg_mode": False,
+            # STG: structural guidance, no negative prompt. ~2x cost.
+            "stg_mode": False,
+            "stg_scale": 1.0,
+            # 0 = no cap on the enhanced prompt length.
+            "enhance_max_words": 0,
             "cfg_steps": 30,
             "cfg_scale": 3.0,
             "auto_min_seconds": 2.0,
@@ -337,6 +342,12 @@ def main():
             return
         img = image_path_var.get().strip() if mode_var.get() == "image2video" else ""
 
+        try:
+            max_words = int(enh_words_var.get())
+        except (ValueError, tk.TclError):
+            max_words = 0
+        max_words = max_words or None      # 0 / blank = no limit, stock behaviour
+
         btn_enhance.config(state="disabled", text="✨ Enhancing...")
 
         def work():
@@ -346,7 +357,7 @@ def main():
                 if os.path.exists(out_path):
                     os.remove(out_path)
                 print("\n--- Enhancing prompt ---")
-                run_subprocess_logged("enhance_in_subprocess", (p, img, out_path))
+                run_subprocess_logged("enhance_in_subprocess", (p, img, out_path, max_words))
                 if not os.path.exists(out_path):
                     raise RuntimeError("Enhancement failed -- see the output above.")
                 with open(out_path) as f:
@@ -371,6 +382,21 @@ def main():
 
     btn_enhance = ttk.Button(enhance_row, text="✨ Enhance Now", command=enhance_now)
     btn_enhance.pack(side=tk.RIGHT)
+
+    # Length cap for the enhancer. 0 = stock behaviour (it writes until done,
+    # typically 120-160 words).
+    enh_words_var = tk.StringVar(value=str(config.get("enhance_max_words", 0)))
+    ttk.Spinbox(enhance_row, from_=0, to=200, increment=10, width=4,
+                textvariable=enh_words_var).pack(side=tk.RIGHT, padx=(6, 6))
+    lbl_enh_words = ttk.Label(enhance_row, text="max words:", foreground="#666666")
+    lbl_enh_words.pack(side=tk.RIGHT)
+    tooltip(lbl_enh_words,
+            "Cap the enhanced prompt's length. 0 = no limit (stock LTX-2.5\n"
+            "behaviour, usually 120-160 words).\n\n"
+            "The verbosity is deliberate -- LTX-2.5 was trained on exhaustive\n"
+            "captions, so trimming may cost some adherence. The limit asks the\n"
+            "model to drop background and ambience first, never the subject,\n"
+            "its action, or the camera.")
     tooltip(btn_enhance,
             "Rewrite the prompt above into the long, detailed caption style\n"
             "LTX-2.5 was trained on, using Gemma-4.\n\n"
@@ -542,6 +568,64 @@ def main():
     )
     chk_cfg.pack(pady=(5, 0))
     update_np_label()   # reflect the restored cfg_mode setting at startup
+
+    # --- Spatio-Temporal Guidance ---
+    # Unlike CFG this uses no negative prompt: it perturbs a transformer block
+    # and steers away from the degraded result, which targets anatomy and
+    # object coherence rather than prompt adherence. Also always starts off.
+    stg_var = tk.BooleanVar(value=False)
+
+    def on_stg_toggle():
+        eng_scale = config.get("stg_scale", 1.0)
+        if not stg_var.get():
+            return
+        if not messagebox.askokcancel(
+            "Spatio-Temporal Guidance",
+            "STG targets structural problems -- duplicated limbs, objects that "
+            "float free of the scene -- by running a second pass with one "
+            "transformer block perturbed and steering away from that result.\n\n"
+            "It uses NO negative prompt. It steers on structure, not text.\n\n"
+            "COST: one extra pass per step, so roughly 2x the time and VRAM. "
+            "That is about 4x cheaper than CFG quality mode, because it keeps "
+            "the 8-step distilled schedule instead of needing 30 steps.\n\n"
+            f"Tried on this setup and it visibly improved anatomy and object "
+            f"coherence at the default strength of 1.0 -- that was one "
+            f"comparison, not a controlled measurement, so judge it on your own "
+            f"prompts.\n\n"
+            f"If the result looks over-sharpened or contrasty rather than "
+            f"better formed, lower the strength beside the checkbox "
+            f"(currently {eng_scale}).\n\n"
+            "Enable it?",
+        ):
+            stg_var.set(False)
+
+    stg_row = ttk.Frame(res_frame)
+    stg_row.pack(pady=(5, 0))
+    chk_stg = ttk.Checkbutton(
+        stg_row,
+        text="STG: fix anatomy / floating objects",
+        variable=stg_var,
+        command=on_stg_toggle,
+    )
+    chk_stg.pack(side=tk.LEFT)
+
+    # Exposed in the GUI, unlike cfg_scale, because STG is untested against the
+    # distilled schedule and lowering this is the documented first fix. Editing
+    # it in the config instead would mean a restart -- and a restart drops the
+    # resident pipeline, so each attempt would cost an 18GB reload.
+    stg_scale_var = tk.StringVar(value=str(config.get("stg_scale", 1.0)))
+    ttk.Spinbox(stg_row, from_=0.0, to=3.0, increment=0.25, width=5,
+                textvariable=stg_scale_var, format="%.2f").pack(side=tk.LEFT, padx=(6, 0))
+    tooltip(chk_stg,
+            "Spatio-Temporal Guidance. Perturbs one transformer block and\n"
+            "steers away from the degraded prediction -- aimed at duplicated\n"
+            "limbs and objects not attached to the scene.\n\n"
+            "Uses NO negative prompt; it steers on structure, not text.\n\n"
+            "~2x time and VRAM (one extra pass per step), but keeps the 8-step\n"
+            "distilled schedule -- roughly 4x cheaper than CFG quality mode.\n\n"
+            "Tried here and it visibly helped at strength 1.0. The box beside\n"
+            "it is the strength; drop to 0.5 if output looks over-sharpened or\n"
+            "contrasty rather than better formed.")
     tooltip(chk_cfg,
             "Runs the transformer twice per step and pushes away from the\n"
             "negative prompt -- the standard way to force prompt adherence.\n\n"
@@ -797,6 +881,9 @@ def main():
                 'image_path': image_path_var.get().strip(),
                 'auto_duration': auto_dur_var.get(),
                 'cfg_mode': cfg_var.get(),
+                'stg_mode': stg_var.get(),
+                'stg_scale': float(stg_scale_var.get() or 1.0),
+                'enhance_max_words': max(0, int(enh_words_var.get() or 0)),
                 'auto_max_seconds': auto_max_val,
             })
             save_config(config)
@@ -904,6 +991,18 @@ def main():
                 stream.flush()
             except Exception:
                 pass
+        # Also skipped with atexit: multiprocessing's own cleanup, which reaps
+        # child processes and unlinks the semaphores they registered. Without
+        # it the resource_tracker complains on the way out:
+        #     UserWarning: resource_tracker: There appear to be 1 leaked
+        #     semaphore objects to clean up at shutdown
+        # This is only mp bookkeeping -- no model or GPU teardown -- so it stays
+        # cheap and closing stays instant.
+        try:
+            import multiprocessing.util
+            multiprocessing.util._exit_function()
+        except Exception:
+            pass
         os._exit(0)
 
     root.protocol("WM_DELETE_WINDOW", on_close)

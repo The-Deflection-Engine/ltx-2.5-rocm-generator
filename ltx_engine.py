@@ -328,7 +328,7 @@ def _embed_cache_key(model_path, p, np_text, need_negative):
     return h.hexdigest()
 
 
-def _enhance_prompt_inproc(torch, p, image_path):
+def _enhance_prompt_inproc(torch, p, image_path, max_words=None):
     """Run the Gemma-4 prompt enhancer. Always called inside a throwaway
     subprocess so the ~10GB enhancer never coexists with the transformer.
 
@@ -359,6 +359,22 @@ def _enhance_prompt_inproc(torch, p, image_path):
 
     system_prompt = LTX2_5_I2V_DEFAULT_SYSTEM_PROMPT if image is not None else LTX2_5_T2V_DEFAULT_SYSTEM_PROMPT
 
+    # The stock system prompt asks for an "exhaustive and lossless" caption --
+    # that verbosity is deliberate, because LTX-2.5 was trained on captions in
+    # that style. Capping `max_new_tokens` instead would just truncate a
+    # sentence mid-clause, so constrain it in the instructions and let the model
+    # decide what to drop. Appended rather than replacing, to keep the trained
+    # style intact.
+    if max_words:
+        system_prompt += (
+            f"\n\nLENGTH LIMIT: the caption must be no more than {max_words} words. "
+            "Stay within it by cutting background scenery, secondary objects and "
+            "incidental ambience -- never the subject, its action, the camera "
+            "movement, or anything the user explicitly asked for. Prefer one "
+            "precise adjective to three vague ones. Still one continuous "
+            "paragraph, same style."
+        )
+
     def run(device):
         with torch.no_grad():
             return pipe_text.enhance_prompt(
@@ -384,11 +400,11 @@ def _enhance_prompt_inproc(torch, p, image_path):
     return enhanced
 
 
-def enhance_in_subprocess(p, image_path, out_path):
+def enhance_in_subprocess(p, image_path, out_path, max_words=None):
     """Subprocess target for the standalone '✨ Enhance Now' button."""
     import torch
     with open(out_path, "w") as f:
-        f.write(_enhance_prompt_inproc(torch, p, image_path))
+        f.write(_enhance_prompt_inproc(torch, p, image_path, max_words))
 
 
 def encode_in_subprocess(model_path, p, np_text, need_negative, out_path):
@@ -583,21 +599,55 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         cfg_steps = max(8, int(config.get("cfg_steps", 30)))
         cfg_scale = float(config.get("cfg_scale", 3.0))
 
+        # --- Spatio-Temporal Guidance ----------------------------------------
+        # STG runs a second pass with one transformer block perturbed and pushes
+        # away from that degraded prediction. Unlike CFG it uses NO negative
+        # prompt -- it steers on structure, not text -- so it targets duplicated
+        # limbs and objects that float free of the scene rather than prompt
+        # adherence. One extra pass, i.e. 2x, and it works with the 8-step
+        # distilled schedule, making it ~4x cheaper than CFG mode.
+        #
+        # It does work with the distilled sigmas despite those being trained
+        # guidance-free -- tried at stg_scale 1.0 and it visibly improved
+        # anatomy and object coherence. One comparison, not a controlled
+        # measurement. If output looks over-sharpened rather than better
+        # formed, lower stg_scale before abandoning it.
+        use_stg = bool(config.get("stg_mode"))
+        stg_scale = float(config.get("stg_scale", 1.0))
+        stg_blocks = config.get("stg_blocks") or [28]
+
         if use_cfg:
             stage1_guidance = dict(
                 guidance_scale=cfg_scale,
                 audio_guidance_scale=cfg_scale,
-                stg_scale=0.0,          # STG is a third forward pass; not worth it here
+                # STG on top of CFG would be a third pass per step. Allowed, but
+                # it is the user asking for it explicitly.
+                stg_scale=stg_scale if use_stg else 0.0,
                 audio_stg_scale=0.0,
                 modality_scale=1.0,
                 audio_modality_scale=1.0,
             )
             stage1_schedule = dict(num_inference_steps=cfg_steps)
             need_negative = True        # the negative prompt is finally encoded and used
+        elif use_stg:
+            # Distilled schedule kept -- only the extra perturbed pass is added.
+            stage1_guidance = dict(
+                guidance_scale=1.0,     # CFG stays off: no negative prompt involved
+                audio_guidance_scale=1.0,
+                stg_scale=stg_scale,
+                audio_stg_scale=0.0,
+                modality_scale=1.0,
+                audio_modality_scale=1.0,
+            )
+            stage1_schedule = dict(sigmas=DISTILLED_SIGMA_VALUES)
+            need_negative = False
         else:
             stage1_guidance = distilled_guidance
             stage1_schedule = dict(sigmas=DISTILLED_SIGMA_VALUES)
             need_negative = False       # CFG off => negative branch is never evaluated
+
+        if use_stg:
+            stage1_guidance["spatio_temporal_guidance_blocks"] = stg_blocks
 
         stage1_w, stage1_h = int(config["width"]), int(config["height"])
         out_w, out_h = (stage1_w * 2, stage1_h * 2) if use_upscale else (stage1_w, stage1_h)
@@ -794,6 +844,12 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         dbg(f"seq={_lat_f * (stage1_h // 32) * (stage1_w // 32):,} tokens "
             f"(latent {_lat_f}x{stage1_h // 32}x{stage1_w // 32}), "
             f"blocks_per_group={config.get('blocks_per_group', 4)}, seed={config['active_seed']}")
+        _passes = 1 + (1 if use_cfg else 0) + (1 if use_stg else 0)
+        dbg(f"guidance: CFG {'on' if use_cfg else 'off'}"
+            f"{f' (scale {cfg_scale})' if use_cfg else ''}, "
+            f"STG {'on' if use_stg else 'off'}"
+            f"{f' (scale {stg_scale}, blocks {stg_blocks})' if use_stg else ''} "
+            f"-> {_passes} transformer pass{'es' if _passes > 1 else ''} per step")
 
         steps_done = [0]
         last_step_at = [generation_start_time]
@@ -945,7 +1001,16 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         final_frames = len(video[0])
         if use_auto_duration:
             print(f"  --> Auto Duration produced {final_frames} frames ({final_frames / float(config['fps']):.2f}s).")
-        output_file = f"output_{mode_tag}{out_w}x{out_h}_{final_frames}f_seed{config['active_seed']}.mp4"
+        # Guidance mode goes in the name: without it a same-seed A/B (STG on
+        # vs off) writes the identical filename and the second run silently
+        # overwrites the first -- destroying the comparison being made.
+        guide_tag = ""
+        if use_cfg:
+            guide_tag += f"_cfg{cfg_scale:g}"
+        if use_stg:
+            guide_tag += f"_stg{stg_scale:g}"
+        output_file = (f"output_{mode_tag}{out_w}x{out_h}_{final_frames}f"
+                       f"_seed{config['active_seed']}{guide_tag}.mp4")
         sample_rate = 24000
         if getattr(pipe, "vocoder", None) is not None:
             sample_rate = getattr(pipe.vocoder.config, "output_sampling_rate", 24000)
