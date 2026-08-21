@@ -956,24 +956,15 @@ def main():
         btn_cancel.config(state="disabled")
         print("\n[!] Cancelling... waiting for current step to yield.")
 
-    btn_generate = ttk.Button(btn_frame, text="🚀 Generate Video", command=start_generation)
-    btn_generate.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8, padx=(0, 4))
-    tooltip(btn_generate,
-            "Render with the settings above. Progress streams into the log.\n\n"
-            "First run of a session reloads ~18GB from disk; later runs reuse\n"
-            "the resident pipeline. A warning appears first if the sequence is\n"
-            "large enough to risk exhausting VRAM.")
-    
-    btn_cancel = ttk.Button(btn_frame, text="🛑 Cancel", command=cancel_generation, state="disabled")
-    btn_cancel.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8, padx=(4, 4))
-    tooltip(btn_cancel,
-            "Stop cleanly at the end of the current diffusion step.\n"
-            "Models stay resident, so the next run starts immediately.")
+    # Utility controls (Unload, Debug) on the left; primary actions (Cancel,
+    # Generate) on the right, Generate flush against the right edge -- the
+    # "submit button bottom-right" convention users expect, rather than the
+    # old left-aligned Generate/Cancel with Unload stranded on the far right.
 
     # Models stay resident in RAM between runs (18GB transformer + 1.8GB decoders).
     # With RAM to spare that is free speed; this button gives it back if needed.
     btn_free = ttk.Button(btn_frame, text="🧹 Unload Models (~18GB)", command=free_resident_models)
-    btn_free.pack(side=tk.RIGHT, ipady=8, padx=(4, 0))
+    btn_free.pack(side=tk.LEFT, ipady=8, padx=(0, 4))
     tooltip(btn_free,
             "Drop the resident pipeline and hand back ~18GB of RAM.\n"
             "The next run reloads from disk (one slow generation).\n\n"
@@ -991,7 +982,21 @@ def main():
     debug_var = tk.BooleanVar(value=False)
     chk_debug = ttk.Checkbutton(btn_frame, text="🐞 Debug", variable=debug_var,
                                 command=on_debug_toggle)
-    chk_debug.pack(side=tk.RIGHT, padx=(8, 0))
+    chk_debug.pack(side=tk.LEFT, padx=(0, 8))
+
+    btn_generate = ttk.Button(btn_frame, text="🚀 Generate Video", command=start_generation)
+    btn_generate.pack(side=tk.RIGHT, fill=tk.X, expand=True, ipady=8, padx=(4, 0))
+    tooltip(btn_generate,
+            "Render with the settings above. Progress streams into the log.\n\n"
+            "First run of a session reloads ~18GB from disk; later runs reuse\n"
+            "the resident pipeline. A warning appears first if the sequence is\n"
+            "large enough to risk exhausting VRAM.")
+
+    btn_cancel = ttk.Button(btn_frame, text="🛑 Cancel", command=cancel_generation, state="disabled")
+    btn_cancel.pack(side=tk.RIGHT, fill=tk.X, expand=True, ipady=8, padx=(4, 4))
+    tooltip(btn_cancel,
+            "Stop cleanly at the end of the current diffusion step.\n"
+            "Models stay resident, so the next run starts immediately.")
     tooltip(chk_debug,
             "Per-step timing, latent geometry, token count and a VRAM/RAM\n"
             "reading on every line, plus diffusers' own offload and tiling\n"
