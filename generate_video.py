@@ -15,7 +15,6 @@ import ltx_engine as eng
 # them, so they must be touched as eng.<name> or the two modules would end up
 # with independent copies.
 from ltx_engine import (
-    AUTO_DURATION_CAP_S,
     CONFIG_FILE,
     EMBED_CACHE_DIR,
     ENHANCER_PATH,
@@ -24,6 +23,7 @@ from ltx_engine import (
     VRAM_BASE_GB,
     VRAM_GB_PER_TOKEN,
     align_frames,
+    auto_duration_cap_s,
     free_resident_models,
     generation_worker,
     guidance_pass_count,
@@ -131,7 +131,7 @@ def main():
             "mode": "text2video",
             "image_path": "",
             # Auto Duration: let the model pick clip length from the prompt.
-            # Capped at AUTO_DURATION_CAP_S regardless of what's set here.
+            # Capped by auto_duration_cap_s() regardless of what's set here.
             "auto_duration": False,
             # CFG quality mode: much better prompt adherence, ~7-8x the compute
             # and ~2x activation VRAM. See the warning on the GUI checkbox.
@@ -301,6 +301,9 @@ def main():
     main_frame.pack(fill=tk.BOTH, expand=True)
     
     # --- Generation mode ---
+    # Unload Models sits inside this box, at the right of the mode row -- not
+    # among the Generate/Cancel buttons at the bottom, where it used to be one
+    # misplaced click away from Generate and cost an 18GB reload.
     mode_frame = ttk.LabelFrame(main_frame, text=" Generation Mode ", padding="8")
     mode_frame.pack(fill=tk.X, pady=(0, 12))
 
@@ -311,6 +314,22 @@ def main():
     mode_row.pack(fill=tk.X)
     ttk.Radiobutton(mode_row, text="Text → Video", variable=mode_var, value="text2video").pack(side=tk.LEFT)
     ttk.Radiobutton(mode_row, text="Image → Video", variable=mode_var, value="image2video").pack(side=tk.LEFT, padx=(12, 0))
+
+    def unload_models():
+        if messagebox.askokcancel(
+            "Unload Models",
+            "Drop the resident pipeline and hand back ~18GB of RAM?\n\n"
+            "The next run reloads everything from disk -- one slow generation."
+        ):
+            free_resident_models()
+
+    btn_free = ttk.Button(mode_row, text="🧹 Unload Models", command=unload_models)
+    btn_free.pack(side=tk.RIGHT)
+    tooltip(btn_free,
+            "Drop the resident pipeline and hand back ~18GB of RAM.\n"
+            "The next run reloads from disk (one slow generation).\n\n"
+            "Usually unnecessary -- VRAM is freed automatically after every "
+            "run. Use this when you need the RAM for something else.")
 
     image_row = ttk.Frame(mode_frame)
     image_row.pack(fill=tk.X, pady=(6, 0))
@@ -517,8 +536,12 @@ def main():
     entry_h.pack(side=tk.LEFT, padx=(2, 0))
     entry_h.insert(0, str(config['height']))
 
-    # The Restored Upscaler Checkbox
-    upscale_var = tk.BooleanVar(value=config.get('upscale', False))
+    # Always starts OFF, deliberately not restored from the config -- same
+    # reasoning as cfg_var below: 2-stage upscale roughly doubles VRAM
+    # pressure and once locked up the whole machine (see commit 740bc65), so
+    # it should be a decision made for this run, not something a previous
+    # session silently leaves armed.
+    upscale_var = tk.BooleanVar(value=False)
     chk_upscale = ttk.Checkbutton(
         res_frame,
         text="2-stage: 2x latent upscale + refine",
@@ -742,31 +765,55 @@ def main():
     entry_fps.bind("<KeyRelease>", on_fps_typing)
     entry_len.bind("<KeyRelease>", on_len_typing)
 
-    # Auto Duration: model picks the length, capped for VRAM safety.
+    # Auto Duration: model picks the length, capped for VRAM safety. The cap
+    # depends on resolution/upscale/guidance mode, so it's recomputed from the
+    # live form values rather than a single fixed number for one card.
     auto_dur_var = tk.BooleanVar(value=config.get("auto_duration", False))
+
+    def current_auto_cap():
+        try:
+            w, h = int(entry_w.get()), int(entry_h.get())
+            fps = float(entry_fps.get())
+        except (ValueError, tk.TclError):
+            return config.get("auto_max_seconds", 5.0)
+        return auto_duration_cap_s(w, h, upscale_var.get(), cfg_var.get(),
+                                   stg_var.get(), fps,
+                                   config.get("cfg_modality_scale", 1.0))
+
+    def refresh_auto_cap_label(_event=None):
+        chk_auto.config(text=f"Auto Duration (max {current_auto_cap():.0f}s)")
 
     def on_auto_toggle():
         on_auto = auto_dur_var.get()
         entry_len.config(state="disabled" if on_auto else "normal")
         if on_auto:
+            refresh_auto_cap_label()
             lbl_auto_max.pack(side=tk.LEFT)
             entry_auto_max.pack(side=tk.LEFT, padx=(2, 0))
         else:
             lbl_auto_max.pack_forget()
             entry_auto_max.pack_forget()
 
-    ttk.Checkbutton(
+    chk_auto = ttk.Checkbutton(
         time_frame,
-        text=f"Auto Duration (max {AUTO_DURATION_CAP_S:.0f}s)",
+        text="Auto Duration",
         variable=auto_dur_var,
         command=on_auto_toggle,
-    ).pack(anchor=tk.W, pady=(6, 0))
+    )
+    chk_auto.pack(anchor=tk.W, pady=(6, 0))
+    entry_w.bind("<KeyRelease>", refresh_auto_cap_label, add="+")
+    entry_h.bind("<KeyRelease>", refresh_auto_cap_label, add="+")
+    entry_fps.bind("<KeyRelease>", refresh_auto_cap_label, add="+")
+    chk_upscale.config(command=lambda: (update_output_label(), refresh_auto_cap_label()))
+    chk_cfg.config(command=lambda: (on_cfg_toggle(), refresh_auto_cap_label()))
+    chk_stg.config(command=lambda: (on_stg_toggle(), refresh_auto_cap_label()))
 
     auto_row = ttk.Frame(time_frame)
     auto_row.pack(anchor=tk.W, pady=(2, 0))
     lbl_auto_max = ttk.Label(auto_row, text="max s:")
     entry_auto_max = ttk.Entry(auto_row, width=4)
     entry_auto_max.insert(0, str(config.get("auto_max_seconds", 5.0)))
+    refresh_auto_cap_label()
     on_auto_toggle()
     
     seed_frame = ttk.Frame(main_frame)
@@ -869,10 +916,13 @@ def main():
             s_val = entry_seed.get().strip().lower()
             active_seed = random.randint(0, 2**32 - 1) if s_val == 'r' else int(s_val)
 
+            auto_cap = auto_duration_cap_s(w_adj, h_adj, upscale_var.get(), cfg_var.get(),
+                                          stg_var.get(), fps,
+                                          config.get("cfg_modality_scale", 1.0))
             try:
-                auto_max_val = min(float(entry_auto_max.get()), AUTO_DURATION_CAP_S)
+                auto_max_val = min(float(entry_auto_max.get()), auto_cap)
             except ValueError:
-                auto_max_val = AUTO_DURATION_CAP_S
+                auto_max_val = auto_cap
 
             # VRAM sanity check. Transformer sequence length is
             # latent_frames * (H/32) * (W/32), and the threshold now scales with
@@ -968,21 +1018,10 @@ def main():
         btn_cancel.config(state="disabled")
         print("\n[!] Cancelling... waiting for current step to yield.")
 
-    # Utility controls (Unload, Debug) on the left; primary actions (Cancel,
-    # Generate) on the right, Generate flush against the right edge -- the
-    # "submit button bottom-right" convention users expect, rather than the
-    # old left-aligned Generate/Cancel with Unload stranded on the far right.
-
-    # Models stay resident in RAM between runs (18GB transformer + 1.8GB decoders).
-    # With RAM to spare that is free speed; this button gives it back if needed.
-    btn_free = ttk.Button(btn_frame, text="🧹 Unload Models (~18GB)", command=free_resident_models)
-    btn_free.pack(side=tk.LEFT, ipady=8, padx=(0, 4))
-    tooltip(btn_free,
-            "Drop the resident pipeline and hand back ~18GB of RAM.\n"
-            "The next run reloads from disk (one slow generation).\n\n"
-            "Rarely needed: VRAM is already freed after every run, and\n"
-            "changing an offload setting rebuilds by itself. Use it to\n"
-            "free the machine for other work, or on a 32GB system.")
+    # Utility controls (Debug) on the left; primary actions (Cancel, Generate)
+    # on the right, Generate flush against the right edge -- the "submit
+    # button bottom-right" convention users expect. Unload Models lives next
+    # to Generation Mode instead, away from this row entirely.
 
     def on_debug_toggle():
         eng.debug_flag = debug_var.get()

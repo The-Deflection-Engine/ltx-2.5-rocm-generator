@@ -60,9 +60,11 @@ EMBED_CACHE_DIR = os.path.abspath("./.embed_cache")
 # `processor` as nulls, so the enhancer is a separate download.
 ENHANCER_PATH = os.path.abspath("./local_ltx25_enhancer")
 
-# Auto Duration can predict up to 20s; at these resolutions that is far past
-# what 16GB of VRAM survives. Hard ceiling on what the model is allowed to pick.
-AUTO_DURATION_CAP_S = 6.0
+# Auto Duration's duration_head can predict up to 20s -- that's a property of
+# the head itself, not the hardware. What the *card* survives depends on
+# resolution and VRAM, so the actual cap is computed per-run below rather than
+# fixed at whatever was safe on one 16GB card at one resolution.
+AUTO_DURATION_HARD_CEILING_S = 20.0
 
 # From the VAE config: spatial_compression_ratio 32, temporal_compression_ratio 8.
 # Width/height must be multiples of 32; frame counts must satisfy 8k + 1.
@@ -84,6 +86,7 @@ MIN_DIMENSION = 256
 # calibrated guess, not physics. Both numbers are overridable in
 # ltx2_config.json, and `token_warn_threshold` overrides the result outright.
 VRAM_BASE_GB = 7.68
+FIT_DESKTOP_BASELINE_GB = 0.54  # desktop compositor's idle share on the fit machine
 VRAM_GB_PER_TOKEN = 1.814e-4
 VRAM_HEADROOM = 0.85          # leave 15% for spikes the steady state misses
 TOKEN_WARN_FALLBACK = 30000   # if VRAM can't be read: the measured 16GB value
@@ -91,16 +94,43 @@ TOKEN_WARN_FALLBACK = 30000   # if VRAM can't be read: the measured 16GB value
 
 def token_warn_threshold(config=None):
     """Latent-token count above which to warn, scaled to the card actually
-    present. Falls back to the measured 16GB figure if VRAM is unreadable."""
+    present. VRAM_BASE_GB's fixed intercept assumed ~0.54GB of desktop
+    compositor usage (the one machine this was fitted on). `hw_monitor`
+    samples actual VRAM use at import time -- before any model is ever loaded
+    -- as DESKTOP_BASELINE_GB, so a heavier desktop at launch (more windows,
+    more monitors) than the fit machine had subtracts extra headroom instead
+    of being silently absorbed. It can't be resampled live during a session:
+    the model stays VRAM-resident across generations (see _MODEL_CACHE), so a
+    live reading after the first run would double-count the resident weights
+    that VRAM_BASE_GB already accounts for. Falls back to the measured 16GB
+    figure if VRAM is unreadable."""
     if config and config.get("token_warn_threshold"):
         return int(config["token_warn_threshold"])
     _, _, vram_total = hw_monitor.get_gpu_stats()
     if not vram_total:
         return TOKEN_WARN_FALLBACK
-    tokens = (vram_total * VRAM_HEADROOM - VRAM_BASE_GB) / VRAM_GB_PER_TOKEN
+    extra_desktop_gb = max(0.0, hw_monitor.desktop_baseline_gb - FIT_DESKTOP_BASELINE_GB)
+    tokens = (vram_total * VRAM_HEADROOM - VRAM_BASE_GB - extra_desktop_gb) / VRAM_GB_PER_TOKEN
     # A card too small to hold the base footprint gets the floor, not a
     # negative threshold -- it will warn on essentially everything, correctly.
     return max(2000, int(tokens))
+
+
+def auto_duration_cap_s(width, height, upscale, cfg_mode, stg_mode, fps,
+                        cfg_modality_scale=1.0, config=None):
+    """Longest clip Auto Duration may pick at this resolution/guidance mode
+    without exceeding token_warn_threshold() on the card actually present --
+    replaces a flat seconds figure that was only ever valid for one 16GB card
+    at one resolution."""
+    threshold = token_warn_threshold(config)
+    passes = guidance_pass_count(cfg_mode, stg_mode, cfg_modality_scale)
+    scale = 2 if upscale else 1
+    tokens_per_frame = ((height * scale) // 32) * ((width * scale) // 32)
+    if tokens_per_frame <= 0 or passes <= 0:
+        return AUTO_DURATION_HARD_CEILING_S
+    lat_f_max = max(1, int(threshold / passes / tokens_per_frame))
+    frames_max = (lat_f_max - 1) * 8 + 1
+    return min(AUTO_DURATION_HARD_CEILING_S, frames_max / float(fps))
 
 # --- Process-lifetime caches -------------------------------------------------
 # Peak RAM use is ~45GB, so on anything comfortably above that there is no
@@ -173,6 +203,11 @@ class LinuxHardwareMonitor:
                 except Exception:
                     pass
         self.get_cpu_stats()
+        # Sampled here, before any model is ever loaded, so it's whatever the
+        # desktop itself holds -- compositor, open windows, monitor count --
+        # not the pipeline's own footprint. See token_warn_threshold().
+        _, desktop_used, _ = self.get_gpu_stats()
+        self.desktop_baseline_gb = desktop_used or 0.0
 
     def get_cpu_stats(self):
         try:
@@ -727,11 +762,14 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
 
         # Auto Duration: with a `duration_head` present the model predicts clip
         # length from the prompt when `num_frames` is omitted. Left unbounded it
-        # will happily pick up to 20s, which no 16GB card survives at these
-        # resolutions -- so max_seconds is clamped hard (see AUTO_DURATION_CAP_S).
+        # will happily pick up to 20s -- clamp to whatever this card actually
+        # survives at this resolution/guidance mode (see auto_duration_cap_s()).
         want_auto_duration = bool(config.get("auto_duration"))
+        auto_cap_s = auto_duration_cap_s(
+            stage1_w, stage1_h, use_upscale, use_cfg, use_stg,
+            float(config["fps"]), cfg_modality_scale, config)
         auto_min_s = float(config.get("auto_min_seconds", 2.0))
-        auto_max_s = min(float(config.get("auto_max_seconds", 5.0)), AUTO_DURATION_CAP_S)
+        auto_max_s = min(float(config.get("auto_max_seconds", 5.0)), auto_cap_s)
         auto_min_s = min(auto_min_s, auto_max_s - 0.1)
 
         total_steps = (cfg_steps if use_cfg else len(DISTILLED_SIGMA_VALUES)) \

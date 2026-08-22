@@ -93,7 +93,10 @@ def summarise(config):
     # actually runs -- size the token/VRAM estimate against the worst case it's
     # allowed to pick instead, same as the GUI's pre-flight check does.
     if config.get("auto_duration"):
-        auto_max = min(float(config.get("auto_max_seconds", 5.0)), gv.AUTO_DURATION_CAP_S)
+        auto_cap = gv.auto_duration_cap_s(
+            w, h, up, config.get("cfg_mode"), config.get("stg_mode"),
+            float(config["fps"]), config.get("cfg_modality_scale", 1.0), config)
+        auto_max = min(float(config.get("auto_max_seconds", 5.0)), auto_cap)
         check_frames = int(auto_max * float(config["fps"]))
     else:
         check_frames = f
