@@ -24,7 +24,7 @@ even with MIOpen's perf database populated. Do not re-add it.
 Bigger tiles are dramatically worse (1024px was 26x slower and peaked at
 15.03GB), smaller are worse too (256px was 4.5x slower). Peak VRAM tracks the
 *largest single tile*, not the tile count. Strides must land on a latent
-boundary (spatial 32, temporal 8) — a ragged stride cost 3x. `bench_vae_tiles.py`
+boundary (spatial 32, temporal 8) — a ragged stride cost 3x. `benchmarks/bench_vae_tiles.py`
 reproduces all of this.
 
 **`blocks_per_group` is inert** while `use_stream=True` — diffusers forces the

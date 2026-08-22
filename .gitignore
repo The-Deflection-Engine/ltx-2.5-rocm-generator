@@ -8,8 +8,10 @@
 !quant_transformer_fp8.py
 !cli_gen_vid.py
 !ltx_engine.py
-!bench_vae_tiles.py
 !CLAUDE.md
+
+# Benchmark/measurement scripts, same reasoning as tests/ above.
+!benchmarks/
 
 # Test harness lives in its own directory; /* only matches root entries, so
 # un-ignoring the directory is enough to include what is inside it.

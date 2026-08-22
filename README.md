@@ -27,7 +27,7 @@ It keeps the FP8 model resident in memory between generations, runs the distille
 | `generate_video.py` | Tk control panel — imports the engine. |
 | `cli_gen_vid.py` | Headless CLI — imports the engine. Needs no `tkinter`. |
 | `quant_transformer_fp8.py` | One-time FP8 conversion, see [First-time setup](#first-time-setup). |
-| `bench_vae_tiles.py` | VAE decode timing harness, see [VAE tile geometry](#vae-tile-geometry--measured-dont-guess). |
+| `benchmarks/bench_vae_tiles.py` | VAE decode timing harness, see [VAE tile geometry](#vae-tile-geometry--measured-dont-guess). |
 
 Both front-ends share the same `ltx2_config.json` and the same pipeline, so a fix/change in one reaches both.
 
@@ -162,7 +162,7 @@ Both `blocks_per_group` and `attention_backend` are baked into the pipeline when
 
 #### VAE tile geometry — measured, don't guess
 
-Decoding 1536x1024 x 49 frames on an RX 9070 XT, timing only the VAE (`bench_vae_tiles.py`):
+Decoding 1536x1024 x 49 frames on an RX 9070 XT, timing only the VAE (`benchmarks/bench_vae_tiles.py`):
 
 | spatial | temporal | tile decodes | time | peak VRAM |
 |---|---|---|---|---|

@@ -6,7 +6,7 @@ knob on it: bigger tiles mean fewer overlap-blend passes, at the cost of VRAM an
 ring-timeout headroom. This decodes a latent of the real post-upscale shape and
 reports time + peak VRAM per configuration.
 
-    python bench_vae_tiles.py [--frames N] [--configs 512,768,1024]
+    python benchmarks/bench_vae_tiles.py [--frames N] [--configs 512,768,1024]
 """
 import argparse
 import os
