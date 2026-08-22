@@ -1,6 +1,8 @@
 
 # 🎬 LTX-2.5 ROCm Video Generator
 
+**v0.1.0** — shown in the GUI title bar and via `python cli_gen_vid.py --version`.
+
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/S6I125FYNB)
 
 *An unashamed joint programming collaboration between a human and AI.*

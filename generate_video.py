@@ -192,7 +192,7 @@ def main():
     config = load_saved_config()
     
     root = tk.Tk()
-    root.title("🎬 LTX-2.5 Control Panel")
+    root.title(f"🎬 LTX-2.5 Control Panel v{eng.__version__}")
     # Opening size: 1080 tall pays for the 7-row prompt box (Arial-10 is 16px
     # per row). Resizable both ways; spare height goes to the log pane, the only
     # widget packed with expand=True, and spare width to everything on fill=X.

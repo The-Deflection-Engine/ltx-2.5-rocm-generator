@@ -156,6 +156,7 @@ def summarise(config):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=f"%(prog)s {gv.__version__}")
     ap.add_argument("--config", default=gv.CONFIG_FILE, help="settings file (default: %(default)s)")
     ap.add_argument("--prompt")
     ap.add_argument("--negative")
