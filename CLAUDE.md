@@ -72,6 +72,35 @@ the GPU. A reading of 15.58GB once turned out to include 2.38GB from an
 unrelated benchmark and made a healthy run look like a 98% near-miss. Use
 `torch.cuda.max_memory_reserved()` (process-local) for anything load-bearing.
 
+**Dual-boot layout, for the planned WSL2 port.** This box has three NVMes:
+`nvme0n1` (this native Linux install, ext4, `/`), `nvme1n1` (Windows boot,
+NTFS), `nvme2n1p2` (shared exFAT, labeled "Data Only", not mounted from
+Linux by default). exFAT is the intentional choice for the shared drive --
+both OSes read/write it natively; NTFS-from-Linux and ext4-from-Windows are
+both worse options.
+
+When setting up the WSL2 environment: clone the repo into WSL2's native
+ext4 filesystem, not onto the exFAT drive (`/mnt/<drive>/...`) -- exFAT has
+no Unix permissions and no real symlink support, and `live-ver` (see below)
+is built entirely out of symlinks. Model checkpoints are large enough to be
+worth sharing rather than re-downloading -- put them on the exFAT drive
+once and symlink to them from WSL2's ext4; that's fine because only the
+symlink's *target* crosses onto exFAT, not the symlink itself.
+
+GPU access under WSL2 is a different mechanism from this native install,
+not a repeat of it: WSL2 doesn't load the Linux `amdgpu` kernel driver at
+all, it goes through the *Windows* GPU driver via paravirtualization. So
+the Windows-side driver needs WSL/ROCm compute support installed, not a
+second native ROCm kernel-module install inside WSL2. Unverified: whether
+gfx1201 (RX 9070 XT) is on AMD's current WSL2 support matrix -- check before
+sinking time in.
+
+`LinuxHardwareMonitor` (`/sys/class/drm`, `/proc/stat`, `/proc/meminfo`)
+will need a rewrite for native Windows but should keep working unmodified
+under WSL2, since WSL2 provides its own Linux-style `/proc` and `/sys`.
+Untested which of the AMD sysfs GPU attributes (`gpu_busy_percent`,
+`mem_info_vram_used`) WSL2 actually populates versus leaves absent.
+
 ## Conventions
 
 Measure before claiming. Several confident conclusions this project were wrong
