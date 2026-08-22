@@ -18,6 +18,7 @@ tests/__pycache__/
 
 # Prompt + screenshot + video examples, same reasoning as tests/ above.
 !Examples/
+!Prompting Guide/
 # Real prompts/results from ad-hoc A/B sessions -- tests/variants.example.json
 # is the committed template, everything else here is scratch.
 tests/variants.*.json

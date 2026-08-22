@@ -43,6 +43,14 @@ class _Widget:
 
 def resolve(config, args):
     """Apply CLI overrides, then the same snapping the GUI applies."""
+    if args.draft:
+        # Lowest resolution/shortest length, guidance off -- for checking
+        # composition/motion fast, not a final render. Applied before the
+        # per-flag overrides below, so e.g. --draft --width 512 still wins
+        # on width. Mirrors the GUI's "Draft Preset" button.
+        config.update({"width": gv.MIN_DIMENSION, "height": gv.MIN_DIMENSION,
+                       "frames": 49, "upscale": False, "cfg_mode": False,
+                       "stg_mode": False, "auto_duration": False})
     if args.prompt is not None:
         config["prompt"] = args.prompt
     if args.negative is not None:
@@ -151,6 +159,9 @@ def main():
     ap.add_argument("--stg", action=argparse.BooleanOptionalAction,
                     help="Spatio-Temporal Guidance: targets anatomy/floating objects, "
                          "no negative prompt, ~2x slower")
+    ap.add_argument("--draft", action="store_true",
+                    help="lowest resolution/shortest length, upscale/CFG/STG off -- "
+                         "fast preview, not final quality. Individual flags still override.")
     ap.add_argument("--debug", action="store_true", help="per-step timing and VRAM lines")
     ap.add_argument("--dry-run", action="store_true", help="print resolved settings and exit")
     ap.add_argument("--force", action="store_true", help="proceed past the VRAM warning")

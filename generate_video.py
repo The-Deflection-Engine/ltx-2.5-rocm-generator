@@ -815,7 +815,38 @@ def main():
     entry_auto_max.insert(0, str(config.get("auto_max_seconds", 5.0)))
     refresh_auto_cap_label()
     on_auto_toggle()
-    
+
+    def draft_preset():
+        """Lowest resolution and shortest length this build allows, guidance
+        off -- for checking composition/motion fast, not a final render.
+        Doesn't touch VAE tile size: that's a separate, already-optimal
+        default (512px) unrelated to output resolution -- see the README's
+        VAE tile geometry section for that curve."""
+        res_combo.set("Custom")
+        on_res_select(None)
+        entry_w.delete(0, tk.END); entry_w.insert(0, str(MIN_DIMENSION))
+        entry_h.delete(0, tk.END); entry_h.insert(0, str(MIN_DIMENSION))
+        upscale_var.set(False)
+        cfg_var.set(False)
+        stg_var.set(False)
+        auto_dur_var.set(False)
+        length_type.set("frames")
+        entry_len.delete(0, tk.END); entry_len.insert(0, "49")
+        update_np_label()
+        on_auto_toggle()
+        update_output_label()
+        refresh_auto_cap_label()
+
+    draft_row = ttk.Frame(main_frame)
+    draft_row.pack(fill=tk.X, pady=(0, 12))
+    btn_draft = ttk.Button(draft_row, text="🏃 Draft Preset", command=draft_preset)
+    btn_draft.pack(side=tk.RIGHT)
+    tooltip(btn_draft,
+            f"Sets {MIN_DIMENSION}x{MIN_DIMENSION}, 49 frames (~2s @24fps), "
+            "upscale/CFG/STG off.\n\n"
+            "For a fast look at composition and motion before committing to "
+            "a full render -- not a quality setting.")
+
     seed_frame = ttk.Frame(main_frame)
     seed_frame.pack(fill=tk.X, pady=(0, 12))
     ttk.Label(seed_frame, text="Seed ('r' for Random):", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
