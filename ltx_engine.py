@@ -125,6 +125,20 @@ VRAM_GB_PER_TOKEN = 1.814e-4
 VRAM_HEADROOM = 0.85          # leave 15% for spikes the steady state misses
 TOKEN_WARN_FALLBACK = 30000   # if VRAM can't be read: the measured 16GB value
 
+# Estimated, NOT yet measured on real hardware (no >=24GB card to test
+# against -- see CLAUDE.md "measure before claiming" / "state what is
+# untested"). Lets a card with enough headroom skip group offload entirely
+# and keep the transformer GPU-resident instead of streaming it block-by-block
+# from pinned host RAM, which should be meaningfully faster once PCIe
+# round-trips aren't in the critical path. Built from: 18GB on-disk fp8
+# transformer (1 byte/param, so VRAM footprint matches) + 6.63GB measured VAE
+# tile-decode peak (see benchmarks/bench_vae_tiles.py) + ~3GB estimated
+# headroom for CFG/STG's extra forward pass and prompt-embed/latent buffers +
+# ~1GB desktop baseline, rounded up. Re-tune this once real hardware is
+# available: compare it against the peak-VRAM figure generation_worker
+# already logs at the end of a full-resident run.
+FULL_RESIDENT_VRAM_THRESHOLD_GB = 29.0
+
 
 def token_warn_threshold(config=None):
     """Latent-token count above which to warn, scaled to the card actually
@@ -1000,35 +1014,47 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 except Exception as exc:
                     print(f"  -> Attention backend '{backend}' unavailable ({exc}); using default.")
 
-            # Group offload: 48 transformer blocks, streamed from pinned host RAM.
-            # NOTE: `use_stream=True` forces num_blocks_per_group to 1 -- diffusers
-            # only supports the prefetch stream at a group size of 1 and logs
-            # "Setting it to 1." So `blocks_per_group` below is inert while streams
-            # are on. That is the faster arrangement anyway (the transfer overlaps
-            # compute instead of stalling it), which is why there is no GUI control
-            # for it. It only takes effect if you also set use_stream=False.
-            offload_kwargs = dict(
-                onload_device=onload_device,
-                offload_device=offload_device,
-                offload_type="block_level",
-                num_blocks_per_group=int(config.get("blocks_per_group", 4)),
-                use_stream=True,
-                record_stream=True,
-                non_blocking=True,
-                low_cpu_mem_usage=False,   # False => pinned (page-locked) host buffers
-            )
-            if hasattr(pipe.transformer, "enable_group_offload"):
-                pipe.transformer.enable_group_offload(**offload_kwargs)
+            # On a big enough card, skip offload/streaming entirely and just keep
+            # the transformer GPU-resident -- see FULL_RESIDENT_VRAM_THRESHOLD_GB.
+            _, _, vram_total_gb = hw_monitor.get_gpu_stats()
+            full_resident = bool(vram_total_gb) and vram_total_gb >= FULL_RESIDENT_VRAM_THRESHOLD_GB
+            if full_resident:
+                print(f"  -> {vram_total_gb:.0f}GB VRAM detected (>= "
+                      f"{FULL_RESIDENT_VRAM_THRESHOLD_GB:.0f}GB estimated threshold); "
+                      "keeping transformer GPU-resident, no offload streaming.")
+                pipe.transformer.to(onload_device)
             else:
-                apply_group_offloading(pipe.transformer, **offload_kwargs)
+                # Group offload: 48 transformer blocks, streamed from pinned host RAM.
+                # NOTE: `use_stream=True` forces num_blocks_per_group to 1 -- diffusers
+                # only supports the prefetch stream at a group size of 1 and logs
+                # "Setting it to 1." So `blocks_per_group` below is inert while streams
+                # are on. That is the faster arrangement anyway (the transfer overlaps
+                # compute instead of stalling it), which is why there is no GUI control
+                # for it. It only takes effect if you also set use_stream=False.
+                offload_kwargs = dict(
+                    onload_device=onload_device,
+                    offload_device=offload_device,
+                    offload_type="block_level",
+                    num_blocks_per_group=int(config.get("blocks_per_group", 4)),
+                    use_stream=True,
+                    record_stream=True,
+                    non_blocking=True,
+                    low_cpu_mem_usage=False,   # False => pinned (page-locked) host buffers
+                )
+                if hasattr(pipe.transformer, "enable_group_offload"):
+                    pipe.transformer.enable_group_offload(**offload_kwargs)
+                else:
+                    apply_group_offloading(pipe.transformer, **offload_kwargs)
 
             if hasattr(pipe.vae, "enable_slicing"):
                 pipe.vae.enable_slicing()
 
             # The decoders are small (VAE 1.4GB + audio VAE 0.1GB + vocoder 0.25GB)
-            # and `_execution_device` is cuda because of the transformer's offload
-            # hooks, so they MUST be on the GPU before pipe() runs -- the old code
-            # moved them *after* the call, i.e. never in time for the decode.
+            # and `_execution_device` is cuda either way -- via the transformer's
+            # offload hooks in the streamed case, or because it's just .to()'d
+            # onto cuda directly in the full-resident case -- so they MUST be on
+            # the GPU before pipe() runs -- the old code moved them *after* the
+            # call, i.e. never in time for the decode.
             pipe.vae.to(onload_device)
             if getattr(pipe, "audio_vae", None) is not None:
                 pipe.audio_vae.to(onload_device)
