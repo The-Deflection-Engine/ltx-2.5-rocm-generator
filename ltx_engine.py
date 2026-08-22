@@ -50,6 +50,10 @@ os.environ.setdefault("OMP_NUM_THREADS", "16")
 os.environ.setdefault("MKL_NUM_THREADS", "16")
 
 CONFIG_FILE = "ltx2_config.json"
+# Local working state, same reasoning as ltx2_config.json: not shareable,
+# not tracked.
+PROMPT_HISTORY_FILE = "prompt_history.json"
+PROMPT_HISTORY_MAX = 50
 MODEL_PATH = os.path.abspath("./local_ltx25_fp8")
 # LTX-2.5 model dir: holds the *correct* latent_upsampler config. Don't be
 # tempted by Lightricks/ltxv-spatial-upscaler-0.9.7 -- that is an LTX-1 / 0.9.x
@@ -346,6 +350,41 @@ def align_frames(n):
     return (max(1, round((n - 1) / 8)) * 8) + 1
 
 
+def load_prompt_history():
+    """Most-recent-first. Missing/corrupt file reads as empty -- history is a
+    convenience, not something worth failing a run over."""
+    try:
+        with open(PROMPT_HISTORY_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def record_prompt_history(prompt, negative_prompt, config):
+    """Called once per attempted generation (see generation_worker) -- logs
+    what was actually run, not every keystroke. Deduplicates consecutive
+    identical prompts (re-running the same one shouldn't spam the list) and
+    caps at PROMPT_HISTORY_MAX, dropping the oldest."""
+    if not prompt.strip():
+        return
+    history = load_prompt_history()
+    if history and history[0].get("prompt") == prompt:
+        return
+    history.insert(0, {
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M"),
+        "seed": config.get("active_seed"),
+        "width": config.get("width"),
+        "height": config.get("height"),
+    })
+    try:
+        with open(PROMPT_HISTORY_FILE, "w") as f:
+            json.dump(history[:PROMPT_HISTORY_MAX], f, indent=2)
+    except OSError as exc:
+        print(f"  [!] Could not save prompt history: {exc}")
+
+
 def latent_tokens(width, height, frames, upscale):
     """Transformer sequence length of the final stage -- the number the VRAM
     warning is built on. Shared by the GUI and the CLI so they can't disagree."""
@@ -572,6 +611,8 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
     try:
         print("\n[*] Initializing PyTorch and ROCm backends...")
         script_start_time = time.time()
+
+        record_prompt_history(config["prompt"], config.get("negative_prompt", ""), config)
 
         import warnings
         import torch

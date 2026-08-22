@@ -25,6 +25,7 @@ from ltx_engine import (
     align_frames,
     auto_duration_cap_s,
     free_resident_models,
+    load_prompt_history,
     generation_worker,
     guidance_pass_count,
     hw_monitor,
@@ -367,6 +368,52 @@ def main():
                               command=lambda: text_prompt.delete("1.0", tk.END))
     btn_clear_pp.pack(side=tk.RIGHT)
     tooltip(btn_clear_pp, "Empty the positive prompt box.")
+
+    def open_history():
+        """Recorded once per Generate click (see record_prompt_history in
+        ltx_engine), not every keystroke -- so this is what was actually run,
+        not a typing log."""
+        history = load_prompt_history()
+        win = tk.Toplevel(root)
+        win.title("Prompt History")
+        win.geometry("640x420")
+        if not history:
+            ttk.Label(win, text="No history yet -- it's recorded the first "
+                                "time you click Generate.", padding=20).pack()
+            return
+
+        list_frame = ttk.Frame(win, padding=8)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+        listbox = tk.Listbox(list_frame, font=("Consolas", 9))
+        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=listbox.yview)
+        listbox.config(yscrollcommand=scrollbar.set)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        for entry in history:
+            preview = entry.get("prompt", "").replace("\n", " ")[:90]
+            listbox.insert(tk.END, f"[{entry.get('timestamp', '?')}]  "
+                                   f"seed {entry.get('seed', '?')}  --  {preview}")
+
+        def use_selected(_event=None):
+            sel = listbox.curselection()
+            if not sel:
+                return
+            entry = history[sel[0]]
+            text_prompt.delete("1.0", tk.END)
+            text_prompt.insert(tk.END, entry.get("prompt", ""))
+            if entry.get("negative_prompt"):
+                text_np.delete("1.0", tk.END)
+                text_np.insert(tk.END, entry["negative_prompt"])
+            win.destroy()
+
+        listbox.bind("<Double-Button-1>", use_selected)
+        btn_row = ttk.Frame(win, padding=(8, 0, 8, 8))
+        btn_row.pack(fill=tk.X)
+        ttk.Button(btn_row, text="Use Selected", command=use_selected).pack(side=tk.RIGHT)
+
+    btn_history = ttk.Button(pp_header, text="🕘 History", command=open_history)
+    btn_history.pack(side=tk.RIGHT, padx=(0, 6))
+    tooltip(btn_history, "Browse past prompts, most recent first, and reload one.")
 
     text_prompt.pack(fill=tk.X, pady=(4, 12))
     text_prompt.insert(tk.END, config['prompt'])
