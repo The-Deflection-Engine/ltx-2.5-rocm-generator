@@ -1242,11 +1242,13 @@ def main():
     # Floor the window at whatever the packed layout actually needs, measured
     # rather than hardcoded -- font metrics and CPU core count (the telemetry
     # grid wraps at 8 per row) both change the requirement per machine.
-    root.minsize(max(640, root.winfo_reqwidth()), min(root.winfo_reqheight(),
-                                                      root.winfo_screenheight()))
-    x = (root.winfo_screenwidth() // 2) - (WIN_W // 2)
-    y = (root.winfo_screenheight() // 2) - (WIN_H // 2)
-    root.geometry(f"+{x}+{y}")
+    req_w = max(640, root.winfo_reqwidth())
+    req_h = min(root.winfo_reqheight(), root.winfo_screenheight())
+    root.minsize(req_w, req_h)
+    win_w, win_h = max(WIN_W, req_w), max(WIN_H, req_h)
+    x = (root.winfo_screenwidth() // 2) - (win_w // 2)
+    y = (root.winfo_screenheight() // 2) - (win_h // 2)
+    root.geometry(f"{win_w}x{win_h}+{x}+{y}")
     
     def on_close():
         """Leave immediately, without running Python's finalisers.

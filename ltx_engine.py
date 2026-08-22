@@ -98,7 +98,7 @@ VIDEO_TO_VIDEO_ENABLED = False
 # they got. Flip this to True if you specifically have a plain (non-IC)
 # LoRA file -- Cinemagraph and Foley-V2A are the two known-plain ones as of
 # this writing.
-LORA_LOADING_ENABLED = False
+LORA_LOADING_ENABLED = True
 
 # From the VAE config: spatial_compression_ratio 32, temporal_compression_ratio 8.
 # Width/height must be multiples of 32; frame counts must satisfy 8k + 1.
