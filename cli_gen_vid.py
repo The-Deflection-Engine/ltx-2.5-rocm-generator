@@ -147,7 +147,7 @@ def summarise(config):
         print(f"  image      : {config.get('image_path') or '(none!)'}")
     if config.get("mode") == "video2video":
         print(f"  video      : {config.get('video_path') or '(none!)'}"
-              f"  (strength {config.get('video_strength', 0.7)})")
+              f"  (strength {config.get('video_strength', 0.05)})")
     if config.get("lora_path"):
         print(f"  lora       : {config['lora_path']}  (scale {config.get('lora_scale', 1.0)})")
     return eff, threshold, est
@@ -168,8 +168,11 @@ def main():
     ap.add_argument("--image", help="conditioning image for image-to-video ('' for text-to-video)")
     ap.add_argument("--video", help="source clip for video-to-video ('' for text-to-video)")
     ap.add_argument("--video-strength", type=float,
-                    help="how much the source video is preserved, 0-1 (default 0.7) -- "
-                         "same idea as img2img denoise strength")
+                    help="how strongly the source video is locked in, 0-1 (default 0.05) -- "
+                         "1.0 keeps source frames untouched, 0.0 is fully noised "
+                         "(prompt has maximum freedom). Opposite direction from "
+                         "img2img denoise strength. Measured: the interesting range "
+                         "is roughly 0-0.05, snapping back to 'locked' by ~0.07.")
     ap.add_argument("--lora", help="path to a LoRA weights file, applied on top of the base model")
     ap.add_argument("--lora-scale", type=float, help="LoRA adapter weight (default 1.0)")
     ap.add_argument("--upscale", action=argparse.BooleanOptionalAction,
@@ -198,7 +201,7 @@ def main():
     defaults = {
         "prompt": "", "negative_prompt": "", "width": 960, "height": 544,
         "frames": 121, "fps": 24.0, "seed": "42", "upscale": False,
-        "mode": "text2video", "image_path": "", "video_path": "", "video_strength": 0.7,
+        "mode": "text2video", "image_path": "", "video_path": "", "video_strength": 0.05,
         "lora_path": "", "lora_scale": 1.0, "auto_duration": False,
         "auto_min_seconds": 2.0, "auto_max_seconds": 5.0, "image_crf": None,
         "cfg_mode": False, "cfg_steps": 30, "cfg_scale": 3.0, "audio_cfg_scale": 7.0, "cfg_modality_scale": 1.0,
@@ -214,6 +217,12 @@ def main():
         sys.exit(f"Image-to-video needs a valid image: {config.get('image_path')!r}")
     if config.get("mode") == "video2video" and not os.path.exists(config.get("video_path", "")):
         sys.exit(f"Video-to-video needs a valid video: {config.get('video_path')!r}")
+    if config.get("mode") == "video2video" and not gv.VIDEO_TO_VIDEO_ENABLED:
+        sys.exit("Video-to-video is disabled -- see VIDEO_TO_VIDEO_ENABLED in ltx_engine.py "
+                 "and the README for why, and how to turn it back on.")
+    if config.get("lora_path") and not gv.LORA_LOADING_ENABLED:
+        sys.exit("LoRA loading is disabled -- see LORA_LOADING_ENABLED in ltx_engine.py "
+                 "and the README for why, and how to turn it back on.")
 
     gv.debug_flag = args.debug
     print("\n--- Resolved settings ---")

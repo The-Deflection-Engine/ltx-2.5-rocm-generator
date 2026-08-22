@@ -38,3 +38,5 @@ etc.) and give each its own index row, sharing the one `prompt.txt`.
 |---|---|---|
 | <a href="singer-in-a-pub/"><img src="singer-in-a-pub/screenshot-base.png" width="200"></a> | [prompt](singer-in-a-pub/prompt.txt) · [settings](singer-in-a-pub/settings.md) · base, 768x512 | <video src="singer-in-a-pub/output-base.mp4" controls width="200"></video> |
 | <a href="singer-in-a-pub/"><img src="singer-in-a-pub/settings-upscaled.png" width="200"></a> | [prompt](singer-in-a-pub/prompt.txt) · [settings](singer-in-a-pub/settings.md) · 2-stage upscale, 1536x1024 | <video src="singer-in-a-pub/output-upscaled.mp4" controls width="200"></video> |
+
+See [`video-to-video/`](video-to-video/) for source-clip → output pairs.
