@@ -27,6 +27,8 @@ It keeps the FP8 model resident in memory between generations, runs the distille
 
 Both front-ends share the same `ltx2_config.json` and the same pipeline, so a fix/change in one reaches both.
 
+See [`Examples/`](Examples/) for real prompts paired with the clips they produced.
+
 ---
 
 ## ✨ Key Features

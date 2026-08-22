@@ -15,6 +15,9 @@
 # un-ignoring the directory is enough to include what is inside it.
 !tests/
 tests/__pycache__/
+
+# Prompt + screenshot + video examples, same reasoning as tests/ above.
+!Examples/
 # Real prompts/results from ad-hoc A/B sessions -- tests/variants.example.json
 # is the committed template, everything else here is scratch.
 tests/variants.*.json
