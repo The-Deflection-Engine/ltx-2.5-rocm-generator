@@ -91,9 +91,11 @@ GPU access under WSL2 is a different mechanism from this native install,
 not a repeat of it: WSL2 doesn't load the Linux `amdgpu` kernel driver at
 all, it goes through the *Windows* GPU driver via paravirtualization. So
 the Windows-side driver needs WSL/ROCm compute support installed, not a
-second native ROCm kernel-module install inside WSL2. Unverified: whether
-gfx1201 (RX 9070 XT) is on AMD's current WSL2 support matrix -- check before
-sinking time in.
+second native ROCm kernel-module install inside WSL2. Checked (2026-08-22):
+gfx1201 (RX 9070 XT) is officially supported since ROCm 7.2 (March 2026) --
+that's also the release that unified Windows/WSL2 into one first-class
+target instead of a workaround. Requires Windows 11 25H2 and AMD GPU driver
+31.40.1+.
 
 `LinuxHardwareMonitor` (`/sys/class/drm`, `/proc/stat`, `/proc/meminfo`)
 will need a rewrite for native Windows but should keep working unmodified
