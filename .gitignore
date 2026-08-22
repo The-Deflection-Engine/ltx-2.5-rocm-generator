@@ -12,6 +12,7 @@
 
 # Benchmark/measurement scripts, same reasoning as tests/ above.
 !benchmarks/
+!tools/
 
 # Test harness lives in its own directory; /* only matches root entries, so
 # un-ignoring the directory is enough to include what is inside it.
