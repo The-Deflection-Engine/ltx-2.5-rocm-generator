@@ -70,6 +70,34 @@ ENHANCER_PATH = os.path.abspath("./local_ltx25_enhancer")
 # fixed at whatever was safe on one 16GB card at one resolution.
 AUTO_DURATION_HARD_CEILING_S = 20.0
 
+# Off by default: measured (see tests/variants.strength_sweep.json and its
+# runs/ report) to not do what it sounds like it does. `video_strength` is one
+# global noise/clean blend, not separate content/style control -- the range
+# that shows real stylistic change (roughly 0-0.05 here) discards nearly all
+# of the source's pixel content, so the result is close to plain
+# text-to-video steered by the prompt, not "the source video, restyled".
+# What's structurally sound is a small edit near strength~0.9-1.0, where the
+# source dominates and the prompt nudges a minor change -- that's still here
+# in the code, just not surfaced as a headline feature. Flip this to True to
+# turn the mode back on in both front-ends.
+VIDEO_TO_VIDEO_ENABLED = False
+
+# Off by default, for a different reason than video-to-video above: plain
+# LoRA loading here actually works (confirmed -- a Cinemagraph LoRA produced
+# a real, visible effect: locked composition vs. the base model's normal
+# camera drift). The problem is that most LoRAs published for LTX-2 are
+# IC-LoRAs (in-context conditioning -- Water-Simulation, Relight,
+# Colorization, Depth-Control, etc.), which need a completely different
+# pipeline (LTX2InContextPipeline), a reference video as a second input, and
+# a structured trigger-phrase prompt ("Reference shows X. Edited shows the
+# same scene with Y. ADD <effect> ..."). None of that is built. Loading an
+# IC-LoRA through the plain path here either does nothing useful or crashes,
+# with no way for someone picking a LoRA off Hugging Face to know which kind
+# they got. Flip this to True if you specifically have a plain (non-IC)
+# LoRA file -- Cinemagraph and Foley-V2A are the two known-plain ones as of
+# this writing.
+LORA_LOADING_ENABLED = False
+
 # From the VAE config: spatial_compression_ratio 32, temporal_compression_ratio 8.
 # Width/height must be multiples of 32; frame counts must satisfy 8k + 1.
 SPATIAL_COMPRESSION = 32
@@ -385,6 +413,16 @@ def record_prompt_history(prompt, negative_prompt, config):
         print(f"  [!] Could not save prompt history: {exc}")
 
 
+def clear_prompt_history():
+    """Delete the history file outright rather than writing `[]` -- avoids
+    leaving an empty-but-present file that would need distinguishing from
+    "no history yet" everywhere load_prompt_history() is used."""
+    try:
+        os.remove(PROMPT_HISTORY_FILE)
+    except FileNotFoundError:
+        pass
+
+
 def latent_tokens(width, height, frames, upscale):
     """Transformer sequence length of the final stage -- the number the VRAM
     warning is built on. Shared by the GUI and the CLI so they can't disagree."""
@@ -623,7 +661,9 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             LTX2VideoTransformer3DModel,
             LTX2LatentUpsamplePipeline,
             LTX2ImageToVideoPipeline,
+            LTX2ConditionPipeline,
         )
+        from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition
         from diffusers.hooks import apply_group_offloading
         from diffusers.pipelines.ltx2.utils import (
             DISTILLED_SIGMA_VALUES,
@@ -677,6 +717,10 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
 
         use_upscale = bool(config.get("upscale"))
         use_image = config.get("mode") == "image2video"
+        use_video = config.get("mode") == "video2video"
+        if use_video and not VIDEO_TO_VIDEO_ENABLED:
+            raise ValueError("Video-to-video is disabled (see VIDEO_TO_VIDEO_ENABLED "
+                             "in ltx_engine.py).")
 
         input_image = None
         if use_image:
@@ -686,6 +730,15 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             if not image_path or not os.path.exists(image_path):
                 raise ValueError(f"Image-to-video mode selected but no valid image path was given: '{image_path}'")
             input_image = Image.open(image_path).convert("RGB")
+
+        input_video_frames = None
+        if use_video:
+            from diffusers.utils import load_video
+
+            video_path = config.get("video_path", "")
+            if not video_path or not os.path.exists(video_path):
+                raise ValueError(f"Video-to-video mode selected but no valid video path was given: '{video_path}'")
+            input_video_frames = load_video(video_path)
 
         # The distilled LTX-2.5 schedule is guidance-free. Leaving
         # `audio_guidance_scale` at its 7.0 default silently turns CFG back ON
@@ -856,8 +909,12 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         # `blocks_per_group` and `attention_backend` are baked into the pipeline at
         # build time, so a reused pipe would silently ignore edits to them. Make
         # them part of the cache identity -- changing either rebuilds by itself.
+        # A LoRA is baked in the same way (it's merged into the transformer's
+        # adapter weights), so it joins the same identity tuple.
         build_opts = (int(config.get("blocks_per_group", 4)),
-                      config.get("attention_backend", "native"))
+                      config.get("attention_backend", "native"),
+                      config.get("lora_path") or None if LORA_LOADING_ENABLED else None,
+                      float(config.get("lora_scale", 1.0)) if LORA_LOADING_ENABLED else None)
 
         if (_MODEL_CACHE["pipe"] is not None
                 and _MODEL_CACHE["path"] == MODEL_PATH
@@ -895,6 +952,37 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 local_files_only=True,
             )
             pipe.set_progress_bar_config(disable=True)
+
+            lora_path = config.get("lora_path") if LORA_LOADING_ENABLED else None
+            if config.get("lora_path") and not LORA_LOADING_ENABLED:
+                print("  -> LoRA loading is disabled (see LORA_LOADING_ENABLED in "
+                      "ltx_engine.py); ignoring lora_path.")
+            if lora_path:
+                try:
+                    pipe.load_lora_weights(lora_path, adapter_name="default_0")
+                    # PEFT creates lora_A/lora_B in the same dtype as the layer
+                    # they adapt -- fp8 here, since the transformer's weights
+                    # rest in fp8 and are only just-in-time upcast inside
+                    # dynamic_fp8_linear_forward above. That patch only covers
+                    # the base layer's own forward; the LoRA path's own matmul
+                    # (lora_B(lora_A(x))) runs unpatched and hits a real fp8
+                    # GEMM, which ROCm has no addmm kernel for ("addmm_cuda"
+                    # not implemented for 'Float8_e4m3fn'). Cast just the LoRA
+                    # adapter weights to bf16 -- same dtype everything else in
+                    # the pipeline computes in -- so that path never touches fp8.
+                    n_cast = 0
+                    for name, param in pipe.transformer.named_parameters():
+                        if "lora_" in name and param.dtype in fp8_types:
+                            param.data = param.data.to(torch.bfloat16)
+                            n_cast += 1
+                    if n_cast:
+                        dbg(f"cast {n_cast} LoRA adapter tensors fp8 -> bf16")
+                    pipe.set_adapters(["default_0"], adapter_weights=[float(config.get("lora_scale", 1.0))])
+                    print(f"  -> LoRA loaded: {lora_path} (scale {config.get('lora_scale', 1.0)})")
+                except Exception as exc:
+                    # A bad or incompatible LoRA file shouldn't take down the
+                    # whole run -- continue with the base model instead.
+                    print(f"  -> LoRA load failed ({exc}); continuing without it.")
 
             # "native" = torch SDPA auto-dispatch. On this GPU (gfx1201) the flash,
             # mem-efficient and math kernels are all available, and auto-dispatch
@@ -1012,7 +1100,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         else:
             length_call = dict(num_frames=config["frames"])
 
-        mode_label = "Image-to-Video" if use_image else "Text-to-Video"
+        mode_label = "Image-to-Video" if use_image else "Video-to-Video" if use_video else "Text-to-Video"
         len_label = "auto length" if use_auto_duration else f"{config['frames']} frames"
         print(f"--- [3/4] Generating Base Video, {mode_label} ({stage1_w}x{stage1_h}, {len_label}) ---")
         # Under Auto Duration the model picks the length, so config["frames"]
@@ -1106,6 +1194,29 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                     **length_call,
                     **shared_call,
                 )
+            elif use_video:
+                # Same "wrap the resident components" pattern as i2v_pipe above --
+                # no extra weights loaded, just the condition-aware __call__.
+                v2v_pipe = LTX2ConditionPipeline(**pipe.components)
+                # `strength` sets a conditioning_mask value, not a denoise
+                # amount: 1.0 = mask=1 = "keep fully clean" (source untouched),
+                # 0.0 = mask=0 = fully noised (prompt has maximum freedom).
+                # That's the OPPOSITE direction from img2img denoise strength --
+                # confirmed by reading prepare_latents() in
+                # pipeline_ltx2_condition.py, not assumed.
+                video_strength = float(config.get("video_strength", 0.05))
+                condition = LTX2VideoCondition(frames=input_video_frames, index=0, strength=video_strength)
+                stage1 = v2v_pipe(
+                    conditions=[condition],
+                    width=stage1_w,
+                    height=stage1_h,
+                    generator=generator,
+                    output_type="latent" if use_upscale else "np",
+                    **stage1_schedule,
+                    **stage1_guidance,
+                    **length_call,
+                    **shared_call,
+                )
             else:
                 stage1 = pipe(
                     width=stage1_w,
@@ -1179,7 +1290,12 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 # is None, so passing 5D latents skips it entirely (and CRF
                 # re-compression along with it, correctly: the image was
                 # already conditioned once, in stage 1).
-                stage2_pipe = i2v_pipe if use_image else pipe
+                # v2v_pipe gets the same treatment as i2v_pipe here, on the
+                # assumption LTX2ConditionPipeline's prepare_latents() special-
+                # cases 5D latents the same way -- UNTESTED against this
+                # checkpoint specifically, unlike the i2v case above which was
+                # verified by reading pipeline_ltx2_image2video.py directly.
+                stage2_pipe = i2v_pipe if use_image else v2v_pipe if use_video else pipe
                 output = stage2_pipe(
                     num_frames=realized_frames,
                     sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
@@ -1209,7 +1325,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             f"(vs {last_step_at[0] - generation_start_time:.1f}s for all {total_steps} steps)")
 
         print("  --> Exporting final video...")
-        mode_tag = "i2v_" if use_image else ""
+        mode_tag = "i2v_" if use_image else "v2v_" if use_video else ""
         # Report what was actually produced -- under Auto Duration this is the
         # model's chosen length, not config["frames"].
         final_frames = len(video[0])
@@ -1223,6 +1339,11 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             guide_tag += f"_cfg{cfg_scale:g}"
         if use_stg:
             guide_tag += f"_stg{stg_scale:g}"
+        # Same reasoning as CFG/STG above: strength is the setting most worth
+        # comparing across identical-seed v2v A/Bs (see the strength-curve
+        # investigation), so it needs to be in the name too, not just guidance.
+        if use_video:
+            guide_tag += f"_str{video_strength:g}"
         output_file = (f"output_{mode_tag}{out_w}x{out_h}_{final_frames}f"
                        f"_seed{config['active_seed']}{guide_tag}.mp4")
         # The name above is fully determined by mode/resolution/frames/seed/

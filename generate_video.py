@@ -20,11 +20,14 @@ from ltx_engine import (
     ENHANCER_PATH,
     MIN_DIMENSION,
     SPATIAL_COMPRESSION,
+    LORA_LOADING_ENABLED,
+    VIDEO_TO_VIDEO_ENABLED,
     VRAM_BASE_GB,
     VRAM_GB_PER_TOKEN,
     align_frames,
     auto_duration_cap_s,
     free_resident_models,
+    clear_prompt_history,
     load_prompt_history,
     generation_worker,
     guidance_pass_count,
@@ -131,6 +134,10 @@ def main():
             "upscale": False,
             "mode": "text2video",
             "image_path": "",
+            "video_path": "",
+            "video_strength": 0.05,
+            "lora_path": "",
+            "lora_scale": 1.0,
             # Auto Duration: let the model pick clip length from the prompt.
             # Capped by auto_duration_cap_s() regardless of what's set here.
             "auto_duration": False,
@@ -308,13 +315,21 @@ def main():
     mode_frame = ttk.LabelFrame(main_frame, text=" Generation Mode ", padding="8")
     mode_frame.pack(fill=tk.X, pady=(0, 12))
 
-    mode_var = tk.StringVar(value=config.get("mode", "text2video"))
+    # A saved config from before this was disabled shouldn't leave the GUI
+    # stuck on a mode with no radio button to select it.
+    initial_mode = config.get("mode", "text2video")
+    if initial_mode == "video2video" and not VIDEO_TO_VIDEO_ENABLED:
+        initial_mode = "text2video"
+    mode_var = tk.StringVar(value=initial_mode)
     image_path_var = tk.StringVar(value=config.get("image_path", ""))
+    video_path_var = tk.StringVar(value=config.get("video_path", ""))
 
     mode_row = ttk.Frame(mode_frame)
     mode_row.pack(fill=tk.X)
     ttk.Radiobutton(mode_row, text="Text → Video", variable=mode_var, value="text2video").pack(side=tk.LEFT)
     ttk.Radiobutton(mode_row, text="Image → Video", variable=mode_var, value="image2video").pack(side=tk.LEFT, padx=(12, 0))
+    if VIDEO_TO_VIDEO_ENABLED:
+        ttk.Radiobutton(mode_row, text="Video → Video", variable=mode_var, value="video2video").pack(side=tk.LEFT, padx=(12, 0))
 
     def unload_models():
         if messagebox.askokcancel(
@@ -346,16 +361,93 @@ def main():
 
     btn_browse = ttk.Button(image_row, text="📁 Choose Image...", command=browse_image)
 
+    video_row = ttk.Frame(mode_frame)
+    video_row.pack(fill=tk.X, pady=(6, 0))
+    lbl_video = ttk.Label(video_row, textvariable=video_path_var, foreground="#666666")
+
+    def browse_video():
+        path = filedialog.askopenfilename(
+            title="Select source video",
+            filetypes=[("Videos", "*.mp4 *.mov *.webm *.avi *.mkv"), ("All files", "*.*")],
+        )
+        if path:
+            video_path_var.set(path)
+
+    btn_browse_video = ttk.Button(video_row, text="📁 Choose Video...", command=browse_video)
+    video_strength_var = tk.StringVar(value=str(config.get("video_strength", 0.05)))
+    lbl_video_strength = ttk.Label(video_row, text="strength:")
+    # Fine 0.025 steps -- the measured sweep (tests/variants.strength_sweep.json)
+    # found the whole interesting range packed into roughly 0-0.1, with a sharp
+    # transition back to "fully locked to source" by ~0.07. Full 0-1 range is
+    # still reachable (by typing) for the near-1.0 small-edit use case.
+    entry_video_strength = ttk.Spinbox(video_row, from_=0.0, to=1.0, increment=0.025, width=5,
+                                       textvariable=video_strength_var, format="%.3f")
+    tooltip(entry_video_strength,
+            "How strongly the source video is locked in -- the OPPOSITE\n"
+            "direction from img2img denoise strength. 1.0 keeps the source\n"
+            "frames untouched (clean, unnoised); 0.0 is fully noised, giving\n"
+            "the prompt maximum room to diverge.\n\n"
+            "Measured: the interesting range is roughly 0.0-0.05 (real style\n"
+            "change) before snapping back to 'basically the source' by ~0.07.\n"
+            "See tests/variants.strength_sweep.json for the sweep this came from.")
+
     def on_mode_switch(*_args):
-        if mode_var.get() == "image2video":
+        mode = mode_var.get()
+        if mode == "image2video":
             btn_browse.pack(side=tk.LEFT)
             lbl_image.pack(side=tk.LEFT, padx=(8, 0))
         else:
             btn_browse.pack_forget()
             lbl_image.pack_forget()
+        if mode == "video2video":
+            btn_browse_video.pack(side=tk.LEFT)
+            lbl_video_strength.pack(side=tk.LEFT, padx=(8, 0))
+            entry_video_strength.pack(side=tk.LEFT, padx=(2, 0))
+            lbl_video.pack(side=tk.LEFT, padx=(8, 0))
+        else:
+            btn_browse_video.pack_forget()
+            lbl_video_strength.pack_forget()
+            entry_video_strength.pack_forget()
+            lbl_video.pack_forget()
 
     mode_var.trace_add("write", on_mode_switch)
     on_mode_switch()
+
+    # LoRA is orthogonal to mode (text/image/video-to-video) and doesn't
+    # change VRAM/compute enough to need a confirmation dialog like CFG/
+    # upscale -- just an optional per-run weights file. Off by default (see
+    # LORA_LOADING_ENABLED in ltx_engine.py) -- vars still exist unconditionally
+    # since config.update() below always reads them.
+    lora_path_var = tk.StringVar(value=config.get("lora_path", "") if LORA_LOADING_ENABLED else "")
+    lora_scale_var = tk.StringVar(value=str(config.get("lora_scale", 1.0)))
+
+    if LORA_LOADING_ENABLED:
+        lora_frame = ttk.LabelFrame(main_frame, text=" LoRA ", padding="8")
+        lora_frame.pack(fill=tk.X, pady=(0, 12))
+        lora_row = ttk.Frame(lora_frame)
+        lora_row.pack(fill=tk.X)
+        lbl_lora = ttk.Label(lora_row, textvariable=lora_path_var, foreground="#666666")
+
+        def browse_lora():
+            path = filedialog.askopenfilename(
+                title="Select LoRA weights",
+                filetypes=[("LoRA weights", "*.safetensors *.pt *.bin"), ("All files", "*.*")],
+            )
+            if path:
+                lora_path_var.set(path)
+
+        def clear_lora():
+            lora_path_var.set("")
+
+        ttk.Button(lora_row, text="📁 LoRA...", command=browse_lora).pack(side=tk.LEFT)
+        ttk.Button(lora_row, text="✕", width=2, command=clear_lora).pack(side=tk.LEFT, padx=(2, 0))
+        ttk.Label(lora_row, text="scale:").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Spinbox(lora_row, from_=0.0, to=2.0, increment=0.05, width=5,
+                   textvariable=lora_scale_var, format="%.2f").pack(side=tk.LEFT, padx=(2, 0))
+        lbl_lora.pack(side=tk.LEFT, padx=(8, 0))
+        tooltip(lbl_lora, "Optional LoRA weights file, applied on top of the base "
+                          "model. Baked in at pipeline build time, so changing it "
+                      "or its scale triggers a rebuild (one slow reload).")
 
     pp_header = ttk.Frame(main_frame)
     pp_header.pack(fill=tk.X)
@@ -406,10 +498,17 @@ def main():
                 text_np.insert(tk.END, entry["negative_prompt"])
             win.destroy()
 
+        def clear_history():
+            if messagebox.askokcancel("Clear History", "Delete all recorded prompt history? "
+                                                        "This can't be undone."):
+                clear_prompt_history()
+                win.destroy()
+
         listbox.bind("<Double-Button-1>", use_selected)
         btn_row = ttk.Frame(win, padding=(8, 0, 8, 8))
         btn_row.pack(fill=tk.X)
         ttk.Button(btn_row, text="Use Selected", command=use_selected).pack(side=tk.RIGHT)
+        ttk.Button(btn_row, text="Clear History", command=clear_history).pack(side=tk.LEFT)
 
     btn_history = ttk.Button(pp_header, text="🕘 History", command=open_history)
     btn_history.pack(side=tk.RIGHT, padx=(0, 6))
@@ -741,7 +840,6 @@ def main():
             "Intended for a bigger card. On 16GB, single-stage only.\n"
             "Steps and strength: cfg_steps / cfg_scale in ltx2_config.json.")
 
-
     def on_res_select(event):
         val = res_combo.get()
         entry_w.config(state="normal"); entry_h.config(state="normal")
@@ -884,10 +982,8 @@ def main():
         update_output_label()
         refresh_auto_cap_label()
 
-    draft_row = ttk.Frame(main_frame)
-    draft_row.pack(fill=tk.X, pady=(0, 12))
-    btn_draft = ttk.Button(draft_row, text="🏃 Draft Preset", command=draft_preset)
-    btn_draft.pack(side=tk.RIGHT)
+    btn_draft = ttk.Button(time_frame, text="🏃 Draft Video Preset", command=draft_preset)
+    btn_draft.pack(anchor=tk.W, pady=(6, 0))
     tooltip(btn_draft,
             f"Sets {MIN_DIMENSION}x{MIN_DIMENSION}, 49 frames (~2s @24fps), "
             "upscale/CFG/STG off.\n\n"
@@ -961,6 +1057,12 @@ def main():
                 img = image_path_var.get().strip()
                 if not img or not os.path.exists(img):
                     messagebox.showerror("Error", "Image-to-Video mode needs a valid image. Click 'Choose Image...'.")
+                    return
+
+            if mode_var.get() == "video2video":
+                vid = video_path_var.get().strip()
+                if not vid or not os.path.exists(vid):
+                    messagebox.showerror("Error", "Video-to-Video mode needs a valid video. Click 'Choose Video...'.")
                     return
 
             # Store exactly what's in the box, empty included. Substituting the
@@ -1052,12 +1154,16 @@ def main():
                 'upscale': upscale_var.get(),
                 'mode': mode_var.get(),
                 'image_path': image_path_var.get().strip(),
+                'video_path': video_path_var.get().strip(),
+                'video_strength': float(video_strength_var.get() or 0.05),
                 'auto_duration': auto_dur_var.get(),
                 'cfg_mode': cfg_var.get(),
                 'stg_mode': stg_var.get(),
                 'stg_scale': float(stg_scale_var.get() or 1.0),
                 'enhance_max_words': max(0, int(enh_words_var.get() or 0)),
                 'auto_max_seconds': auto_max_val,
+                'lora_path': lora_path_var.get().strip(),
+                'lora_scale': float(lora_scale_var.get() or 1.0),
             })
             save_config(config)
             

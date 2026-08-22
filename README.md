@@ -40,9 +40,18 @@ See [`Examples/`](Examples/) for real prompts paired with the clips they produce
 * **Prompt enhancer (optional):** click **✨ Enhance Now** to rewrite a short prompt into the long, detailed caption style LTX-2.5 was trained on, using `google/gemma-4-E2B-it`. The result replaces the prompt box, so you read and edit it before spending minutes on a render — no hidden rewrites. It runs in a throwaway subprocess and frees itself on exit, so it costs **zero resident VRAM or RAM during generation**. Works for image-to-video too (the enhancer is conditioned on your reference frame). Requires the one-off download below.
 * **CFG quality mode (off by default):** the distilled schedule is guidance-free, which is fast but drops secondary prompt details. Ticking **CFG quality mode** runs classifier-free guidance on stage 1 — the transformer runs twice per step and pushes away from the negative prompt, which is what forces adherence. Costs roughly **7-8x the compute** (30 steps instead of 8, doubled per step) and about **2x the activation VRAM**, so on 16GB it is realistically single-stage only. Confirmation dialog spells this out before it turns on.
 * **STG — structural guidance without a negative prompt:** duplicated limbs, extra fingers, objects floating unattached to anything. **STG** perturbs one transformer block and steers away from the degraded prediction, which targets *structure* rather than prompt adherence — and needs no negative prompt at all. It keeps the 8-step distilled schedule, so it costs one extra pass (**~2x**) rather than CFG mode's 30 doubled steps (~7-8x). Tried here at strength 1.0 and it visibly improved anatomy and object coherence; drop the strength to 0.5 if output looks over-sharpened instead of better formed. Off by default.
+* **Video-to-video (built, but off by default):** feeds an existing clip into `LTX2ConditionPipeline`/`LTX2VideoCondition`, blended against the prompt by a **strength** value — the *opposite* direction from img2img denoise strength: `1.0` keeps the source frames untouched, `0.0` is fully noised. Measured with a real sweep (`tests/variants.strength_sweep.json`) that the range doing anything stylistically is roughly `0.0`-`0.05`, snapping back to "basically the source" by ~`0.07` — and at the strengths that do show style, so little of the source's actual pixel content survives that the result is closer to plain text-to-video steered by the prompt than "the source video, restyled." The one structurally sound use left is a small edit near `0.9`-`1.0`, where the source dominates and the prompt nudges a minor change. Disabled by default for this reason — flip `VIDEO_TO_VIDEO_ENABLED` in `ltx_engine.py` to turn it back on in both front-ends. Requires `imageio` (see [Requirements](#requirements)).
+* **LoRA loading (built, but off by default):** points at a local `.safetensors`/`.pt`/`.bin` LoRA file and applies it on top of the base model at pipeline build time. Confirmed working for a plain LoRA (Cinemagraph — real, visible effect: locked composition vs. the base model's normal camera drift). The catch: most LoRAs published for LTX-2 are **IC-LoRAs** (Water-Simulation, Relight, Colorization, Depth-Control, and most of the rest of Lightricks' library) — a different kind entirely, needing a separate pipeline (`LTX2InContextPipeline`), a "dry"/reference video as a second input, and a structured trigger-phrase prompt ("Reference shows X. Edited shows the same scene with Y. ADD \<effect\> ..."). None of that is built, so loading an IC-LoRA through this path does nothing useful or crashes, with no way to tell which kind of LoRA you've got until you try. Off by default for that reason — flip `LORA_LOADING_ENABLED` in `ltx_engine.py` if you specifically have a plain (non-IC) LoRA file. Requires `peft` (see [Requirements](#requirements)). No adapter picker; one LoRA at a time.
 * **Live hardware telemetry:** CPU/RAM/GPU/VRAM usage and per-core load, read directly from sysfs/procfs (no extra dependencies).
 * **Auto-saved config:** every setting (prompt, resolution, frames, seed, offload tuning) is persisted to `ltx2_config.json` and reloaded on next launch.
 * **Cancel support:** stop a run cleanly between diffusion steps.
+
+Not currently possible: **audio-to-video** (no LTX2 pipeline in the pinned
+`diffusers` accepts audio as an input condition — audio is generation
+*output* only, via the vocoder). **Multi-shot generation** is the same
+`LTX2ConditionPipeline` video-to-video already uses under the hood, just with
+several indexed conditions instead of one — technically close, but the UI for
+authoring multiple shots is its own piece of work, not yet built.
 
 ---
 
@@ -108,6 +117,8 @@ python cli_gen_vid.py                              # run what's in the config
 python cli_gen_vid.py --prompt "a red car" --seconds 4
 python cli_gen_vid.py --dry-run                    # resolve settings, print, exit
 python cli_gen_vid.py --image frame.png --debug    # image-to-video
+python cli_gen_vid.py --video clip.mp4 --video-strength 0.05  # video-to-video, off by default -- see Key Features
+python cli_gen_vid.py --lora style.safetensors --lora-scale 0.8  # off by default -- see Key Features
 ```
 
 Settings come from `ltx2_config.json`; every flag overrides it for that run only. `--save` writes the resolved settings back, `--config other.json` points at a different file.
@@ -238,5 +249,6 @@ Peak RAM usage is roughly 45GB — the resident 18GB transformer plus a transien
   ```bash
   hf download google/gemma-4-E2B-it --local-dir local_ltx25_enhancer
   ```
+* **LoRA loading and video-to-video are both off by default, but their dependencies are in `requirements.txt` anyway** (`imageio`, `peft`) — if you re-enable either, a plain `pip install -r requirements.txt` already covers them, nothing extra to fetch.
 ### PLEASE FEEL FREE TO CONTRIBUTE TO MY "Buy Euan an RTX 5090 Fund" ;-)
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/S6I125FYNB)
