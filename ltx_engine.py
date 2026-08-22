@@ -623,7 +623,9 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             LTX2VideoTransformer3DModel,
             LTX2LatentUpsamplePipeline,
             LTX2ImageToVideoPipeline,
+            LTX2ConditionPipeline,
         )
+        from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition
         from diffusers.hooks import apply_group_offloading
         from diffusers.pipelines.ltx2.utils import (
             DISTILLED_SIGMA_VALUES,
@@ -677,6 +679,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
 
         use_upscale = bool(config.get("upscale"))
         use_image = config.get("mode") == "image2video"
+        use_video = config.get("mode") == "video2video"
 
         input_image = None
         if use_image:
@@ -686,6 +689,15 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             if not image_path or not os.path.exists(image_path):
                 raise ValueError(f"Image-to-video mode selected but no valid image path was given: '{image_path}'")
             input_image = Image.open(image_path).convert("RGB")
+
+        input_video_frames = None
+        if use_video:
+            from diffusers.utils import load_video
+
+            video_path = config.get("video_path", "")
+            if not video_path or not os.path.exists(video_path):
+                raise ValueError(f"Video-to-video mode selected but no valid video path was given: '{video_path}'")
+            input_video_frames = load_video(video_path)
 
         # The distilled LTX-2.5 schedule is guidance-free. Leaving
         # `audio_guidance_scale` at its 7.0 default silently turns CFG back ON
@@ -856,8 +868,12 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         # `blocks_per_group` and `attention_backend` are baked into the pipeline at
         # build time, so a reused pipe would silently ignore edits to them. Make
         # them part of the cache identity -- changing either rebuilds by itself.
+        # A LoRA is baked in the same way (it's merged into the transformer's
+        # adapter weights), so it joins the same identity tuple.
         build_opts = (int(config.get("blocks_per_group", 4)),
-                      config.get("attention_backend", "native"))
+                      config.get("attention_backend", "native"),
+                      config.get("lora_path") or None,
+                      float(config.get("lora_scale", 1.0)))
 
         if (_MODEL_CACHE["pipe"] is not None
                 and _MODEL_CACHE["path"] == MODEL_PATH
@@ -895,6 +911,17 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 local_files_only=True,
             )
             pipe.set_progress_bar_config(disable=True)
+
+            lora_path = config.get("lora_path")
+            if lora_path:
+                try:
+                    pipe.load_lora_weights(lora_path, adapter_name="default_0")
+                    pipe.set_adapters(["default_0"], adapter_weights=[float(config.get("lora_scale", 1.0))])
+                    print(f"  -> LoRA loaded: {lora_path} (scale {config.get('lora_scale', 1.0)})")
+                except Exception as exc:
+                    # A bad or incompatible LoRA file shouldn't take down the
+                    # whole run -- continue with the base model instead.
+                    print(f"  -> LoRA load failed ({exc}); continuing without it.")
 
             # "native" = torch SDPA auto-dispatch. On this GPU (gfx1201) the flash,
             # mem-efficient and math kernels are all available, and auto-dispatch
@@ -1012,7 +1039,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         else:
             length_call = dict(num_frames=config["frames"])
 
-        mode_label = "Image-to-Video" if use_image else "Text-to-Video"
+        mode_label = "Image-to-Video" if use_image else "Video-to-Video" if use_video else "Text-to-Video"
         len_label = "auto length" if use_auto_duration else f"{config['frames']} frames"
         print(f"--- [3/4] Generating Base Video, {mode_label} ({stage1_w}x{stage1_h}, {len_label}) ---")
         # Under Auto Duration the model picks the length, so config["frames"]
@@ -1106,6 +1133,23 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                     **length_call,
                     **shared_call,
                 )
+            elif use_video:
+                # Same "wrap the resident components" pattern as i2v_pipe above --
+                # no extra weights loaded, just the condition-aware __call__.
+                v2v_pipe = LTX2ConditionPipeline(**pipe.components)
+                video_strength = float(config.get("video_strength", 0.7))
+                condition = LTX2VideoCondition(frames=input_video_frames, index=0, strength=video_strength)
+                stage1 = v2v_pipe(
+                    conditions=[condition],
+                    width=stage1_w,
+                    height=stage1_h,
+                    generator=generator,
+                    output_type="latent" if use_upscale else "np",
+                    **stage1_schedule,
+                    **stage1_guidance,
+                    **length_call,
+                    **shared_call,
+                )
             else:
                 stage1 = pipe(
                     width=stage1_w,
@@ -1179,7 +1223,12 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 # is None, so passing 5D latents skips it entirely (and CRF
                 # re-compression along with it, correctly: the image was
                 # already conditioned once, in stage 1).
-                stage2_pipe = i2v_pipe if use_image else pipe
+                # v2v_pipe gets the same treatment as i2v_pipe here, on the
+                # assumption LTX2ConditionPipeline's prepare_latents() special-
+                # cases 5D latents the same way -- UNTESTED against this
+                # checkpoint specifically, unlike the i2v case above which was
+                # verified by reading pipeline_ltx2_image2video.py directly.
+                stage2_pipe = i2v_pipe if use_image else v2v_pipe if use_video else pipe
                 output = stage2_pipe(
                     num_frames=realized_frames,
                     sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
@@ -1209,7 +1258,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             f"(vs {last_step_at[0] - generation_start_time:.1f}s for all {total_steps} steps)")
 
         print("  --> Exporting final video...")
-        mode_tag = "i2v_" if use_image else ""
+        mode_tag = "i2v_" if use_image else "v2v_" if use_video else ""
         # Report what was actually produced -- under Auto Duration this is the
         # model's chosen length, not config["frames"].
         final_frames = len(video[0])

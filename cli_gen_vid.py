@@ -64,6 +64,15 @@ def resolve(config, args):
     if args.image is not None:
         config["image_path"] = args.image
         config["mode"] = "image2video" if args.image else "text2video"
+    if args.video is not None:
+        config["video_path"] = args.video
+        config["mode"] = "video2video" if args.video else "text2video"
+    if args.video_strength is not None:
+        config["video_strength"] = args.video_strength
+    if args.lora is not None:
+        config["lora_path"] = args.lora
+    if args.lora_scale is not None:
+        config["lora_scale"] = args.lora_scale
     if args.upscale is not None:
         config["upscale"] = args.upscale
     if args.cfg is not None:
@@ -136,6 +145,11 @@ def summarise(config):
           f"   [warn above {threshold:,} tokens]")
     if config.get("mode") == "image2video":
         print(f"  image      : {config.get('image_path') or '(none!)'}")
+    if config.get("mode") == "video2video":
+        print(f"  video      : {config.get('video_path') or '(none!)'}"
+              f"  (strength {config.get('video_strength', 0.7)})")
+    if config.get("lora_path"):
+        print(f"  lora       : {config['lora_path']}  (scale {config.get('lora_scale', 1.0)})")
     return eff, threshold, est
 
 
@@ -152,6 +166,12 @@ def main():
     ap.add_argument("--fps", type=float)
     ap.add_argument("--seed", help="integer, or 'r' for random")
     ap.add_argument("--image", help="conditioning image for image-to-video ('' for text-to-video)")
+    ap.add_argument("--video", help="source clip for video-to-video ('' for text-to-video)")
+    ap.add_argument("--video-strength", type=float,
+                    help="how much the source video is preserved, 0-1 (default 0.7) -- "
+                         "same idea as img2img denoise strength")
+    ap.add_argument("--lora", help="path to a LoRA weights file, applied on top of the base model")
+    ap.add_argument("--lora-scale", type=float, help="LoRA adapter weight (default 1.0)")
     ap.add_argument("--upscale", action=argparse.BooleanOptionalAction,
                     help="2-stage 2x latent upscale + refine")
     ap.add_argument("--cfg", action=argparse.BooleanOptionalAction,
@@ -178,7 +198,8 @@ def main():
     defaults = {
         "prompt": "", "negative_prompt": "", "width": 960, "height": 544,
         "frames": 121, "fps": 24.0, "seed": "42", "upscale": False,
-        "mode": "text2video", "image_path": "", "auto_duration": False,
+        "mode": "text2video", "image_path": "", "video_path": "", "video_strength": 0.7,
+        "lora_path": "", "lora_scale": 1.0, "auto_duration": False,
         "auto_min_seconds": 2.0, "auto_max_seconds": 5.0, "image_crf": None,
         "cfg_mode": False, "cfg_steps": 30, "cfg_scale": 3.0, "audio_cfg_scale": 7.0, "cfg_modality_scale": 1.0,
         "stg_mode": False, "stg_scale": 1.0,
@@ -191,6 +212,8 @@ def main():
         sys.exit("Positive prompt is empty -- set it in the config or pass --prompt.")
     if config.get("mode") == "image2video" and not os.path.exists(config.get("image_path", "")):
         sys.exit(f"Image-to-video needs a valid image: {config.get('image_path')!r}")
+    if config.get("mode") == "video2video" and not os.path.exists(config.get("video_path", "")):
+        sys.exit(f"Video-to-video needs a valid video: {config.get('video_path')!r}")
 
     gv.debug_flag = args.debug
     print("\n--- Resolved settings ---")

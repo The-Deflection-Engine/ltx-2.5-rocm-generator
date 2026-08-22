@@ -131,6 +131,10 @@ def main():
             "upscale": False,
             "mode": "text2video",
             "image_path": "",
+            "video_path": "",
+            "video_strength": 0.7,
+            "lora_path": "",
+            "lora_scale": 1.0,
             # Auto Duration: let the model pick clip length from the prompt.
             # Capped by auto_duration_cap_s() regardless of what's set here.
             "auto_duration": False,
@@ -310,11 +314,13 @@ def main():
 
     mode_var = tk.StringVar(value=config.get("mode", "text2video"))
     image_path_var = tk.StringVar(value=config.get("image_path", ""))
+    video_path_var = tk.StringVar(value=config.get("video_path", ""))
 
     mode_row = ttk.Frame(mode_frame)
     mode_row.pack(fill=tk.X)
     ttk.Radiobutton(mode_row, text="Text → Video", variable=mode_var, value="text2video").pack(side=tk.LEFT)
     ttk.Radiobutton(mode_row, text="Image → Video", variable=mode_var, value="image2video").pack(side=tk.LEFT, padx=(12, 0))
+    ttk.Radiobutton(mode_row, text="Video → Video", variable=mode_var, value="video2video").pack(side=tk.LEFT, padx=(12, 0))
 
     def unload_models():
         if messagebox.askokcancel(
@@ -346,13 +352,46 @@ def main():
 
     btn_browse = ttk.Button(image_row, text="📁 Choose Image...", command=browse_image)
 
+    video_row = ttk.Frame(mode_frame)
+    video_row.pack(fill=tk.X, pady=(6, 0))
+    lbl_video = ttk.Label(video_row, textvariable=video_path_var, foreground="#666666")
+
+    def browse_video():
+        path = filedialog.askopenfilename(
+            title="Select source video",
+            filetypes=[("Videos", "*.mp4 *.mov *.webm *.avi *.mkv"), ("All files", "*.*")],
+        )
+        if path:
+            video_path_var.set(path)
+
+    btn_browse_video = ttk.Button(video_row, text="📁 Choose Video...", command=browse_video)
+    video_strength_var = tk.StringVar(value=str(config.get("video_strength", 0.7)))
+    lbl_video_strength = ttk.Label(video_row, text="strength:")
+    entry_video_strength = ttk.Spinbox(video_row, from_=0.0, to=1.0, increment=0.05, width=5,
+                                       textvariable=video_strength_var, format="%.2f")
+    tooltip(entry_video_strength,
+            "How much the source video is preserved -- same idea as img2img\n"
+            "denoise strength. Lower = closer to the source; higher = more\n"
+            "freedom for the prompt to diverge from it.")
+
     def on_mode_switch(*_args):
-        if mode_var.get() == "image2video":
+        mode = mode_var.get()
+        if mode == "image2video":
             btn_browse.pack(side=tk.LEFT)
             lbl_image.pack(side=tk.LEFT, padx=(8, 0))
         else:
             btn_browse.pack_forget()
             lbl_image.pack_forget()
+        if mode == "video2video":
+            btn_browse_video.pack(side=tk.LEFT)
+            lbl_video_strength.pack(side=tk.LEFT, padx=(8, 0))
+            entry_video_strength.pack(side=tk.LEFT, padx=(2, 0))
+            lbl_video.pack(side=tk.LEFT, padx=(8, 0))
+        else:
+            btn_browse_video.pack_forget()
+            lbl_video_strength.pack_forget()
+            entry_video_strength.pack_forget()
+            lbl_video.pack_forget()
 
     mode_var.trace_add("write", on_mode_switch)
     on_mode_switch()
@@ -741,6 +780,35 @@ def main():
             "Intended for a bigger card. On 16GB, single-stage only.\n"
             "Steps and strength: cfg_steps / cfg_scale in ltx2_config.json.")
 
+    # LoRA is orthogonal to mode (text/image/video-to-video) and doesn't
+    # change VRAM/compute enough to need a confirmation dialog like CFG/
+    # upscale -- just an optional per-run weights file.
+    lora_row = ttk.Frame(res_frame)
+    lora_row.pack(pady=(5, 0), fill=tk.X)
+    lora_path_var = tk.StringVar(value=config.get("lora_path", ""))
+    lora_scale_var = tk.StringVar(value=str(config.get("lora_scale", 1.0)))
+    lbl_lora = ttk.Label(lora_row, textvariable=lora_path_var, foreground="#666666")
+
+    def browse_lora():
+        path = filedialog.askopenfilename(
+            title="Select LoRA weights",
+            filetypes=[("LoRA weights", "*.safetensors *.pt *.bin"), ("All files", "*.*")],
+        )
+        if path:
+            lora_path_var.set(path)
+
+    def clear_lora():
+        lora_path_var.set("")
+
+    ttk.Button(lora_row, text="📁 LoRA...", command=browse_lora).pack(side=tk.LEFT)
+    ttk.Button(lora_row, text="✕", width=2, command=clear_lora).pack(side=tk.LEFT, padx=(2, 0))
+    ttk.Label(lora_row, text="scale:").pack(side=tk.LEFT, padx=(8, 0))
+    ttk.Spinbox(lora_row, from_=0.0, to=2.0, increment=0.05, width=5,
+               textvariable=lora_scale_var, format="%.2f").pack(side=tk.LEFT, padx=(2, 0))
+    lbl_lora.pack(side=tk.LEFT, padx=(8, 0))
+    tooltip(lbl_lora, "Optional LoRA weights file, applied on top of the base "
+                      "model. Baked in at pipeline build time, so changing it "
+                      "or its scale triggers a rebuild (one slow reload).")
 
     def on_res_select(event):
         val = res_combo.get()
@@ -963,6 +1031,12 @@ def main():
                     messagebox.showerror("Error", "Image-to-Video mode needs a valid image. Click 'Choose Image...'.")
                     return
 
+            if mode_var.get() == "video2video":
+                vid = video_path_var.get().strip()
+                if not vid or not os.path.exists(vid):
+                    messagebox.showerror("Error", "Video-to-Video mode needs a valid video. Click 'Choose Video...'.")
+                    return
+
             # Store exactly what's in the box, empty included. Substituting the
             # library default here used to get saved straight back to the config,
             # so clearing the box never stuck -- it refilled on the next launch.
@@ -1052,12 +1126,16 @@ def main():
                 'upscale': upscale_var.get(),
                 'mode': mode_var.get(),
                 'image_path': image_path_var.get().strip(),
+                'video_path': video_path_var.get().strip(),
+                'video_strength': float(video_strength_var.get() or 0.7),
                 'auto_duration': auto_dur_var.get(),
                 'cfg_mode': cfg_var.get(),
                 'stg_mode': stg_var.get(),
                 'stg_scale': float(stg_scale_var.get() or 1.0),
                 'enhance_max_words': max(0, int(enh_words_var.get() or 0)),
                 'auto_max_seconds': auto_max_val,
+                'lora_path': lora_path_var.get().strip(),
+                'lora_scale': float(lora_scale_var.get() or 1.0),
             })
             save_config(config)
             
