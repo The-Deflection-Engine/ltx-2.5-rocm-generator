@@ -24,6 +24,10 @@ Examples/
    folder; the video embedded with `<video>` so it plays inline on the GitHub
    page rather than just downloading.
 
+Multiple renders of the same prompt (e.g. base vs. 2-stage upscale) can share
+one folder — suffix each file instead (`output-base.mp4`/`output-upscaled.mp4`,
+etc.) and give each its own index row, sharing the one `prompt.txt`.
+
 ## Index
 
 <!-- Copy this row per example:
@@ -32,4 +36,5 @@ Examples/
 
 | preview | prompt / settings | clip |
 |---|---|---|
-| <a href="singer-in-a-pub/"><img src="singer-in-a-pub/screenshot.png" width="200"></a> | [prompt](singer-in-a-pub/prompt.txt) · [settings](singer-in-a-pub/settings.md) | <video src="singer-in-a-pub/output.mp4" controls width="200"></video> |
+| <a href="singer-in-a-pub/"><img src="singer-in-a-pub/screenshot-base.png" width="200"></a> | [prompt](singer-in-a-pub/prompt.txt) · [settings](singer-in-a-pub/settings.md) · base, 768x512 | <video src="singer-in-a-pub/output-base.mp4" controls width="200"></video> |
+| <a href="singer-in-a-pub/"><img src="singer-in-a-pub/settings-upscaled.png" width="200"></a> | [prompt](singer-in-a-pub/prompt.txt) · [settings](singer-in-a-pub/settings.md) · 2-stage upscale, 1536x1024 | <video src="singer-in-a-pub/output-upscaled.mp4" controls width="200"></video> |

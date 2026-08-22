@@ -1184,6 +1184,16 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             guide_tag += f"_stg{stg_scale:g}"
         output_file = (f"output_{mode_tag}{out_w}x{out_h}_{final_frames}f"
                        f"_seed{config['active_seed']}{guide_tag}.mp4")
+        # The name above is fully determined by mode/resolution/frames/seed/
+        # guidance -- any exact rerun (a second click, an unattended repeat)
+        # reproduces it byte-for-byte and would otherwise silently overwrite
+        # the earlier file. Append the first free _2, _3, ... suffix instead.
+        if os.path.exists(output_file):
+            base, ext = os.path.splitext(output_file)
+            n = 2
+            while os.path.exists(f"{base}_{n}{ext}"):
+                n += 1
+            output_file = f"{base}_{n}{ext}"
         sample_rate = 24000
         if getattr(pipe, "vocoder", None) is not None:
             sample_rate = getattr(pipe.vocoder.config, "output_sampling_rate", 24000)
