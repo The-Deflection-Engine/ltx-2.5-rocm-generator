@@ -199,7 +199,9 @@ def main():
     # widget packed with expand=True, and spare width to everything on fill=X.
     # minsize is set once the layout has been measured, further down -- below it
     # the bottom button row starts clipping.
-    WIN_W, WIN_H = 740, 1080
+    # Widened from 740 -- FLF2V's start+end image controls share one row
+    # (see image_row below) and need the extra width to not wrap/clip.
+    WIN_W, WIN_H = 900, 1080
     root.geometry(f"{WIN_W}x{WIN_H}")
     root.resizable(True, True)
     
@@ -364,9 +366,10 @@ def main():
 
     btn_browse = ttk.Button(image_row, text="📁 Choose Image...", command=browse_image)
 
-    end_image_row = ttk.Frame(mode_frame)
-    end_image_row.pack(fill=tk.X, pady=(6, 0))
-    lbl_end_image = ttk.Label(end_image_row, textvariable=end_image_path_var, foreground="#666666")
+    # Shares image_row with the start-frame controls above (rather than its
+    # own row) -- one more full row here is exactly the kind of thing that
+    # pushed Cancel/Generate off the bottom of the window on shorter screens.
+    lbl_end_image = ttk.Label(image_row, textvariable=end_image_path_var, foreground="#666666")
 
     def browse_end_image():
         path = filedialog.askopenfilename(
@@ -379,8 +382,8 @@ def main():
     def clear_end_image():
         end_image_path_var.set("")
 
-    btn_browse_end = ttk.Button(end_image_row, text="📁 Choose End Frame...", command=browse_end_image)
-    btn_clear_end = ttk.Button(end_image_row, text="✕", width=2, command=clear_end_image)
+    btn_browse_end = ttk.Button(image_row, text="📁 Choose End Frame...", command=browse_end_image)
+    btn_clear_end = ttk.Button(image_row, text="✕", width=2, command=clear_end_image)
     tooltip(btn_browse_end,
             "Conditions the LAST frame of the video on this image, in\n"
             "addition to the start frame above. Works with Auto Duration --\n"
@@ -425,7 +428,7 @@ def main():
             btn_browse.pack_forget()
             lbl_image.pack_forget()
         if mode == "flf2v":
-            btn_browse_end.pack(side=tk.LEFT)
+            btn_browse_end.pack(side=tk.LEFT, padx=(12, 0))
             btn_clear_end.pack(side=tk.LEFT, padx=(2, 0))
             lbl_end_image.pack(side=tk.LEFT, padx=(8, 0))
         else:
@@ -1287,10 +1290,18 @@ def main():
     # Floor the window at whatever the packed layout actually needs, measured
     # rather than hardcoded -- font metrics and CPU core count (the telemetry
     # grid wraps at 8 per row) both change the requirement per machine.
+    #
+    # `usable_h` leaves headroom below the raw screen height for window-manager
+    # chrome (title bar, taskbar/dock) -- capping at the *raw* screen height
+    # (the old behaviour) produces a window exactly as tall as the display with
+    # zero margin, so on any screen where the packed layout needs that much
+    # (more controls = taller layout, e.g. FLF2V's extra row) the bottom
+    # Cancel/Generate row renders behind the taskbar, off-screen.
+    usable_h = max(400, root.winfo_screenheight() - 80)
     req_w = max(640, root.winfo_reqwidth())
-    req_h = min(root.winfo_reqheight(), root.winfo_screenheight())
+    req_h = min(root.winfo_reqheight(), usable_h)
     root.minsize(req_w, req_h)
-    win_w, win_h = max(WIN_W, req_w), max(WIN_H, req_h)
+    win_w, win_h = max(WIN_W, req_w), min(max(WIN_H, req_h), usable_h)
     x = (root.winfo_screenwidth() // 2) - (win_w // 2)
     y = (root.winfo_screenheight() // 2) - (win_h // 2)
     root.geometry(f"{win_w}x{win_h}+{x}+{y}")
