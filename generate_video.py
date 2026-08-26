@@ -137,6 +137,9 @@ def main():
             "end_image_path": "",
             "video_path": "",
             "video_strength": 0.05,
+            # IC-LoRA v2v: scales cross-attention to the reference tokens.
+            # 1.0 = full adherence (trained default), 0.5 = balanced.
+            "conditioning_attention_strength": 1.0,
             "lora_path": "",
             "lora_scale": 1.0,
             # Auto Duration: let the model pick clip length from the prompt.
@@ -379,6 +382,20 @@ def main():
     ttk.Radiobutton(mode_row, text="First+Last Frame → Video", variable=mode_var, value="flf2v").pack(side=tk.LEFT, padx=(12, 0))
     if VIDEO_TO_VIDEO_ENABLED:
         ttk.Radiobutton(mode_row, text="Video → Video", variable=mode_var, value="video2video").pack(side=tk.LEFT, padx=(12, 0))
+    if LORA_LOADING_ENABLED:
+        rb_ic = ttk.Radiobutton(mode_row, text="IC-LoRA Video → Video",
+                                variable=mode_var, value="ic_v2v")
+        rb_ic.pack(side=tk.LEFT, padx=(12, 0))
+        tooltip(rb_ic,
+                "Real video-to-video: the reference clip is appended to the\n"
+                "token sequence as extra tokens the model attends to, so\n"
+                "structure and motion follow it while the prompt drives\n"
+                "appearance. Needs an IC-LoRA (pick one in the LoRA box).\n\n"
+                "Most control IC-LoRAs want a *control signal* as the\n"
+                "reference -- a canny/depth/pose pass over your clip, not\n"
+                "the clip itself. Check the adapter's model card.\n\n"
+                "Single-stage only, and no Auto Duration: the reference\n"
+                "rides the same sequence, and the length should match it.")
 
     def unload_models():
         if messagebox.askokcancel(
@@ -446,6 +463,25 @@ def main():
             video_path_var.set(path)
 
     btn_browse_video = ttk.Button(video_row, text="📁 Choose Video...", command=browse_video)
+
+    # IC-LoRA's dial. Unlike video_strength below this scales cross-attention
+    # between the noisy tokens and the appended reference tokens, so it has a
+    # genuinely usable middle -- LTX documents 0.5 as "balanced blend of
+    # control signal and free generation".
+    attn_strength_var = tk.StringVar(
+        value=str(config.get("conditioning_attention_strength", 1.0)))
+    lbl_attn = ttk.Label(video_row, text="attention:")
+    entry_attn = ttk.Spinbox(video_row, from_=0.0, to=1.0, increment=0.05, width=5,
+                             textvariable=attn_strength_var, format="%.2f")
+    tooltip(entry_attn,
+            "How strongly the generated video attends to the reference.\n"
+            "1.0 = full adherence to the control signal (the trained\n"
+            "default), 0.5 = balanced blend of control and free generation,\n"
+            "0.0 = reference ignored entirely.\n\n"
+            "This scales attention scores, not pixels, so unlike the\n"
+            "Video -> Video strength dial the middle of the range is\n"
+            "actually useful.")
+
     video_strength_var = tk.StringVar(value=str(config.get("video_strength", 0.05)))
     lbl_video_strength = ttk.Label(video_row, text="strength:")
     # Fine 0.025 steps -- the measured sweep (tests/variants.strength_sweep.json)
@@ -487,15 +523,27 @@ def main():
             btn_browse_end.pack_forget()
             btn_clear_end.pack_forget()
             lbl_end_image.pack_forget()
-        if mode == "video2video":
+        # Both video modes take a source clip, so the picker is shared; only
+        # the dial beside it differs (crossfade strength vs attention).
+        if mode in ("video2video", "ic_v2v"):
             btn_browse_video.pack(side=tk.LEFT)
-            lbl_video_strength.pack(side=tk.LEFT, padx=(8, 0))
-            entry_video_strength.pack(side=tk.LEFT, padx=(2, 0))
-            lbl_video.pack(side=tk.LEFT, padx=(8, 0))
         else:
             btn_browse_video.pack_forget()
+        if mode == "video2video":
+            lbl_video_strength.pack(side=tk.LEFT, padx=(8, 0))
+            entry_video_strength.pack(side=tk.LEFT, padx=(2, 0))
+        else:
             lbl_video_strength.pack_forget()
             entry_video_strength.pack_forget()
+        if mode == "ic_v2v":
+            lbl_attn.pack(side=tk.LEFT, padx=(8, 0))
+            entry_attn.pack(side=tk.LEFT, padx=(2, 0))
+        else:
+            lbl_attn.pack_forget()
+            entry_attn.pack_forget()
+        if mode in ("video2video", "ic_v2v"):
+            lbl_video.pack(side=tk.LEFT, padx=(8, 0))
+        else:
             lbl_video.pack_forget()
 
     mode_var.trace_add("write", on_mode_switch)
@@ -1206,6 +1254,33 @@ def main():
                     messagebox.showerror("Error", "Video-to-Video mode needs a valid video. Click 'Choose Video...'.")
                     return
 
+            if mode_var.get() == "ic_v2v":
+                vid = video_path_var.get().strip()
+                if not vid or not os.path.exists(vid):
+                    messagebox.showerror("Error", "IC-LoRA Video-to-Video needs a valid reference clip. "
+                                                  "Click 'Choose Video...'.")
+                    return
+                if not lora_path_var.get().strip():
+                    messagebox.showerror(
+                        "Error",
+                        "IC-LoRA Video-to-Video needs an IC-LoRA -- the reference clip is only "
+                        "meaningful to a model trained to attend to it.\n\n"
+                        "Pick one in the LoRA box (e.g. LTX-2.3-22b-IC-LoRA-Union-Control).")
+                    return
+                if upscale_var.get():
+                    messagebox.showerror(
+                        "Error",
+                        "IC-LoRA Video-to-Video is single-stage only -- turn off 2x upscale.\n\n"
+                        "The reference tokens ride the same sequence, so a 2-stage run would "
+                        "carry them at the upscaled size too.")
+                    return
+                if auto_dur_var.get():
+                    messagebox.showerror(
+                        "Error",
+                        "IC-LoRA Video-to-Video has no Auto Duration -- the pipeline takes a "
+                        "fixed frame count, and the length should match the reference clip.")
+                    return
+
             # Store exactly what's in the box, empty included. Substituting the
             # library default here used to get saved straight back to the config,
             # so clearing the box never stuck -- it refilled on the next launch.
@@ -1262,7 +1337,12 @@ def main():
             # loaded/saved config -- same as everywhere else it's used.
             passes = guidance_pass_count(cfg_var.get(), stg_var.get(),
                                          eng.resolve_modality_scale(config))
-            eff_tokens = tokens * passes
+            # Live widget values, not the last-saved config, for the things the
+            # user can change without saving; the IC-LoRA reference tail is
+            # read from the config's lora_path, which is where it lives.
+            eff_tokens = int(tokens * passes * eng.ic_reference_token_factor(
+                {**config, "mode": mode_var.get(),
+                 "lora_path": lora_path_var.get().strip()}))
             if eff_tokens > threshold:
                 _, _, vram_total = hw_monitor.get_gpu_stats()
                 est = eng.estimate_vram_gb(eff_tokens, config)
@@ -1298,6 +1378,7 @@ def main():
                 'end_image_path': end_image_path_var.get().strip(),
                 'video_path': video_path_var.get().strip(),
                 'video_strength': float(video_strength_var.get() or 0.05),
+                'conditioning_attention_strength': float(attn_strength_var.get() or 1.0),
                 'auto_duration': auto_dur_var.get(),
                 'cfg_mode': cfg_var.get(),
                 'stg_mode': stg_var.get(),

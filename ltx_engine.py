@@ -199,6 +199,49 @@ VIDEO_TO_VIDEO_ENABLED = True
 # current v2v mode is a crossfade rather than a restyle.
 LORA_LOADING_ENABLED = True
 
+
+def _probe_video_fps(path):
+    """A clip's frame rate via ffprobe, or None if it can't be determined.
+
+    Only used to warn about an fps mismatch on an IC-LoRA reference, so a
+    missing ffprobe or an odd container degrades to "no warning" rather than
+    to a failed run.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=20).stdout.strip()
+        num, _, den = out.partition("/")
+        return float(num) / float(den or 1)
+    except Exception:
+        return None
+
+
+def read_lora_reference_downscale_factor(lora_path, default=1):
+    """An IC-LoRA's `reference_downscale_factor`, from its safetensors metadata.
+
+    Upstream stores this on the adapter (ltx-pipelines reads it via its own
+    `read_lora_reference_downscale_factor`); diffusers does NOT read it for you
+    -- LTX2InContextPipeline takes it as a plain argument and defaults to 1. So
+    it has to be read here, and getting it wrong is not cosmetic: the factor
+    scales the reference tokens' positional coordinates into the target's
+    space, so a mismatch misplaces every reference token.
+
+    Measured examples: Union-Control ships 2 (half-res reference, so reference
+    tokens cost ~25% of the target's rather than 100%), Day-To-Night ships 1.
+    """
+    try:
+        from safetensors import safe_open
+        with safe_open(lora_path, framework="pt") as f:
+            meta = f.metadata() or {}
+        raw = meta.get("reference_downscale_factor")
+        return int(raw) if raw else default
+    except Exception as exc:
+        dbg(f"could not read reference_downscale_factor from {lora_path}: {exc}")
+        return default
+
 # From the VAE config: spatial_compression_ratio 32, temporal_compression_ratio 8.
 # Width/height must be multiples of 32; frame counts must satisfy 8k + 1.
 SPATIAL_COMPRESSION = 32
@@ -500,6 +543,44 @@ def apply_recommended_defaults(defaults, config_exists, frames=121):
           f"(budget {rec['_budget']:,} of {rec['_threshold']:,} tokens). "
           f"Upscale/STG/CFG stay off until you turn them on.")
     return defaults
+
+
+def ic_reference_token_factor(config):
+    """How much an IC-LoRA reference clip inflates the transformer sequence.
+
+    Reference tokens are *appended* to the sequence (that is the whole point --
+    see the VIDEO_TO_VIDEO_ENABLED note), so they are paid for in the same
+    attention budget as the target. A same-resolution reference therefore
+    doubles the sequence; the adapter's `reference_downscale_factor` divides
+    the reference's spatial dims, so it costs 1/factor^2 of the target.
+
+    Returns 1.0 for every other mode, so callers can multiply unconditionally.
+    Without this the pre-flight warning under-counts an IC-LoRA run by 25-100%
+    and the VRAM calibration records a token figure the run never had.
+    """
+    if config.get("mode") != "ic_v2v":
+        return 1.0
+    lora_path = config.get("lora_path") or ""
+    factor = read_lora_reference_downscale_factor(lora_path) if lora_path else 1
+    return 1.0 + 1.0 / float(max(1, factor) ** 2)
+
+
+def effective_tokens(config, width=None, height=None, frames=None):
+    """Transformer sequence length the VRAM model is built on, all-in.
+
+    Single place that combines the three multipliers -- final-stage tokens,
+    guidance passes, and any IC-LoRA reference tail -- so the GUI's dialog, the
+    CLI's summary, the engine's debug line and the calibration record cannot
+    drift apart. They have drifted before: the pre-flight estimate once
+    hardcoded "x2 if CFG", which under-counted STG-only and CFG+STG runs.
+    """
+    width = int(config["width"] if width is None else width)
+    height = int(config["height"] if height is None else height)
+    frames = int(config["frames"] if frames is None else frames)
+    tokens = latent_tokens(width, height, frames, bool(config.get("upscale")))
+    passes = guidance_pass_count(config.get("cfg_mode"), config.get("stg_mode"),
+                                 resolve_modality_scale(config))
+    return int(tokens * passes * ic_reference_token_factor(config))
 
 
 def resolve_modality_scale(config):
@@ -1117,8 +1198,10 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             LTX2LatentUpsamplePipeline,
             LTX2ImageToVideoPipeline,
             LTX2ConditionPipeline,
+            LTX2InContextPipeline,
         )
         from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition
+        from diffusers.pipelines.ltx2.pipeline_ltx2_ic_lora import LTX2ReferenceCondition
         from diffusers.hooks import apply_group_offloading
         # KNOWN DIVERGENCE FROM THE REFERENCE RECIPE (audited 2026-08-26).
         # These sigma values match upstream exactly, but the *sampler* stepping
@@ -1206,9 +1289,37 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         # LTX2ImageToVideoPipeline) and a mandatory second image.
         use_flf2v = config.get("mode") == "flf2v"
         use_video = config.get("mode") == "video2video"
+        # IC-LoRA video-to-video: the real one. The reference clip is appended
+        # to the token sequence as extra clean tokens the transformer attends
+        # to, rather than painted over the generation canvas the way
+        # `video2video` does -- see the VIDEO_TO_VIDEO_ENABLED note. Needs an
+        # IC-LoRA trained to attend across reference<->target; without one the
+        # base model has no idea what the extra tokens are for.
+        use_ic_v2v = config.get("mode") == "ic_v2v"
         if use_video and not VIDEO_TO_VIDEO_ENABLED:
             raise ValueError("Video-to-video is disabled (see VIDEO_TO_VIDEO_ENABLED "
                              "in ltx_engine.py).")
+        if use_ic_v2v:
+            if not LORA_LOADING_ENABLED or not config.get("lora_path"):
+                raise ValueError(
+                    "IC-LoRA video-to-video needs an IC-LoRA -- the reference clip is "
+                    "only meaningful to a model trained to attend to it. Pick one with "
+                    "the LoRA control (e.g. LTX-2.3-22b-IC-LoRA-Union-Control).")
+            if config.get("upscale"):
+                # Reference tokens are appended to the sequence, so stage 2
+                # would carry them at the upscaled size too. Upstream's own
+                # generic v2v workflow is single-stage distilled for the same
+                # reason (LTX-2.5_V2V_ICLoRA_Single_Stage_Distilled.json).
+                raise ValueError("IC-LoRA video-to-video is single-stage only -- turn off "
+                                 "2x upscale. The reference tokens ride the same sequence, "
+                                 "so a 2-stage run carries them at the upscaled size.")
+            if config.get("auto_duration"):
+                # LTX2InContextPipeline.__call__ has no min_seconds/max_seconds
+                # and a fixed num_frames default -- there is no duration_head
+                # path through it. Length comes from the reference anyway.
+                raise ValueError("IC-LoRA video-to-video has no Auto Duration -- the "
+                                 "pipeline takes a fixed num_frames, and the length "
+                                 "should match the reference clip.")
 
         input_image = None
         input_end_image = None
@@ -1228,13 +1339,27 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 input_end_image = Image.open(end_image_path).convert("RGB")
 
         input_video_frames = None
-        if use_video:
+        if use_video or use_ic_v2v:
             from diffusers.utils import load_video
 
             video_path = config.get("video_path", "")
             if not video_path or not os.path.exists(video_path):
-                raise ValueError(f"Video-to-video mode selected but no valid video path was given: '{video_path}'")
+                mode_desc = "IC-LoRA video-to-video" if use_ic_v2v else "Video-to-video"
+                raise ValueError(f"{mode_desc} mode selected but no valid video path was given: '{video_path}'")
             input_video_frames = load_video(video_path)
+            if use_ic_v2v:
+                # The reference loader reads frames at their native rate and does
+                # NOT resample temporally (stated on Lightricks' IC-LoRA model
+                # cards). A reference at a different fps than the run therefore
+                # plays back at the wrong speed against the generated video --
+                # silently, since nothing downstream compares the two. Can't fix
+                # it here without re-encoding, so say so.
+                ref_fps = _probe_video_fps(video_path)
+                if ref_fps and abs(ref_fps - float(config["fps"])) > 0.1:
+                    print(f"  [!] Reference clip is {ref_fps:.3g}fps but this run is "
+                          f"{float(config['fps']):.3g}fps. The reference loader does not "
+                          f"resample in time, so motion will be mistimed against the "
+                          f"output -- re-encode the reference to {float(config['fps']):.3g}fps first.")
 
         # The distilled LTX-2.5 schedule is guidance-free. Leaving
         # `audio_guidance_scale` at its 7.0 default silently turns CFG back ON
@@ -1609,6 +1734,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             length_call = dict(num_frames=config["frames"])
 
         mode_label = ("Image-to-Video" if use_image else "First+Last-Frame-to-Video" if use_flf2v
+                      else "IC-LoRA Video-to-Video" if use_ic_v2v
                       else "Video-to-Video" if use_video else "Text-to-Video")
         len_label = "auto length" if use_auto_duration else f"{config['frames']} frames"
         print(f"--- [3/4] Generating Base Video, {mode_label} ({stage1_w}x{stage1_h}, {len_label}) ---")
@@ -1747,6 +1873,43 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                     height=stage1_h,
                     generator=generator,
                     output_type="latent" if use_upscale else "np",
+                    **stage1_schedule,
+                    **stage1_guidance,
+                    **length_call,
+                    **shared_call,
+                )
+            elif use_ic_v2v:
+                # `**pipe.components` does NOT work here, unlike every other
+                # wrapped pipeline above: LTX2InContextPipeline is the one that
+                # does not accept `duration_head`, which LTX2Pipeline registers.
+                # Dropping that single key is the whole difference -- everything
+                # else is the same resident component set, no weights reloaded.
+                ic_components = {k: v for k, v in pipe.components.items()
+                                 if k != "duration_head"}
+                ic_pipe = LTX2InContextPipeline(**ic_components)
+                # Must match what the adapter was trained with -- it scales the
+                # reference tokens' positional coordinates into the target's
+                # space. Read from the LoRA's own metadata rather than assumed.
+                ref_downscale = read_lora_reference_downscale_factor(config["lora_path"])
+                # strength=1.0 keeps the reference tokens fully clean, which is
+                # the trained setup. The user-facing dial is
+                # conditioning_attention_strength below, which scales how hard
+                # the noisy tokens attend to them -- that is the knob LTX
+                # documents (0.5 = "balanced blend of control signal and free
+                # generation"), and unlike video2video's strength it has a
+                # usable middle because it modulates influence, not pixels.
+                ref_condition = LTX2ReferenceCondition(frames=input_video_frames, strength=1.0)
+                attn_strength = float(config.get("conditioning_attention_strength", 1.0))
+                dbg(f"IC-LoRA reference: downscale_factor={ref_downscale}, "
+                    f"attention_strength={attn_strength}")
+                stage1 = ic_pipe(
+                    reference_conditions=[ref_condition],
+                    reference_downscale_factor=ref_downscale,
+                    conditioning_attention_strength=attn_strength,
+                    width=stage1_w,
+                    height=stage1_h,
+                    generator=generator,
+                    output_type="np",
                     **stage1_schedule,
                     **stage1_guidance,
                     **length_call,
@@ -1891,7 +2054,8 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             f"(vs {last_step_at[0] - generation_start_time:.1f}s for all {total_steps} steps)")
 
         print("  --> Exporting final video...")
-        mode_tag = "i2v_" if use_image else "flf2v_" if use_flf2v else "v2v_" if use_video else ""
+        mode_tag = ("i2v_" if use_image else "flf2v_" if use_flf2v
+                    else "icv2v_" if use_ic_v2v else "v2v_" if use_video else "")
         # Report what was actually produced -- under Auto Duration this is the
         # model's chosen length, not config["frames"].
         final_frames = len(video[0])
@@ -1906,7 +2070,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         # it stopped, not what the settings cost.
         _, _, _vram_total_gb = hw_monitor.get_gpu_stats()
         record_vram_observation(
-            latent_tokens(stage1_w, stage1_h, final_frames, use_upscale) * _passes,
+            effective_tokens(config, stage1_w, stage1_h, final_frames),
             torch.cuda.max_memory_reserved() / 1024**3,
             _vram_total_gb,
         )

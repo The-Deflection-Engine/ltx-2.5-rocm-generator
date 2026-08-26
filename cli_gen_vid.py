@@ -74,7 +74,14 @@ def resolve(config, args):
             config["mode"] = "image2video" if config.get("image_path") else "text2video"
     if args.video is not None:
         config["video_path"] = args.video
-        config["mode"] = "video2video" if args.video else "text2video"
+        # --ic-v2v picks the IC-LoRA path for the same source clip; plain
+        # --video stays the crossfade mode. See VIDEO_TO_VIDEO_ENABLED.
+        if args.video:
+            config["mode"] = "ic_v2v" if args.ic_v2v else "video2video"
+        else:
+            config["mode"] = "text2video"
+    if args.attention_strength is not None:
+        config["conditioning_attention_strength"] = args.attention_strength
     if args.video_strength is not None:
         config["video_strength"] = args.video_strength
     if args.lora is not None:
@@ -131,7 +138,7 @@ def summarise(config):
     # not a hardcoded x2, which used to under-count STG-only and CFG+STG runs.
     passes = gv.guidance_pass_count(config.get("cfg_mode"), config.get("stg_mode"),
                                     gv.resolve_modality_scale(config))
-    eff = tokens * passes
+    eff = int(tokens * passes * gv.ic_reference_token_factor(config))
     est = gv.estimate_vram_gb(eff, config)
     _, _, vram_total = gv.hw_monitor.get_gpu_stats()
     threshold = gv.token_warn_threshold(config)
@@ -158,6 +165,9 @@ def summarise(config):
     if config.get("mode") == "video2video":
         print(f"  video      : {config.get('video_path') or '(none!)'}"
               f"  (strength {config.get('video_strength', 0.05)})")
+    if config.get("mode") == "ic_v2v":
+        print(f"  reference  : {config.get('video_path') or '(none!)'}"
+              f"  (attention {config.get('conditioning_attention_strength', 1.0)})")
     if config.get("lora_path"):
         print(f"  lora       : {config['lora_path']}  (scale {config.get('lora_scale', 1.0)})")
     return eff, threshold, est
@@ -179,6 +189,11 @@ def main():
     ap.add_argument("--image", help="conditioning image for image-to-video ('' for text-to-video)")
     ap.add_argument("--end-image", help="optional end-frame image for image-to-video ('' to clear)")
     ap.add_argument("--video", help="source clip for video-to-video ('' for text-to-video)")
+    ap.add_argument("--ic-v2v", action="store_true",
+                    help="use the IC-LoRA reference path for --video (needs --lora); "
+                         "without this, --video is the crossfade video2video mode")
+    ap.add_argument("--attention-strength", type=float,
+                    help="IC-LoRA conditioning attention strength, 0.0-1.0 (default 1.0)")
     ap.add_argument("--video-strength", type=float,
                     help="how strongly the source video is locked in, 0-1 (default 0.05) -- "
                          "1.0 keeps source frames untouched, 0.0 is fully noised "
@@ -233,6 +248,12 @@ def main():
         sys.exit(f"Image-to-video needs a valid start image: {config.get('image_path')!r}")
     if config.get("mode") == "flf2v" and not os.path.exists(config.get("end_image_path", "")):
         sys.exit(f"First+Last-Frame mode needs a valid end image: {config.get('end_image_path')!r}")
+    if config.get("mode") == "ic_v2v":
+        if not os.path.exists(config.get("video_path", "")):
+            sys.exit(f"IC-LoRA video-to-video needs a valid reference clip: {config.get('video_path')!r}")
+        if not config.get("lora_path"):
+            sys.exit("IC-LoRA video-to-video needs --lora: the reference clip only means "
+                     "something to a model trained to attend to it.")
     if config.get("mode") == "video2video" and not os.path.exists(config.get("video_path", "")):
         sys.exit(f"Video-to-video needs a valid video: {config.get('video_path')!r}")
     if config.get("mode") == "video2video" and not gv.VIDEO_TO_VIDEO_ENABLED:
