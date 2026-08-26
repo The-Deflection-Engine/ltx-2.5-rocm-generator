@@ -66,6 +66,12 @@ def resolve(config, args):
         config["mode"] = "image2video" if args.image else "text2video"
     if args.end_image is not None:
         config["end_image_path"] = args.end_image
+        # FLF2V ("First-Last-Frame to Video") is its own mode, not an
+        # add-on to image2video -- mirrors the GUI's separate radio button.
+        if args.end_image:
+            config["mode"] = "flf2v"
+        elif config.get("mode") == "flf2v":
+            config["mode"] = "image2video" if config.get("image_path") else "text2video"
     if args.video is not None:
         config["video_path"] = args.video
         config["mode"] = "video2video" if args.video else "text2video"
@@ -145,10 +151,10 @@ def summarise(config):
     print(f"  est. VRAM  : ~{est:.1f}GB"
           f"{f' of {vram_total:.1f}GB' if vram_total else ''}"
           f"   [warn above {threshold:,} tokens]")
-    if config.get("mode") == "image2video":
+    if config.get("mode") in ("image2video", "flf2v"):
         print(f"  image      : {config.get('image_path') or '(none!)'}")
-        if config.get("end_image_path"):
-            print(f"  end image  : {config['end_image_path']}")
+    if config.get("mode") == "flf2v":
+        print(f"  end image  : {config.get('end_image_path') or '(none!)'}")
     if config.get("mode") == "video2video":
         print(f"  video      : {config.get('video_path') or '(none!)'}"
               f"  (strength {config.get('video_strength', 0.05)})")
@@ -219,10 +225,10 @@ def main():
 
     if not config["prompt"].strip():
         sys.exit("Positive prompt is empty -- set it in the config or pass --prompt.")
-    if config.get("mode") == "image2video" and not os.path.exists(config.get("image_path", "")):
-        sys.exit(f"Image-to-video needs a valid image: {config.get('image_path')!r}")
-    if config.get("end_image_path") and not os.path.exists(config["end_image_path"]):
-        sys.exit(f"End frame image path does not exist: {config['end_image_path']!r}")
+    if config.get("mode") in ("image2video", "flf2v") and not os.path.exists(config.get("image_path", "")):
+        sys.exit(f"Image-to-video needs a valid start image: {config.get('image_path')!r}")
+    if config.get("mode") == "flf2v" and not os.path.exists(config.get("end_image_path", "")):
+        sys.exit(f"First+Last-Frame mode needs a valid end image: {config.get('end_image_path')!r}")
     if config.get("mode") == "video2video" and not os.path.exists(config.get("video_path", "")):
         sys.exit(f"Video-to-video needs a valid video: {config.get('video_path')!r}")
     if config.get("mode") == "video2video" and not gv.VIDEO_TO_VIDEO_ENABLED:

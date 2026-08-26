@@ -330,6 +330,7 @@ def main():
     mode_row.pack(fill=tk.X)
     ttk.Radiobutton(mode_row, text="Text → Video", variable=mode_var, value="text2video").pack(side=tk.LEFT)
     ttk.Radiobutton(mode_row, text="Image → Video", variable=mode_var, value="image2video").pack(side=tk.LEFT, padx=(12, 0))
+    ttk.Radiobutton(mode_row, text="First+Last Frame → Video", variable=mode_var, value="flf2v").pack(side=tk.LEFT, padx=(12, 0))
     if VIDEO_TO_VIDEO_ENABLED:
         ttk.Radiobutton(mode_row, text="Video → Video", variable=mode_var, value="video2video").pack(side=tk.LEFT, padx=(12, 0))
 
@@ -369,7 +370,7 @@ def main():
 
     def browse_end_image():
         path = filedialog.askopenfilename(
-            title="Select end-frame image (optional)",
+            title="Select end-frame image",
             filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp"), ("All files", "*.*")],
         )
         if path:
@@ -381,8 +382,8 @@ def main():
     btn_browse_end = ttk.Button(end_image_row, text="📁 Choose End Frame...", command=browse_end_image)
     btn_clear_end = ttk.Button(end_image_row, text="✕", width=2, command=clear_end_image)
     tooltip(btn_browse_end,
-            "Optional. Conditions the LAST frame of the video on this image,\n"
-            "in addition to the start frame above. Works with Auto Duration --\n"
+            "Conditions the LAST frame of the video on this image, in\n"
+            "addition to the start frame above. Works with Auto Duration --\n"
             "the end frame always lands on whatever length gets generated.")
 
     video_row = ttk.Frame(mode_frame)
@@ -417,15 +418,17 @@ def main():
 
     def on_mode_switch(*_args):
         mode = mode_var.get()
-        if mode == "image2video":
+        if mode in ("image2video", "flf2v"):
             btn_browse.pack(side=tk.LEFT)
             lbl_image.pack(side=tk.LEFT, padx=(8, 0))
+        else:
+            btn_browse.pack_forget()
+            lbl_image.pack_forget()
+        if mode == "flf2v":
             btn_browse_end.pack(side=tk.LEFT)
             btn_clear_end.pack(side=tk.LEFT, padx=(2, 0))
             lbl_end_image.pack(side=tk.LEFT, padx=(8, 0))
         else:
-            btn_browse.pack_forget()
-            lbl_image.pack_forget()
             btn_browse_end.pack_forget()
             btn_clear_end.pack_forget()
             lbl_end_image.pack_forget()
@@ -566,7 +569,7 @@ def main():
         if not os.path.isdir(ENHANCER_PATH):
             messagebox.showerror("Error", f"Prompt enhancer not found at {ENHANCER_PATH}.")
             return
-        img = image_path_var.get().strip() if mode_var.get() == "image2video" else ""
+        img = image_path_var.get().strip() if mode_var.get() in ("image2video", "flf2v") else ""
 
         try:
             max_words = int(enh_words_var.get())
@@ -1088,9 +1091,15 @@ def main():
                 if not img or not os.path.exists(img):
                     messagebox.showerror("Error", "Image-to-Video mode needs a valid image. Click 'Choose Image...'.")
                     return
+
+            if mode_var.get() == "flf2v":
+                img = image_path_var.get().strip()
+                if not img or not os.path.exists(img):
+                    messagebox.showerror("Error", "First+Last Frame mode needs a valid start image. Click 'Choose Image...'.")
+                    return
                 end_img = end_image_path_var.get().strip()
-                if end_img and not os.path.exists(end_img):
-                    messagebox.showerror("Error", "End frame image path does not exist.")
+                if not end_img or not os.path.exists(end_img):
+                    messagebox.showerror("Error", "First+Last Frame mode needs a valid end image. Click 'Choose End Frame...'.")
                     return
 
             if mode_var.get() == "video2video":

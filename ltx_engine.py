@@ -735,6 +735,13 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
 
         use_upscale = bool(config.get("upscale"))
         use_image = config.get("mode") == "image2video"
+        # FLF2V ("First-Last-Frame to Video") -- LTX's own name for start+end
+        # frame conditioning, per the diffusers example's asset filenames
+        # (flf2v_input_first_frame.png / flf2v_input_last_frame.png). A
+        # separate mode from plain i2v, not an optional extra on it, since it
+        # needs a different pipeline (LTX2ConditionPipeline, not
+        # LTX2ImageToVideoPipeline) and a mandatory second image.
+        use_flf2v = config.get("mode") == "flf2v"
         use_video = config.get("mode") == "video2video"
         if use_video and not VIDEO_TO_VIDEO_ENABLED:
             raise ValueError("Video-to-video is disabled (see VIDEO_TO_VIDEO_ENABLED "
@@ -742,18 +749,19 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
 
         input_image = None
         input_end_image = None
-        if use_image:
+        if use_image or use_flf2v:
             from PIL import Image
 
             image_path = config.get("image_path", "")
             if not image_path or not os.path.exists(image_path):
-                raise ValueError(f"Image-to-video mode selected but no valid image path was given: '{image_path}'")
+                mode_desc = "First+Last-Frame" if use_flf2v else "Image-to-video"
+                raise ValueError(f"{mode_desc} mode selected but no valid start image path was given: '{image_path}'")
             input_image = Image.open(image_path).convert("RGB")
 
-            end_image_path = config.get("end_image_path", "")
-            if end_image_path:
-                if not os.path.exists(end_image_path):
-                    raise ValueError(f"End frame image path does not exist: '{end_image_path}'")
+            if use_flf2v:
+                end_image_path = config.get("end_image_path", "")
+                if not end_image_path or not os.path.exists(end_image_path):
+                    raise ValueError(f"First+Last-Frame mode selected but no valid end image path was given: '{end_image_path}'")
                 input_end_image = Image.open(end_image_path).convert("RGB")
 
         input_video_frames = None
@@ -1137,7 +1145,8 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         else:
             length_call = dict(num_frames=config["frames"])
 
-        mode_label = "Image-to-Video" if use_image else "Video-to-Video" if use_video else "Text-to-Video"
+        mode_label = ("Image-to-Video" if use_image else "First+Last-Frame-to-Video" if use_flf2v
+                      else "Video-to-Video" if use_video else "Text-to-Video")
         len_label = "auto length" if use_auto_duration else f"{config['frames']} frames"
         print(f"--- [3/4] Generating Base Video, {mode_label} ({stage1_w}x{stage1_h}, {len_label}) ---")
         # Under Auto Duration the model picks the length, so config["frames"]
@@ -1198,7 +1207,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
 
         stage1_conditions = None
         with torch.inference_mode():
-            if use_image:
+            if use_image or use_flf2v:
                 # Shares the already-loaded/onloaded transformer, VAE, text
                 # encoder etc with `pipe` -- this just wraps the same resident
                 # component instances in the image-conditioned __call__, no
@@ -1220,7 +1229,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 crf = config.get("image_crf")
                 if crf is None:
                     crf = LTX2_5_IMAGE_CRF
-                if input_end_image is not None:
+                if use_flf2v:
                     # Start+end frame conditioning needs the keyframe-aware
                     # condition pipeline -- LTX2ImageToVideoPipeline only ever
                     # conditions frame 0. `index=-1` is a *latent* index (see
@@ -1380,9 +1389,9 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 # [1, 1792, 128], but the expected shape is [1, 2688, 128]"
                 # (256x256 stage 1 upscaled to 512x512, defaults implying
                 # 512x768) before out_w/out_h were added here.
-                stage2_pipe = i2v_pipe if use_image else v2v_pipe if use_video else pipe
+                stage2_pipe = i2v_pipe if (use_image or use_flf2v) else v2v_pipe if use_video else pipe
                 stage2_conditions = {}
-                if use_image and stage1_conditions is not None:
+                if use_flf2v and stage1_conditions is not None:
                     stage2_conditions["conditions"] = stage1_conditions
                     stage2_conditions["height"] = out_h
                     stage2_conditions["width"] = out_w
@@ -1420,7 +1429,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             f"(vs {last_step_at[0] - generation_start_time:.1f}s for all {total_steps} steps)")
 
         print("  --> Exporting final video...")
-        mode_tag = "i2v_" if use_image else "v2v_" if use_video else ""
+        mode_tag = "i2v_" if use_image else "flf2v_" if use_flf2v else "v2v_" if use_video else ""
         # Report what was actually produced -- under Auto Duration this is the
         # model's chosen length, not config["frames"].
         final_frames = len(video[0])
