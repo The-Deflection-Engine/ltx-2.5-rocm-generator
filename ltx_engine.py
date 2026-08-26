@@ -480,7 +480,81 @@ def _embed_cache_key(model_path, p, np_text, need_negative):
     return h.hexdigest()
 
 
-def _enhance_prompt_inproc(torch, p, image_path, max_words=None):
+# diffusers ships I2V/T2V system prompts (LTX2_5_I2V/T2V_DEFAULT_SYSTEM_PROMPT)
+# but no FLF2V one -- FLF2V is a diffusers pipeline capability
+# (LTX2ConditionPipeline), not something LTX2Pipeline.enhance_prompt() itself
+# knows about (it hard-codes a single `{"type": "image"}` content block, see
+# _enhance_flf2v_inproc below). Adapted from LTX2_5_I2V_DEFAULT_SYSTEM_PROMPT:
+# same 7-point captioning style, but grounds BOTH ends of the clip and asks
+# for one continuous, physically plausible path between them instead of one
+# open-ended continuation.
+LTX2_5_FLF2V_SYSTEM_PROMPT = """You are given a REFERENCE START IMAGE (the exact first frame of the video), a REFERENCE END IMAGE (the exact last frame of the video), and a user's short request describing what happens between them. Write a single, highly detailed audio-visual caption describing the video that begins on the start image, ends on the end image, and best fulfills that request, in the EXACT style of the training captions used for this video model. The generated video is scored against the user's ORIGINAL request, so preserve every element the user stated; expand faithfully into the full caption style without contradicting or dropping anything they asked for.
+
+FIRST+LAST FRAME GROUNDING (do this first): the opening of your caption must match the START image exactly -- same subject(s), identity, appearance, clothing, setting, lighting, and composition as shown. The closing of your caption must match the END image exactly, in the same way. Narrate one continuous, physically plausible chronological path from the start image to the end image -- use the user's request to determine what happens in between, and never contradict, replace, or invent anything inconsistent with either image. Single continuous take -- no hard cuts.
+
+Match this captioning style precisely:
+
+1. Begin immediately with the action or visual detail. Do NOT use "The scene opens…", "We see…", "There is…".
+
+2. Objective, observable description only. Do not infer emotions or intentions — describe what is visible and audible (e.g. not "he looks sad" but "his eyebrows angle downward and his lips are pressed together").
+
+3. Full visual detail: environment (materials, textures, lighting, colors), character appearance (clothing, posture, facial details), and the spatial positioning of all elements — grounded in and consistent with BOTH reference images at their respective ends of the clip. When a human appears, identify them specifically (gendered terms when clearly implied; differentiate multiple people consistently) and describe visible physical attributes — apparent gender presentation, skin tone, estimated age group, hair color/length/style, build, clothing and accessories. Do not infer ethnicity, nationality, religion, or culture.
+
+4. Precise motion and cinematic description. For every shot you MUST include, woven naturally into the prose (never as tags or labels):
+   - Shot type (exactly one: extreme wide shot / wide shot / medium shot / medium close-up / close-up / extreme close-up) — consistent with how the start image is framed, and if the end image implies a different framing, describe the camera move that gets there.
+   - Camera motion (always stated; if none, explicitly say the camera remains static). Camera movement is expected and good — match the user if they specified it, otherwise choose the treatment that best bridges the two reference frames.
+   - Camera viewpoint relative to subject (front-facing / back-facing / side view / over-the-shoulder / top-down / low-angle / high-angle) — matching the start image's viewpoint at the opening, and the end image's viewpoint by the close.
+   Express these as flowing prose: "a medium shot frames…, captured from a front-facing angle as the camera slowly pans…". Never as "medium shot, static camera —".
+
+5. Complete soundscape, integrated naturally: any dialogue (quote it exactly, in the original language), tone of voice, background music (type, mood, volume changes), and environmental sounds (footsteps, wind, traffic, animals). If the request implies sound, describe it plausibly.
+
+6. Strict chronological, real-time flow using transitions like "Initially…", "A moment later…", "Simultaneously…". Keep the user's requested motion/action central and in motion throughout, arriving at the end image's exact state by the final moment.
+
+7. One single continuous paragraph. No bullet points, no section headers, no labels like "Audio:" or "Visual:". Exhaustive and lossless — include background elements, subtle movements, lighting, secondary sounds — detailed enough to reconstruct the scene. Aim for a rich, complete paragraph (roughly 150–220 words).
+
+If the user wrote in another language, produce the English caption of the same content. Output ONLY the caption text — no JSON, no preamble.
+
+AESTHETIC QUALITY (in addition to the above, without breaking the objective caption style or contradicting either reference image): render the described scene with strong visual production value — cinematic, film-grade color and contrast, beautiful natural lighting, crisp fine detail and texture, pleasing composition and depth. Weave these quality descriptors naturally into the same observable prose (e.g. "warm cinematic lighting", "richly saturated film-grade color", "crisp high-resolution detail") — describe how the exact requested scene, moving from the start frame to the end frame, LOOKS at its most visually striking, never adding new objects or actions and never contradicting either reference image. Keep everything else (first+last frame grounding, framing triple, soundscape, chronological single paragraph, faithfulness) exactly as specified."""
+
+
+def _enhance_flf2v_inproc(torch, pipe_text, prompt, start_image, end_image, system_prompt, device):
+    """Two-image variant of `LTX2Pipeline.enhance_prompt` -- that method only
+    ever inserts one `{"type": "image"}` content block (see
+    diffusers/pipelines/ltx2/pipeline_ltx2.py), so FLF2V's start+end pair
+    can't go through it. Replicates its message/generation/decode logic
+    exactly, just with two image slots instead of one -- verified against
+    this checkpoint that the Gemma4 processor accepts a list of 2 images
+    matched positionally to 2 `{"type": "image"}` blocks in the template.
+    """
+    from diffusers.pipelines.ltx2.pipeline_ltx2 import _prepare_enhance_image, _pad_inputs_for_attention_alignment, clean_response
+    from diffusers.pipelines.ltx2.utils import GEMMA4_PROMPT_ENHANCEMENT_CONFIG
+
+    config = GEMMA4_PROMPT_ENHANCEMENT_CONFIG
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": [
+            {"type": "image"},
+            {"type": "image"},
+            {"type": "text", "text": f"User Raw Input Prompt: {prompt}."},
+        ]},
+    ]
+    template = pipe_text.processor.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    images = [_prepare_enhance_image(start_image), _prepare_enhance_image(end_image)]
+    model_inputs = pipe_text.processor(text=template, images=images, return_tensors="pt").to(device)
+    pad_token_id = pipe_text.processor.tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = 0
+    model_inputs = _pad_inputs_for_attention_alignment(model_inputs, pad_token_id=pad_token_id)
+    pipe_text.prompt_enhancer.to(device)
+    torch.manual_seed(config.seed)
+    generated = pipe_text.prompt_enhancer.generate(
+        **model_inputs, max_new_tokens=config.max_new_tokens, **config.generation_kwargs,
+    )
+    generated_ids = generated[0][len(model_inputs.input_ids[0]):]
+    return clean_response(pipe_text.processor.tokenizer.decode(generated_ids, skip_special_tokens=True))
+
+
+def _enhance_prompt_inproc(torch, p, image_path, max_words=None, end_image_path=None):
     """Run the Gemma-4 prompt enhancer. Always called inside a throwaway
     subprocess so the ~10GB enhancer never coexists with the transformer.
 
@@ -501,6 +575,11 @@ def _enhance_prompt_inproc(torch, p, image_path, max_words=None):
         from PIL import Image
         image = Image.open(image_path).convert("RGB")
 
+    end_image = None
+    if end_image_path and os.path.exists(end_image_path):
+        from PIL import Image
+        end_image = Image.open(end_image_path).convert("RGB")
+
     print("  -> Loading prompt enhancer (Gemma-4 E4B)...")
     pipe_text = types.SimpleNamespace(_execution_device="cpu")
     pipe_text.enhance_prompt = LTX2Pipeline.enhance_prompt.__get__(pipe_text)
@@ -509,7 +588,13 @@ def _enhance_prompt_inproc(torch, p, image_path, max_words=None):
         ENHANCER_PATH, dtype=torch.bfloat16, local_files_only=True,
     ).eval()
 
-    system_prompt = LTX2_5_I2V_DEFAULT_SYSTEM_PROMPT if image is not None else LTX2_5_T2V_DEFAULT_SYSTEM_PROMPT
+    use_flf2v = image is not None and end_image is not None
+    if use_flf2v:
+        system_prompt = LTX2_5_FLF2V_SYSTEM_PROMPT
+    elif image is not None:
+        system_prompt = LTX2_5_I2V_DEFAULT_SYSTEM_PROMPT
+    else:
+        system_prompt = LTX2_5_T2V_DEFAULT_SYSTEM_PROMPT
 
     # The stock system prompt asks for an "exhaustive and lossless" caption --
     # that verbosity is deliberate, because LTX-2.5 was trained on captions in
@@ -529,6 +614,8 @@ def _enhance_prompt_inproc(torch, p, image_path, max_words=None):
 
     def run(device):
         with torch.no_grad():
+            if use_flf2v:
+                return _enhance_flf2v_inproc(torch, pipe_text, p, image, end_image, system_prompt, device)
             return pipe_text.enhance_prompt(
                 prompt=p, system_prompt=system_prompt, image=image, device=device,
             )[0]
@@ -552,11 +639,11 @@ def _enhance_prompt_inproc(torch, p, image_path, max_words=None):
     return enhanced
 
 
-def enhance_in_subprocess(p, image_path, out_path, max_words=None):
+def enhance_in_subprocess(p, image_path, out_path, max_words=None, end_image_path=None):
     """Subprocess target for the standalone '✨ Enhance Now' button."""
     import torch
     with open(out_path, "w") as f:
-        f.write(_enhance_prompt_inproc(torch, p, image_path, max_words))
+        f.write(_enhance_prompt_inproc(torch, p, image_path, max_words, end_image_path))
 
 
 def encode_in_subprocess(model_path, p, np_text, need_negative, out_path):

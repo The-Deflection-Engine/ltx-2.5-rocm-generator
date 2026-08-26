@@ -570,6 +570,7 @@ def main():
             messagebox.showerror("Error", f"Prompt enhancer not found at {ENHANCER_PATH}.")
             return
         img = image_path_var.get().strip() if mode_var.get() in ("image2video", "flf2v") else ""
+        end_img = end_image_path_var.get().strip() if mode_var.get() == "flf2v" else ""
 
         try:
             max_words = int(enh_words_var.get())
@@ -586,7 +587,7 @@ def main():
                 if os.path.exists(out_path):
                     os.remove(out_path)
                 print("\n--- Enhancing prompt ---")
-                run_subprocess_logged("enhance_in_subprocess", (p, img, out_path, max_words))
+                run_subprocess_logged("enhance_in_subprocess", (p, img, out_path, max_words, end_img))
                 if not os.path.exists(out_path):
                     raise RuntimeError("Enhancement failed -- see the output above.")
                 with open(out_path) as f:
