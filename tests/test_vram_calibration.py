@@ -93,17 +93,19 @@ def _rec(threshold):
     return eng.recommended_defaults({"token_warn_threshold": threshold})
 
 
-def test_defaults_never_choose_upscale():
-    # Upscale is the user's call at every card size -- see DEFAULT_PRESETS.
+def test_defaults_never_choose_the_consent_knobs():
+    # upscale / stg / cfg are the user's call at every card size, however big.
     for thr in (2000, 30000, 100000, 5_000_000):
-        assert "upscale" not in _rec(thr)
+        r = _rec(thr)
+        for key in ("upscale", "stg_mode", "cfg_mode"):
+            assert key not in r, f"{key} must never be auto-enabled ({thr})"
 
 
 def test_defaults_stay_inside_their_budget():
     for thr in (2000, 10000, 33837, 200000):
         r = _rec(thr)
         cost = eng._preset_cost(r["width"], r["height"], 121,
-                                r["stg_mode"], r["modality_scale"])
+                                r["modality_scale"])
         # The floor preset is allowed to exceed it -- there is nothing smaller.
         floor = eng.DEFAULT_PRESETS[-1]
         if (r["width"], r["height"]) != (floor[0], floor[1]):
@@ -112,11 +114,11 @@ def test_defaults_stay_inside_their_budget():
 
 def test_defaults_are_monotonic_in_headroom():
     """More VRAM must never select a leaner preset than less VRAM."""
-    order = {p[:2] + p[2:]: i for i, p in enumerate(eng.DEFAULT_PRESETS)}
+    order = {p: i for i, p in enumerate(eng.DEFAULT_PRESETS)}
     prev_rank = None
     for thr in (2000, 5000, 15000, 35000, 70000, 200000):
         r = _rec(thr)
-        rank = order[(r["width"], r["height"], r["stg_mode"], r["modality_scale"])]
+        rank = order[(r["width"], r["height"], r["modality_scale"])]
         if prev_rank is not None:
             assert rank <= prev_rank, f"threshold {thr} picked a leaner preset"
         prev_rank = rank
@@ -140,7 +142,9 @@ def test_apply_seeds_a_fresh_config():
             "modality_scale": 1.0, "frames": 121}
     out = eng.apply_recommended_defaults(dict(base), config_exists=False)
     assert (out["width"], out["height"]) != (111, 222)
-    assert "upscale" not in out or out["upscale"] is False
+    # Seeding must not switch on anything that needs the user's consent.
+    assert out["stg_mode"] is False
+    assert out.get("upscale", False) is False
 
 
 if __name__ == "__main__":
