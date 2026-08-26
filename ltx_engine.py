@@ -62,11 +62,45 @@ MODEL_PATH = os.path.abspath("./local_ltx25_fp8")
 # upsampler and is architecturally incompatible with the LTX-2.5 VAE.
 BASE_MODEL_PATH = os.path.abspath("./local_ltx25_model")
 EMBED_CACHE_DIR = os.path.abspath("./.embed_cache")
-# google/gemma-4-E4B-it. The LTX-2.5 checkpoints ship `prompt_enhancer` and
-# `processor` as nulls, so the enhancer is a separate download.
-# local_ltx25_enhancer/ (the older E2B checkpoint) is kept on disk for A/B
-# comparison but is no longer loaded by default.
-ENHANCER_PATH = os.path.abspath("./local_ltx25_enhancer_e4b")
+# The LTX-2.5 checkpoints ship `prompt_enhancer` and `processor` as nulls,
+# so the enhancer is a separate download -- Gemma-4, in two sizes. A keyed
+# dict rather than one constant so the GUI can list/select/download by name
+# without a new global here every time a size is added.
+ENHANCER_MODELS = {
+    "e2b": {
+        "repo_id": "google/gemma-4-E2B-it",
+        "local_dir": os.path.abspath("./local_ltx25_enhancer"),
+        "label": "E2B (faster, ~9.6GB)",
+    },
+    "e4b": {
+        "repo_id": "google/gemma-4-E4B-it",
+        "local_dir": os.path.abspath("./local_ltx25_enhancer_e4b"),
+        "label": "E4B (more accurate, ~15GB)",
+    },
+}
+DEFAULT_ENHANCER_MODEL = "e4b"
+
+
+def enhancer_is_downloaded(model_key):
+    """config.json + at least one .safetensors file, not just directory
+    existence -- an interrupted/partial download would otherwise read as
+    "downloaded" here and then fail deep inside
+    from_pretrained(local_files_only=True) instead of prompting a re-fetch."""
+    local_dir = ENHANCER_MODELS[model_key]["local_dir"]
+    if not os.path.isfile(os.path.join(local_dir, "config.json")):
+        return False
+    return any(f.endswith(".safetensors") for f in os.listdir(local_dir))
+
+
+def download_enhancer_model(model_key):
+    """Subprocess target: fetch a prompt-enhancer checkpoint from the Hub.
+    huggingface_hub prints its own tqdm progress bars, which
+    run_subprocess_logged streams into the GUI log the same way it does for
+    every other long-running step in this file -- no separate progress
+    plumbing needed."""
+    from huggingface_hub import snapshot_download
+    info = ENHANCER_MODELS[model_key]
+    snapshot_download(info["repo_id"], local_dir=info["local_dir"])
 
 # Auto Duration's duration_head can predict up to 20s -- that's a property of
 # the head itself, not the hardware. What the *card* survives depends on
@@ -554,15 +588,18 @@ def _enhance_flf2v_inproc(torch, pipe_text, prompt, start_image, end_image, syst
     return clean_response(pipe_text.processor.tokenizer.decode(generated_ids, skip_special_tokens=True))
 
 
-def _enhance_prompt_inproc(torch, p, image_path, max_words=None, end_image_path=None):
+def _enhance_prompt_inproc(torch, p, image_path, max_words=None, end_image_path=None, model_key=None):
     """Run the Gemma-4 prompt enhancer. Always called inside a throwaway
-    subprocess so the ~10GB enhancer never coexists with the transformer.
+    subprocess so the ~10-16GB enhancer never coexists with the transformer.
 
     `LTX2Pipeline.enhance_prompt` only reads `.processor`, `.prompt_enhancer`
     and `._execution_device`, so it runs against a bare shell object -- no need
     to load the 23GB text encoder just to rewrite a sentence.
     """
     import types
+    model_key = model_key or DEFAULT_ENHANCER_MODEL
+    enhancer_info = ENHANCER_MODELS[model_key]
+    enhancer_path = enhancer_info["local_dir"]
     from diffusers import LTX2Pipeline
     from transformers import AutoModelForCausalLM, AutoProcessor
     from diffusers.pipelines.ltx2.utils import (
@@ -580,12 +617,12 @@ def _enhance_prompt_inproc(torch, p, image_path, max_words=None, end_image_path=
         from PIL import Image
         end_image = Image.open(end_image_path).convert("RGB")
 
-    print("  -> Loading prompt enhancer (Gemma-4 E4B)...")
+    print(f"  -> Loading prompt enhancer (Gemma-4 {enhancer_info['label']})...")
     pipe_text = types.SimpleNamespace(_execution_device="cpu")
     pipe_text.enhance_prompt = LTX2Pipeline.enhance_prompt.__get__(pipe_text)
-    pipe_text.processor = AutoProcessor.from_pretrained(ENHANCER_PATH, local_files_only=True)
+    pipe_text.processor = AutoProcessor.from_pretrained(enhancer_path, local_files_only=True)
     pipe_text.prompt_enhancer = AutoModelForCausalLM.from_pretrained(
-        ENHANCER_PATH, dtype=torch.bfloat16, local_files_only=True,
+        enhancer_path, dtype=torch.bfloat16, local_files_only=True,
     ).eval()
 
     use_flf2v = image is not None and end_image is not None
@@ -639,11 +676,11 @@ def _enhance_prompt_inproc(torch, p, image_path, max_words=None, end_image_path=
     return enhanced
 
 
-def enhance_in_subprocess(p, image_path, out_path, max_words=None, end_image_path=None):
+def enhance_in_subprocess(p, image_path, out_path, max_words=None, end_image_path=None, model_key=None):
     """Subprocess target for the standalone '✨ Enhance Now' button."""
     import torch
     with open(out_path, "w") as f:
-        f.write(_enhance_prompt_inproc(torch, p, image_path, max_words, end_image_path))
+        f.write(_enhance_prompt_inproc(torch, p, image_path, max_words, end_image_path, model_key))
 
 
 def encode_in_subprocess(model_path, p, np_text, need_negative, out_path):

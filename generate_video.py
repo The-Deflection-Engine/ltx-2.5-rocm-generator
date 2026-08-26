@@ -17,7 +17,8 @@ import ltx_engine as eng
 from ltx_engine import (
     CONFIG_FILE,
     EMBED_CACHE_DIR,
-    ENHANCER_PATH,
+    DEFAULT_ENHANCER_MODEL,
+    ENHANCER_MODELS,
     MIN_DIMENSION,
     SPATIAL_COMPRESSION,
     LORA_LOADING_ENABLED,
@@ -26,6 +27,7 @@ from ltx_engine import (
     VRAM_GB_PER_TOKEN,
     align_frames,
     auto_duration_cap_s,
+    enhancer_is_downloaded,
     free_resident_models,
     clear_prompt_history,
     load_prompt_history,
@@ -150,6 +152,7 @@ def main():
             "stg_scale": 1.0,
             # 0 = no cap on the enhanced prompt length.
             "enhance_max_words": 0,
+            "enhancer_model": DEFAULT_ENHANCER_MODEL,
             "cfg_steps": 30,
             "cfg_scale": 3.0,
             # Separate from cfg_scale: the reference recipe runs audio CFG
@@ -592,13 +595,38 @@ def main():
     text_prompt.insert(tk.END, config['prompt'])
 
     enhance_row = ttk.Frame(main_frame)
-    enhance_row.pack(fill=tk.X, pady=(0, 12))
+    enhance_row.pack(fill=tk.X, pady=(0, 4))
 
     ttk.Label(
         enhance_row,
         text="Rewrite the prompt in LTX-2.5's trained caption style:",
         foreground="#666666",
     ).pack(side=tk.LEFT)
+
+    enhancer_model_row = ttk.Frame(main_frame)
+    enhancer_model_row.pack(fill=tk.X, pady=(0, 12))
+    ttk.Label(enhancer_model_row, text="Enhancer model:", foreground="#666666").pack(side=tk.LEFT)
+    enhancer_model_var = tk.StringVar(value=config.get("enhancer_model", DEFAULT_ENHANCER_MODEL))
+    enhancer_model_labels = {key: info["label"] for key, info in ENHANCER_MODELS.items()}
+    enhancer_label_to_key = {v: k for k, v in enhancer_model_labels.items()}
+    cmb_enhancer_model = ttk.Combobox(
+        enhancer_model_row, state="readonly", width=28,
+        values=list(enhancer_model_labels.values()),
+    )
+    cmb_enhancer_model.set(enhancer_model_labels.get(enhancer_model_var.get(), enhancer_model_labels[DEFAULT_ENHANCER_MODEL]))
+
+    def on_enhancer_model_change(*_args):
+        enhancer_model_var.set(enhancer_label_to_key[cmb_enhancer_model.get()])
+
+    cmb_enhancer_model.bind("<<ComboboxSelected>>", on_enhancer_model_change)
+    cmb_enhancer_model.pack(side=tk.LEFT, padx=(6, 0))
+    tooltip(cmb_enhancer_model,
+            "Which Gemma-4 checkpoint rewrites the prompt. E4B is more\n"
+            "accurate but roughly 1.5x the download and load time; E2B is\n"
+            "faster and smaller. Switching models here doesn't affect\n"
+            "generation itself, only the 'Enhance Now' rewrite.\n\n"
+            "Downloaded on first use if not already on disk (confirms first,\n"
+            "since it's several GB from Hugging Face).")
 
     def enhance_now():
         """Rewrite the prompt box in place so it can be reviewed/edited before
@@ -607,9 +635,19 @@ def main():
         if not p:
             messagebox.showerror("Error", "Positive prompt cannot be empty.")
             return
-        if not os.path.isdir(ENHANCER_PATH):
-            messagebox.showerror("Error", f"Prompt enhancer not found at {ENHANCER_PATH}.")
+
+        model_key = enhancer_model_var.get()
+        model_info = ENHANCER_MODELS[model_key]
+        # Checked (and, if needed, confirmed) here on the main thread --
+        # messagebox calls aren't safe from the worker thread below.
+        needs_download = not enhancer_is_downloaded(model_key)
+        if needs_download and not messagebox.askyesno(
+            "Download prompt enhancer?",
+            f"The {model_info['label']} prompt enhancer isn't downloaded yet.\n\n"
+            f"Fetch it from Hugging Face now ({model_info['repo_id']})?",
+        ):
             return
+
         img = image_path_var.get().strip() if mode_var.get() in ("image2video", "flf2v") else ""
         end_img = end_image_path_var.get().strip() if mode_var.get() == "flf2v" else ""
 
@@ -624,11 +662,19 @@ def main():
         def work():
             out_path = os.path.join(EMBED_CACHE_DIR, "enhanced_prompt.txt")
             try:
+                if needs_download:
+                    print(f"\n--- Downloading {model_info['label']} prompt enhancer ---")
+                    root.after(0, lambda: btn_enhance.config(text="✨ Downloading model..."))
+                    code = run_subprocess_logged("download_enhancer_model", (model_key,))
+                    if code != 0 or not enhancer_is_downloaded(model_key):
+                        raise RuntimeError("Enhancer download failed -- see the output above.")
+                    root.after(0, lambda: btn_enhance.config(text="✨ Enhancing..."))
+
                 os.makedirs(EMBED_CACHE_DIR, exist_ok=True)
                 if os.path.exists(out_path):
                     os.remove(out_path)
                 print("\n--- Enhancing prompt ---")
-                run_subprocess_logged("enhance_in_subprocess", (p, img, out_path, max_words, end_img))
+                run_subprocess_logged("enhance_in_subprocess", (p, img, out_path, max_words, end_img, model_key))
                 if not os.path.exists(out_path):
                     raise RuntimeError("Enhancement failed -- see the output above.")
                 with open(out_path) as f:
@@ -1247,6 +1293,7 @@ def main():
                 'stg_mode': stg_var.get(),
                 'stg_scale': float(stg_scale_var.get() or 1.0),
                 'enhance_max_words': max(0, int(enh_words_var.get() or 0)),
+                'enhancer_model': enhancer_model_var.get(),
                 'auto_max_seconds': auto_max_val,
                 'lora_path': lora_path_var.get().strip(),
                 'lora_scale': float(lora_scale_var.get() or 1.0),
