@@ -173,6 +173,11 @@ def main():
             # more speed at the cost of VRAM, drop to 2 if stage 2 OOMs.
             "blocks_per_group": 4
         }
+        # Size the starting settings to this GPU, but only when there is no
+        # saved config -- the file below is the record of what the user chose,
+        # and it is applied on top, so their picks always win.
+        eng.apply_recommended_defaults(defaults, os.path.exists(CONFIG_FILE),
+                                       frames=defaults["frames"])
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, "r") as f:

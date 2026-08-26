@@ -89,6 +89,60 @@ def test_estimate_is_monotonic():
     assert b > a
 
 
+def _rec(threshold):
+    return eng.recommended_defaults({"token_warn_threshold": threshold})
+
+
+def test_defaults_never_choose_upscale():
+    # Upscale is the user's call at every card size -- see DEFAULT_PRESETS.
+    for thr in (2000, 30000, 100000, 5_000_000):
+        assert "upscale" not in _rec(thr)
+
+
+def test_defaults_stay_inside_their_budget():
+    for thr in (2000, 10000, 33837, 200000):
+        r = _rec(thr)
+        cost = eng._preset_cost(r["width"], r["height"], 121,
+                                r["stg_mode"], r["modality_scale"])
+        # The floor preset is allowed to exceed it -- there is nothing smaller.
+        floor = eng.DEFAULT_PRESETS[-1]
+        if (r["width"], r["height"]) != (floor[0], floor[1]):
+            assert cost <= thr * eng.DEFAULT_BUDGET_FRACTION, (thr, r, cost)
+
+
+def test_defaults_are_monotonic_in_headroom():
+    """More VRAM must never select a leaner preset than less VRAM."""
+    order = {p[:2] + p[2:]: i for i, p in enumerate(eng.DEFAULT_PRESETS)}
+    prev_rank = None
+    for thr in (2000, 5000, 15000, 35000, 70000, 200000):
+        r = _rec(thr)
+        rank = order[(r["width"], r["height"], r["stg_mode"], r["modality_scale"])]
+        if prev_rank is not None:
+            assert rank <= prev_rank, f"threshold {thr} picked a leaner preset"
+        prev_rank = rank
+
+
+def test_tiny_card_gets_the_floor_not_a_crash():
+    r = _rec(1)
+    floor = eng.DEFAULT_PRESETS[-1]
+    assert (r["width"], r["height"]) == (floor[0], floor[1])
+
+
+def test_apply_is_a_noop_when_a_config_exists():
+    base = {"width": 111, "height": 222, "stg_mode": False,
+            "modality_scale": 1.0, "frames": 121}
+    out = eng.apply_recommended_defaults(dict(base), config_exists=True)
+    assert out == base, "an existing config must never be overridden"
+
+
+def test_apply_seeds_a_fresh_config():
+    base = {"width": 111, "height": 222, "stg_mode": False,
+            "modality_scale": 1.0, "frames": 121}
+    out = eng.apply_recommended_defaults(dict(base), config_exists=False)
+    assert (out["width"], out["height"]) != (111, 222)
+    assert "upscale" not in out or out["upscale"] is False
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

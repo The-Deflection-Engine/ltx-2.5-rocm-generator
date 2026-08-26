@@ -220,6 +220,10 @@ def main():
         "stg_mode": False, "stg_scale": 1.0,
         "blocks_per_group": 4, "attention_backend": "native",
     }
+    # Same rule as the GUI: adapt the starting settings to this GPU only when
+    # there is no config file to honour. Explicit flags still override below.
+    gv.apply_recommended_defaults(defaults, os.path.exists(args.config),
+                                  frames=defaults["frames"])
     defaults.update(config)
     config = resolve(defaults, args)
 

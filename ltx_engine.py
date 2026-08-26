@@ -397,6 +397,119 @@ def token_warn_threshold(config=None):
     return max(2000, int(tokens))
 
 
+# --- Adaptive defaults --------------------------------------------------------
+# The shipped defaults were picked for one 16GB card: everything expensive off,
+# 960x544 base. On a smaller card that still won't fit; on a bigger one it
+# leaves most of the card idle and quietly withholds quality the hardware could
+# afford. With the VRAM model now calibrated per-machine, the starting settings
+# can be derived instead of guessed.
+#
+# These only ever seed a *fresh* config. Every front-end loads saved settings
+# over the top of its defaults dict, so once a user has clicked Generate once,
+# their choices win permanently -- this can never reach in and change a setting
+# someone deliberately picked.
+#
+# Defaults get a fraction of the warning threshold rather than all of it: a
+# default that trips its own "large sequence" dialog on the first click is a
+# bad default, and the threshold is a ceiling, not a target.
+DEFAULT_BUDGET_FRACTION = 0.7
+
+# Explicit presets, richest first -- the first one that fits the budget wins.
+#
+# UPSCALE IS DELIBERATELY NOT HERE. It is the single biggest quality lever and
+# it would fit on a large card, but it also doubles the output dimensions and
+# multiplies cost 4x, and nobody should discover that happened to them because
+# their GPU is roomy. It stays a tick the user makes on purpose. (The original
+# reason it defaults off -- a 960x544 2-stage 193-frame run taking the desktop
+# down -- turns out not to be the argument: that run is ~51k tokens, still far
+# above the calibrated threshold, so it would be warned about today regardless.
+# The argument that stands is consent, not headroom.)
+#
+# Ordering rules encoded here:
+#   - resolution up to the reference 960x544 base first
+#   - then STG: measured here to improve anatomy and object coherence, 2x
+#   - then modality: mostly an audio/AV-coupling gain, 2x
+#   - only past 960x544 once guidance is already affordable, so a big card
+#     spends its first headroom on quality rather than raw pixels
+#   - CFG never: at ~7-8x it is a considered choice, not something to switch
+#     on for someone because their card happens to be large.
+# (width, height, stg_mode, modality_scale)
+DEFAULT_PRESETS = (
+    (1280, 704, True,  3.0),
+    (1280, 704, True,  1.0),
+    (960,  544, True,  3.0),
+    (960,  544, True,  1.0),
+    (960,  544, False, 1.0),
+    (768,  448, True,  1.0),
+    (768,  448, False, 1.0),
+    (640,  384, False, 1.0),
+    (512,  288, False, 1.0),
+    (320,  192, False, 1.0),
+    (MIN_DIMENSION, MIN_DIMENSION, False, 1.0),
+)
+
+
+def _preset_cost(width, height, frames, stg, modality_scale):
+    """Effective tokens for a candidate preset -- the same arithmetic the
+    pre-flight check and the engine's own pass count use. Always costed
+    single-stage, since upscale is never chosen here."""
+    return latent_tokens(width, height, frames, False) * \
+        guidance_pass_count(False, stg, modality_scale)
+
+
+def recommended_defaults(config=None, vram_total_gb=None, frames=121):
+    """Starting settings sized to the card actually present.
+
+    Returns a dict of config keys (width/height/stg_mode/modality_scale) plus
+    `_budget` and `_threshold` for the caller to log. Never returns `upscale`
+    -- see the note on DEFAULT_PRESETS. Pure arithmetic over
+    token_warn_threshold(), so it inherits whatever the VRAM model currently
+    is -- shipped constants on a fresh install, this machine's own calibration
+    once enough runs exist.
+    """
+    threshold = token_warn_threshold(config)
+    budget = threshold * DEFAULT_BUDGET_FRACTION
+
+    # The last preset is the floor: if even that does not fit there is nothing
+    # smaller to offer, so take it and let the normal warning do its job.
+    w, h, stg, modality = DEFAULT_PRESETS[-1]
+    for cand in DEFAULT_PRESETS:
+        if _preset_cost(cand[0], cand[1], frames, cand[2], cand[3]) <= budget:
+            w, h, stg, modality = cand
+            break
+
+    return {"width": w, "height": h, "stg_mode": stg,
+            "modality_scale": modality,
+            "_budget": int(budget), "_threshold": int(threshold)}
+
+
+def apply_recommended_defaults(defaults, config_exists, frames=121):
+    """Fold adaptive values into a front-end's defaults dict, in place.
+
+    No-op once a saved config exists: the settings file is the record of what
+    the user chose, and re-deriving on top of it would silently move settings
+    between sessions -- e.g. closing a browser frees VRAM, and the next launch
+    would "helpfully" turn on upscale.
+    """
+    if config_exists:
+        return defaults
+    try:
+        rec = recommended_defaults(frames=frames)
+    except Exception as exc:
+        dbg(f"adaptive defaults skipped: {exc}")
+        return defaults
+    for key in ("width", "height", "stg_mode", "modality_scale"):
+        defaults[key] = rec[key]
+    enabled = ["stg"] if rec["stg_mode"] else []
+    if rec["modality_scale"] > 1.0:
+        enabled.append("modality")
+    print(f"  -> First run: sized defaults to this GPU -- "
+          f"{rec['width']}x{rec['height']}"
+          f"{', ' + ' + '.join(enabled) if enabled else ', no extra guidance'} "
+          f"(budget {rec['_budget']:,} of {rec['_threshold']:,} tokens).")
+    return defaults
+
+
 def resolve_modality_scale(config):
     """Modality-guidance scale from a config, honouring the legacy key name.
 
