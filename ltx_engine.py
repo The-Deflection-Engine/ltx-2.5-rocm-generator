@@ -359,6 +359,28 @@ TOKEN_WARN_FLOOR = 2000
 # already logs at the end of a full-resident run.
 FULL_RESIDENT_VRAM_THRESHOLD_GB = 29.0
 
+# VRAM_BASE_GB above is an *offload*-profile intercept: it assumes the
+# transformer is streamed block-by-block, so only a group at a time is resident.
+# The resident profile carries the whole fp8 transformer instead -- ~18GB, more
+# than the entire token term at any size this app renders. The self-calibration
+# is keyed by profile, but the *shipped* fallback was not, so until this machine
+# has fitted its own "resident" line every estimate and the token warning
+# under-counted by that 18GB and warned about nothing. Charge it explicitly.
+# Slightly optimistic in practice (the streamed intercept already includes a
+# group's worth of weights, which this double-counts); the first real resident
+# run replaces both numbers with measured ones anyway.
+#
+# One measurement so far, from the OOM that prompted this: 1024x576 / 241
+# frames / no guidance = 17,856 effective tokens, on a 32GB card. Predicted
+# 28.92GB, died asking for 2.64GB with 26.32GB allocated + 2.64GB reserved =
+# 28.96GB reserved. The model is right; the card is the problem. Consequence
+# worth knowing: 25.68GB of intercept against 32GB * 0.85 headroom leaves only
+# ~7,700 tokens for the run itself, so resident mode engages on short clips
+# only. A card that runs it comfortably at full length wants ~40GB, not 29 --
+# FULL_RESIDENT_VRAM_THRESHOLD_GB is the floor at which it is *ever* worth
+# trying, not the point at which it always works.
+RESIDENT_TRANSFORMER_GB = 18.0
+
 # --- Self-calibration ---------------------------------------------------------
 # The constants above are a two-point fit from one RX 9070 XT. Rather than ship
 # more hardcoded numbers for hardware nobody here can test on, every successful
@@ -404,8 +426,13 @@ def _load_calibration():
         return []
 
 
-def record_vram_observation(eff_tokens, peak_gb, vram_total_gb=None):
+def record_vram_observation(eff_tokens, peak_gb, vram_total_gb=None, profile=None):
     """Append one (tokens, peak GB) point from a completed run.
+
+    `profile` is the regime the run *actually* used. Pass it: a big card can
+    still fall back to streaming for a run that won't fit resident (see
+    resident_profile_fits), and filing that peak under "resident" because the
+    card is large is exactly the profile-mixing the fit cannot survive.
 
     Never raises: this runs at the tail of a successful generation, and losing
     a calibration sample must not turn a finished render into a failed one.
@@ -415,7 +442,7 @@ def record_vram_observation(eff_tokens, peak_gb, vram_total_gb=None):
             return
         points = _load_calibration()
         points.append({
-            "profile": vram_profile(vram_total_gb),
+            "profile": profile or vram_profile(vram_total_gb),
             "tokens": int(eff_tokens),
             "peak_gb": round(float(peak_gb), 3),
             "ts": int(time.time()),
@@ -477,6 +504,8 @@ def vram_model(config=None, vram_total_gb=None):
     fit = fit_vram_model(_load_calibration(), profile)
     if fit:
         return fit[0], fit[1], f"calibrated:{profile}"
+    if profile == "resident":
+        return VRAM_BASE_GB + RESIDENT_TRANSFORMER_GB, VRAM_GB_PER_TOKEN, "shipped:resident"
     return VRAM_BASE_GB, VRAM_GB_PER_TOKEN, "shipped"
 
 
@@ -486,6 +515,23 @@ def estimate_vram_gb(eff_tokens, config=None, vram_total_gb=None):
     threshold below."""
     base, per_token, _ = vram_model(config, vram_total_gb)
     return base + per_token * eff_tokens
+
+
+def resident_profile_fits(eff_tokens, config=None, vram_total_gb=None):
+    """Whether *this run* can afford to keep the transformer GPU-resident.
+
+    Card size alone is not the question. The transformer stays resident through
+    the VAE decode, which is the peak of the whole run and lands after every
+    denoise step has been paid for -- so a card that clears
+    FULL_RESIDENT_VRAM_THRESHOLD_GB still OOMs on a long clip, 4 minutes in.
+    Streaming that same run costs PCIe round-trips and finishes.
+    """
+    if not vram_total_gb:
+        _, _, vram_total_gb = hw_monitor.get_gpu_stats()
+    if not vram_total_gb or vram_total_gb < FULL_RESIDENT_VRAM_THRESHOLD_GB:
+        return False
+    base, per_token, _ = vram_model(config, vram_total_gb)
+    return base + per_token * eff_tokens <= vram_total_gb * VRAM_HEADROOM
 
 
 def token_warn_threshold(config=None):
@@ -1653,7 +1699,14 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 _EMBED_MEM_CACHE.pop(next(iter(_EMBED_MEM_CACHE)))  # oldest inserted
             _EMBED_MEM_CACHE[key] = embeds
 
-        prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask = embeds
+        # The cache is written by the encoder subprocess, so these come back on
+        # CPU. Group offload's hooks used to move pipeline inputs onto the onload
+        # device for us; the full-resident path (>= FULL_RESIDENT_VRAM_THRESHOLD_GB,
+        # no hooks) has nothing doing that, and diffusers' encode_prompt returns
+        # caller-supplied embeds untouched -- so move them here, for every path.
+        prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask = [
+            t if t is None else t.to("cuda") for t in embeds
+        ]
 
         if cancel_flag:
             raise CancellationError("Cancelled after text encoding.")
@@ -1667,6 +1720,18 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         # them part of the cache identity -- changing either rebuilds by itself.
         # A LoRA is baked in the same way (it's merged into the transformer's
         # adapter weights), so it joins the same identity tuple.
+        # Resident vs streamed is decided per *run*, not per card, and it has to
+        # be decided here: the regime is baked into the resident pipeline, so it
+        # joins the cache identity below or a reused pipe silently keeps the
+        # previous run's arrangement. Under Auto Duration the length isn't known
+        # yet -- plan for the longest clip it may pick, since that's the one that
+        # would OOM.
+        _, _, vram_total_gb = hw_monitor.get_gpu_stats()
+        plan_frames = (int(round(auto_max_s * float(config["fps"]))) if want_auto_duration
+                       else int(config["frames"]))
+        full_resident = resident_profile_fits(
+            effective_tokens(config, stage1_w, stage1_h, plan_frames), config, vram_total_gb)
+
         build_opts = (int(config.get("blocks_per_group", 4)),
                       config.get("attention_backend", "native"),
                       # The whole stack, in order: adding, removing, reordering
@@ -1674,7 +1739,11 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                       # they are merged into the resident transformer. A tuple
                       # of pairs rather than just the paths -- a scale change
                       # alone changes the weights just as much.
-                      tuple((e["path"], e["scale"]) for e in resolve_loras(config)))
+                      tuple((e["path"], e["scale"]) for e in resolve_loras(config)),
+                      # Offload regime: the transformer is either .to(cuda)'d or
+                      # wrapped in group-offload hooks at build time, and neither
+                      # is undone by reuse.
+                      full_resident)
 
         if (_MODEL_CACHE["pipe"] is not None
                 and _MODEL_CACHE["path"] == MODEL_PATH
@@ -1773,16 +1842,18 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 except Exception as exc:
                     print(f"  -> Attention backend '{backend}' unavailable ({exc}); using default.")
 
-            # On a big enough card, skip offload/streaming entirely and just keep
-            # the transformer GPU-resident -- see FULL_RESIDENT_VRAM_THRESHOLD_GB.
-            _, _, vram_total_gb = hw_monitor.get_gpu_stats()
-            full_resident = bool(vram_total_gb) and vram_total_gb >= FULL_RESIDENT_VRAM_THRESHOLD_GB
+            # Big enough card *and* a run that fits in it: skip offload/streaming
+            # entirely and keep the transformer GPU-resident. Decided above, in
+            # resident_profile_fits(), because it is part of the cache identity.
             if full_resident:
-                print(f"  -> {vram_total_gb:.0f}GB VRAM detected (>= "
-                      f"{FULL_RESIDENT_VRAM_THRESHOLD_GB:.0f}GB estimated threshold); "
+                print(f"  -> {vram_total_gb:.0f}GB VRAM and this run fits; "
                       "keeping transformer GPU-resident, no offload streaming.")
                 pipe.transformer.to(onload_device)
             else:
+                if vram_total_gb and vram_total_gb >= FULL_RESIDENT_VRAM_THRESHOLD_GB:
+                    print(f"  -> {vram_total_gb:.0f}GB VRAM, but this run's estimated peak "
+                          "doesn't leave room for a resident transformer through the VAE "
+                          "decode; streaming it instead (slower, but it finishes).")
                 # Group offload: 48 transformer blocks, streamed from pinned host RAM.
                 # NOTE: `use_stream=True` forces num_blocks_per_group to 1 -- diffusers
                 # only supports the prefetch stream at a group size of 1 and logs
@@ -1814,11 +1885,22 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             # onto cuda directly in the full-resident case -- so they MUST be on
             # the GPU before pipe() runs -- the old code moved them *after* the
             # call, i.e. never in time for the decode.
+            #
+            # `connectors` and `duration_head` run *before* the transformer, so
+            # under group offload they got away with staying on CPU: their inputs
+            # (the cached prompt embeds) were on CPU too, and the transformer's
+            # own hooks moved the result across. With no hooks -- and with the
+            # embeds now onloaded up front -- they have to be moved here, same as
+            # the decoders. Both are small (projection layers, not blocks).
             pipe.vae.to(onload_device)
             if getattr(pipe, "audio_vae", None) is not None:
                 pipe.audio_vae.to(onload_device)
             if getattr(pipe, "vocoder", None) is not None:
                 pipe.vocoder.to(onload_device)
+            if getattr(pipe, "connectors", None) is not None:
+                pipe.connectors.to(onload_device)
+            if getattr(pipe, "duration_head", None) is not None:
+                pipe.duration_head.to(onload_device)
 
             _MODEL_CACHE.update({"pipe": pipe, "path": MODEL_PATH, "opts": build_opts})
 
@@ -2241,6 +2323,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             effective_tokens(config, stage1_w, stage1_h, final_frames),
             torch.cuda.max_memory_reserved() / 1024**3,
             _vram_total_gb,
+            profile="resident" if full_resident else "offload",
         )
         # Guidance mode goes in the name: without it a same-seed A/B (STG on
         # vs off) writes the identical filename and the second run silently

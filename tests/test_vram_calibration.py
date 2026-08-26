@@ -73,7 +73,7 @@ def test_unknown_profile_is_empty_not_crash():
 
 def test_model_falls_back_to_shipped_constants():
     base, per_token, source = eng.vram_model(config={})
-    assert source in ("shipped", "calibrated:offload", "calibrated:resident")
+    assert source in ("shipped", "shipped:resident", "calibrated:offload", "calibrated:resident")
     assert base > 0 and per_token > 0
 
 
@@ -169,3 +169,26 @@ if __name__ == "__main__":
         fn()
         print(f"  ok  {fn.__name__}")
     print(f"\n{len(fns)} checks passed.")
+
+
+def test_resident_fallback_charges_the_resident_transformer():
+    """The shipped fallback must be profile-aware too, not just the fit: a
+    resident card holds the whole ~18GB transformer, so an offload intercept
+    under-counts every estimate by more than the entire token term."""
+    off, _, _ = eng.vram_model(config={}, vram_total_gb=16.0)
+    res, _, src = eng.vram_model(config={}, vram_total_gb=32.0)
+    assert src == "shipped:resident"
+    assert res - off > eng.VRAM_GB_PER_TOKEN * 30000
+
+
+def test_resident_is_a_per_run_decision_not_just_a_per_card_one():
+    """The OOM this came from: a 32GB card cleared the card-size threshold and
+    then died at the VAE decode, 4 minutes in. Same card, same settings, only
+    the clip length differs -- the long one must fall back to streaming."""
+    cfg = {"width": 1024, "height": 576, "upscale": False}
+    short = eng.effective_tokens(dict(cfg, frames=49), None, None, None)
+    long = eng.effective_tokens(dict(cfg, frames=241), None, None, None)
+    assert eng.resident_profile_fits(short, cfg, 32.0)
+    assert not eng.resident_profile_fits(long, cfg, 32.0)
+    # A small card never goes resident whatever the run size.
+    assert not eng.resident_profile_fits(short, cfg, 16.0)
