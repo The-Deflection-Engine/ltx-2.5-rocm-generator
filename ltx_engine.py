@@ -337,6 +337,13 @@ FIT_DESKTOP_BASELINE_GB = 0.54  # desktop compositor's idle share on the fit mac
 VRAM_GB_PER_TOKEN = 1.814e-4
 VRAM_HEADROOM = 0.85          # leave 15% for spikes the steady state misses
 TOKEN_WARN_FALLBACK = 30000   # if VRAM can't be read: the measured 16GB value
+# Floor for the computed threshold. Landing here means the VRAM sums say there
+# is no usable budget at all -- which no card this app can run on would produce,
+# so in practice it means the reading was contaminated (sysfs VRAM is
+# system-wide; a second instance of this app, or any other GPU program, inflates
+# the desktop baseline sampled at import). Treated as "unknown", not as "tiny
+# card" -- see apply_recommended_defaults.
+TOKEN_WARN_FLOOR = 2000
 
 # Estimated, NOT yet measured on real hardware (no >=24GB card to test
 # against -- see CLAUDE.md "measure before claiming" / "state what is
@@ -508,7 +515,7 @@ def token_warn_threshold(config=None):
     tokens = (vram_total * VRAM_HEADROOM - base_gb - extra_desktop_gb) / per_token
     # A card too small to hold the base footprint gets the floor, not a
     # negative threshold -- it will warn on essentially everything, correctly.
-    return max(2000, int(tokens))
+    return max(TOKEN_WARN_FLOOR, int(tokens))
 
 
 # --- Adaptive defaults --------------------------------------------------------
@@ -606,6 +613,16 @@ def apply_recommended_defaults(defaults, config_exists, frames=121):
         rec = recommended_defaults(frames=frames)
     except Exception as exc:
         dbg(f"adaptive defaults skipped: {exc}")
+        return defaults
+    if rec["_threshold"] <= TOKEN_WARN_FLOOR:
+        # Degenerate VRAM reading -- almost certainly another GPU program (or a
+        # second copy of this app) holding memory when we sampled the baseline,
+        # since a card with genuinely no budget could not run this at all.
+        # Baking 320x192 into a fresh config off the back of that would be
+        # wrong and permanent, so leave the shipped defaults alone and say why.
+        print("  -> Skipping GPU-sized defaults: VRAM reading looks contaminated "
+              "(something else is using the GPU). Using stock defaults; set "
+              "resolution yourself if they don't suit.")
         return defaults
     defaults["width"] = rec["width"]
     defaults["height"] = rec["height"]
@@ -1249,7 +1266,33 @@ def _build_latent_upsampler(torch, local_files_only=True):
     return model
 
 
-def generation_worker(config, root, progress_var, progress_bar, btn_generate, btn_cancel):
+# Fraction of a run each phase accounts for, as a 0-1000 scale. A step-only bar
+# reached 100% and then sat frozen through the VAE decode, which measured 16-39%
+# of generation time across this repo's runs -- most wrong exactly when you most
+# want to know how long is left.
+#
+# Approximate by nature: the split shifts with resolution, length, upscale and
+# whether the model is already resident. Taken from the debug timings this repo
+# logs (`VAE decode took Xs (vs Ys for all N steps)`). Better an honest estimate
+# that keeps moving than a precise number for one phase and a freeze for the
+# rest.
+PROGRESS_PHASES = (
+    ("Loading models and encoding prompt", 0, 180),
+    ("Generating", 180, 780),
+    ("VAE decode", 780, 960),
+    ("Encoding video", 960, 1000),
+)
+
+
+def _phase_bounds(name):
+    for label, lo, hi in PROGRESS_PHASES:
+        if label == name:
+            return lo, hi
+    return 0, 1000
+
+
+def generation_worker(config, root, progress_var, progress_bar, btn_generate, btn_cancel,
+                      status_var=None):
     pipe = None
     upscale_pipe = None
     try:
@@ -1559,8 +1602,22 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
 
         total_steps = (cfg_steps if use_cfg else len(DISTILLED_SIGMA_VALUES)) \
             + (len(STAGE_2_DISTILLED_SIGMA_VALUES) if use_upscale else 0)
-        root.after(0, lambda: progress_bar.config(maximum=total_steps))
+        root.after(0, lambda: progress_bar.config(maximum=1000))
         root.after(0, progress_var.set, 0)
+
+        def report(phase, frac=0.0, detail=""):
+            """Drive the overall progress bar and the status line.
+
+            `frac` is progress *within* the named phase, 0-1. status_var is
+            optional so cli_gen_vid and server.py keep working with their
+            existing stub widgets and 6-argument call.
+            """
+            lo, hi = _phase_bounds(phase)
+            root.after(0, progress_var.set, int(lo + (hi - lo) * max(0.0, min(1.0, frac))))
+            if status_var is not None:
+                root.after(0, status_var.set, f"{phase}{detail}...")
+
+        report("Loading models and encoding prompt")
 
         # --- Stage 1: Prompt embeddings (memory -> disk -> subprocess) ---
         print("\n--- [1/4] Resolving Prompt Embeddings ---")
@@ -1863,7 +1920,14 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             last_step_at[0] = now
             print(f"  --> Completed Step {done}/{total_steps} ({elapsed:.1f}s elapsed)")
             dbg(f"step {done} t={float(timestep):.1f} {step_time:.1f}s this step")
-            root.after(0, progress_var.set, done)
+            if done >= total_steps:
+                # Last step of the run: what is left inside this pipeline call
+                # is the VAE decode, which has no callback of its own. Naming
+                # it here is the only chance to show it while it runs.
+                report("VAE decode", 0.0)
+            else:
+                report("Generating", done / max(1, total_steps),
+                       f" step {done}/{total_steps}")
             return callback_kwargs
 
         # Guidance is per-stage now (CFG mode drives stage 1 only), so it is no
@@ -2129,6 +2193,12 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 print("--- [4/4] Skipping Upscaler (Native Resolution selected) ---")
                 output = stage1
 
+        # The decode already happened inside the pipeline call above -- there
+        # is no callback inside it to subdivide, so the bar sits at the start
+        # of this band while it runs and the status line names it. That is the
+        # honest presentation: a phase we cannot subdivide, labelled, rather
+        # than a bar that pretends to be finished.
+        report("VAE decode", 1.0)
         video = output[0]
         audio = output[1] if len(output) > 1 else None
 
@@ -2142,6 +2212,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         dbg(f"VAE decode took {time.time() - last_step_at[0]:.1f}s "
             f"(vs {last_step_at[0] - generation_start_time:.1f}s for all {total_steps} steps)")
 
+        report("Encoding video")
         print("  --> Exporting final video...")
         mode_tag = ("i2v_" if use_image else "flf2v_" if use_flf2v
                     else "icv2v_" if use_ic_v2v else "v2v_" if use_video else "")

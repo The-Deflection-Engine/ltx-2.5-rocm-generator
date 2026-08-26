@@ -136,6 +136,22 @@ def test_apply_is_a_noop_when_a_config_exists():
     assert out == base, "an existing config must never be overridden"
 
 
+def test_apply_skips_on_a_contaminated_vram_reading():
+    """A floor threshold means the VRAM sums are unusable, not that the card is
+    tiny -- baking 320x192 into a fresh config off that would be wrong and
+    permanent. Reproduces the real case: a second GPU program inflating the
+    desktop baseline sampled at import."""
+    base = {"width": 960, "height": 544, "stg_mode": False,
+            "modality_scale": 1.0, "frames": 121}
+    real = eng.token_warn_threshold
+    eng.token_warn_threshold = lambda config=None: eng.TOKEN_WARN_FLOOR
+    try:
+        out = eng.apply_recommended_defaults(dict(base), config_exists=False)
+    finally:
+        eng.token_warn_threshold = real
+    assert (out["width"], out["height"]) == (960, 544), out
+
+
 def test_apply_seeds_a_fresh_config():
     base = {"width": 111, "height": 222, "stg_mode": False,
             "modality_scale": 1.0, "frames": 121}

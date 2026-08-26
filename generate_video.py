@@ -140,6 +140,9 @@ def main():
             # IC-LoRA v2v: scales cross-attention to the reference tokens.
             # 1.0 = full adherence (trained default), 0.5 = balanced.
             "conditioning_attention_strength": 1.0,
+            # Log pane hidden by default -- it is the tallest widget in the
+            # window and most runs never need it.
+            "show_log": False,
             "lora_path": "",
             "loras": [],
             "lora_scale": 1.0,
@@ -1275,16 +1278,38 @@ def main():
             "The seed used is written into the output filename.")
     entry_seed.insert(0, str(config['seed']))
 
+    # Progress spans the WHOLE run, not just the denoise steps. A step-only bar
+    # hit 100% and then sat there through the VAE decode, which measured 16-39%
+    # of generation time across the runs in this repo -- i.e. the bar was most
+    # wrong exactly when you most wanted to know how long was left. The engine
+    # now reports a 0-1000 overall figure and a phase name; see PROGRESS_PHASES
+    # in ltx_engine.py for the weighting.
     progress_var = tk.IntVar(value=0)
-    progress_bar = ttk.Progressbar(main_frame, variable=progress_var, maximum=8, mode='determinate')
-    progress_bar.pack(fill=tk.X, pady=(0, 8))
-    
+    status_var = tk.StringVar(value="Idle.")
+    progress_bar = ttk.Progressbar(main_frame, variable=progress_var,
+                                   maximum=1000, mode='determinate')
+    progress_bar.pack(fill=tk.X, pady=(0, 2))
+    status_row = ttk.Frame(main_frame)
+    status_row.pack(fill=tk.X, pady=(0, 8))
+    ttk.Label(status_row, textvariable=status_var, foreground="#666666").pack(side=tk.LEFT)
+
+    # The log is hidden by default -- it is the tallest widget in the window by
+    # a wide margin, and most runs never need it. Ticking the box packs it back
+    # in and the window grows to suit; the text is still captured either way, so
+    # nothing is lost by having it closed when something goes wrong.
+    show_log_var = tk.BooleanVar(value=bool(config.get("show_log", False)))
+    chk_show_log = ttk.Checkbutton(status_row, text="📜 Show log", variable=show_log_var)
+    chk_show_log.pack(side=tk.RIGHT)
+    tooltip(chk_show_log,
+            "Show the generation log. Hidden by default to keep the window\n"
+            "short -- output is captured regardless, so you can tick this\n"
+            "after something fails and still read what happened.")
+
     # `state="disabled"` keeps the log read-only, but it also stops the widget
     # taking focus -- so Ctrl+C never reaches it. takefocus + a click-to-focus
     # binding restore copying without making the log editable.
     log_text = scrolledtext.ScrolledText(main_frame, height=10, state="disabled", bg="#1e1e1e",
                                          fg="#00ff00", font=("Consolas", 9), takefocus=True)
-    log_text.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
 
     def copy_log(_event=None):
         try:
@@ -1318,7 +1343,21 @@ def main():
 
     btn_frame = ttk.Frame(main_frame)
     btn_frame.pack(fill=tk.X)
-    
+
+    def on_show_log(*_args):
+        """Pack the log above the button row, and resize the window to suit.
+
+        `before=btn_frame` matters: pack() appends, so without it the log would
+        land *below* Generate/Cancel on every re-show.
+        """
+        if show_log_var.get():
+            log_text.pack(fill=tk.BOTH, expand=True, pady=(0, 12), before=btn_frame)
+        else:
+            log_text.pack_forget()
+        resize_to_content()
+
+    show_log_var.trace_add("write", on_show_log)
+
     def start_generation():
         eng.cancel_flag = False 
         
@@ -1476,6 +1515,7 @@ def main():
                 'video_path': video_path_var.get().strip(),
                 'video_strength': float(video_strength_var.get() or 0.05),
                 'conditioning_attention_strength': float(attn_strength_var.get() or 1.0),
+                'show_log': show_log_var.get(),
                 'auto_duration': auto_dur_var.get(),
                 'cfg_mode': cfg_var.get(),
                 'stg_mode': stg_var.get(),
@@ -1514,7 +1554,8 @@ def main():
 
             thread = threading.Thread(
                 target=run_and_reenable,
-                args=(config, root, progress_var, progress_bar, btn_generate, btn_cancel),
+                args=(config, root, progress_var, progress_bar, btn_generate, btn_cancel,
+                      status_var),
             )
             thread.daemon = True
             thread.start()
@@ -1563,29 +1604,35 @@ def main():
             "warnings.\n\nSafe to toggle mid-run: the next step picks it up,\n"
             "so you never restart and reload 18GB to diagnose something.")
 
-    root.update_idletasks()
     # Width still floors at whatever the packed layout actually needs --
     # telemetry_frame (CPU/RAM/VRAM bar) is a direct child of `root`, not of
     # the scrollable canvas below, so its reqwidth (font metrics and CPU core
     # count both change it -- the telemetry grid wraps at 8 per row) still
-    # propagates normally. Height is different: main_frame's own content
-    # (mode/prompt/resolution panels, log, Generate/Cancel) now lives inside
-    # a Canvas, which does NOT propagate a child's size upward, so
-    # `root.winfo_reqheight()` no longer reflects the full unscrolled content
-    # -- deliberately. A window shorter than that content is exactly what the
-    # scrollbar above is for, so height is capped at `usable_h` (screen
-    # height minus headroom for window-manager chrome) rather than grown to
-    # fit everything, which is what let the bottom row render off-screen on
-    # short displays before the scrollable panel existed.
+    # propagates normally.
+    #
+    # Height has to be measured differently. main_frame lives inside a Canvas,
+    # which does NOT propagate a child's size upward, so `root.winfo_reqheight()`
+    # reflects only the fixed telemetry bar. Ask main_frame directly instead, so
+    # the window actually fits its content -- that is what lets hiding the log
+    # shrink the window rather than just leaving a gap. Still capped at
+    # `usable_h` (screen height minus window-manager chrome); anything past that
+    # is what the scrollbar is for.
     usable_h = max(400, root.winfo_screenheight() - 80)
-    req_w = max(640, root.winfo_reqwidth())
-    req_h = min(root.winfo_reqheight(), usable_h)
-    root.minsize(req_w, min(req_h, 400))
-    win_w, win_h = max(WIN_W, req_w), min(max(WIN_H, req_h), usable_h)
-    x = (root.winfo_screenwidth() // 2) - (win_w // 2)
-    y = (root.winfo_screenheight() // 2) - (win_h // 2)
-    root.geometry(f"{win_w}x{win_h}+{x}+{y}")
-    
+
+    def resize_to_content():
+        root.update_idletasks()
+        content_h = main_frame.winfo_reqheight() + telemetry_frame.winfo_reqheight() + 8
+        win_h = max(400, min(content_h, usable_h))
+        win_w = max(WIN_W, max(640, root.winfo_reqwidth()))
+        root.minsize(min(win_w, 640), 400)
+        # Keep the window centred on its new size rather than growing downward
+        # off the bottom of the screen when the log is revealed.
+        x = (root.winfo_screenwidth() // 2) - (win_w // 2)
+        y = max(0, (root.winfo_screenheight() // 2) - (win_h // 2))
+        root.geometry(f"{win_w}x{win_h}+{x}+{y}")
+
+    on_show_log()   # packs the log if the config asked for it, then sizes
+
     def on_close():
         """Leave immediately, without running Python's finalisers.
 
