@@ -8,7 +8,7 @@ No UI of any kind lives here. Two front-ends drive it:
 `generation_worker()` marshals progress through objects passed in (anything
 with .after/.set/.config), which is why the CLI can hand it plain stubs.
 """
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 import os
 import gc

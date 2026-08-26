@@ -10,8 +10,29 @@ assumptions have already been tested and found wrong.
 - `generate_video.py` — Tk GUI only.
 - `cli_gen_vid.py` — headless; deliberately has no generation logic of its own,
   it hands stub widget objects to `generation_worker()`.
+- `server.py` + `static/index.html` — FastAPI front-end. **Untracked by design**
+  (`.gitignore` whitelists specific root files and this is not one), and still
+  text-to-video only: none of image/FLF2V/v2v/IC-LoRA is exposed in its UI,
+  though `/api/generate` passes `mode` through fine.
 
 Keep it that way. The engine must not import tkinter.
+
+**Anything the front-ends both need goes in the engine, not in each of them.**
+There are now three front-ends and they have drifted before — the pre-flight
+VRAM estimate once hardcoded "×2 if CFG", which under-counted STG-only and
+CFG+STG runs in one place while the engine counted correctly in another.
+`effective_tokens()`, `resolve_modality_scale()`, `estimate_vram_gb()` and
+`apply_recommended_defaults()` all exist for that reason.
+
+## Generation modes
+
+`config["mode"]` is one of: `text2video`, `image2video`, `flf2v` (start+end
+frame), `video2video` (the crossfade — see the finding below), `ic_v2v`
+(IC-LoRA, the real video-to-video). Adding one means touching the engine's
+mode flags, input loading, stage-1 dispatch, `mode_label`/`mode_tag`, plus the
+GUI radio/pickers/validation/config-save, the CLI flag/resolve/summary/
+validation, and `server.py`'s DEFAULTS. Grep an existing mode name to find them
+all — `flf2v` is the cleanest one to copy.
 
 ## Findings that cost real measurement
 
@@ -55,6 +76,59 @@ destroys the first — which happened before it was fixed.
 ROCm runtime (`ip == fault address`, i.e. a call into an unloaded library). The
 close handler calls `os._exit(0)`. It deliberately does *not* free models first
 — the kernel reclaims everything, and doing it by hand only made closing slow.
+
+**`video_strength` is a crossfade that compounds, not a restyle dial.** The
+narrow useful range is not a tuning problem — it is arithmetic. The condition
+is applied at `index=0` and spans the whole clip, so every token gets the same
+mask (verified: per-frame correlation to source is flat across all 49 frames,
+slope -0.00016/frame), and the denoise loop re-blends
+`x0 = model*(1-s) + source*s` on **every** step. The model's free contribution
+therefore decays as `(1-s)^num_steps`. Fixed-seed sweep, correlation *between*
+outputs: 0.4 vs 1.0 = 0.984, 0.6 vs 1.0 = 0.994, 0.8 vs 1.0 = 0.997, while 0.0
+vs any s≥0.2 is ~0.16. A near-step function. Corollary: the range narrows
+further as step count rises. Real v2v is IC-LoRA (below), not this.
+
+**IC-LoRA is the actual video-to-video, and the plumbing all works.** Upstream
+appends the reference as extra clean tokens the transformer attends to
+(`VideoConditionByReferenceLatent`), never touching the generation canvas —
+that is why their `conditioning_attention_strength` has a usable middle and
+`video_strength` does not. Measured against `LTX-2.3-22b-IC-LoRA-Union-Control`
+on this 2.5 fp8 stack: diffusers already converts Lightricks' key format (all
+960 tensors, no shim), every targeted module exists in the 2.5 transformer,
+blocks 0-47 align, all 480 A/B pairs are shape-clean, and all 960 adapter
+tensors arrive in **fp8** — so the existing fp8→bf16 cast is required for
+IC-LoRAs too. Two things diffusers will not do for you: it rejects
+`duration_head` in `LTX2InContextPipeline(**pipe.components)` (drop that one
+key), and it never reads `reference_downscale_factor` from the adapter's
+metadata despite taking it as an argument — get that wrong and every reference
+token's position is misplaced.
+
+**Reference tokens are paid for out of the same attention budget.** They are
+appended to the sequence, so an IC-LoRA run costs `1 + 1/factor²` times the
+target's tokens. Anything computing effective tokens must account for it or it
+under-counts by 25% (factor 2) to 100% (factor 1) — including the VRAM
+calibration, which would otherwise record a token figure the run never had.
+`effective_tokens()` is the single place that combines final-stage tokens,
+guidance passes and this factor; use it rather than re-deriving.
+
+**The shipped VRAM fit was over-cautious on its own fit machine.** At 6,630
+tokens it predicted 8.88GB against 7.87GB actual (13% high). Runs now
+self-calibrate into `vram_calibration.json` and the refit sits within ±0.14GB
+across 448-12,480 tokens. Two things that matter if you touch this: it must be
+keyed by offload profile (a full-resident card holds the ~18GB transformer, so
+its intercept is different by more than the entire token term), and it must
+refuse to fit from draft-sized runs only — a clean line from three 256×256
+renders extrapolated 10x is exactly how you get a confidently wrong ceiling.
+
+**Modality guidance is not tied to CFG.** diffusers gates it on
+`modality_scale > 1.0` alone, the same shape as STG's gate, so it rides the
+8-step distilled schedule for one extra pass — it never needed CFG's 30 doubled
+steps. What it changes, same seed: video correlation 0.93 (barely), audio 0.20
+(almost entirely). It is an audio/AV-coupling knob. Caveat: upstream's
+`DistilledPipeline` uses `SimpleDenoiser`, "Single transformer call, no
+guidance", so 3.0 is their *guided*-preset value and running it on the
+distilled schedule is off-recipe — same category as STG-on-distilled, and
+resting on one informal A/B.
 
 ## Traps
 
