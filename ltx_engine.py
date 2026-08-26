@@ -62,9 +62,11 @@ MODEL_PATH = os.path.abspath("./local_ltx25_fp8")
 # upsampler and is architecturally incompatible with the LTX-2.5 VAE.
 BASE_MODEL_PATH = os.path.abspath("./local_ltx25_model")
 EMBED_CACHE_DIR = os.path.abspath("./.embed_cache")
-# google/gemma-4-E2B-it. The LTX-2.5 checkpoints ship `prompt_enhancer` and
+# google/gemma-4-E4B-it. The LTX-2.5 checkpoints ship `prompt_enhancer` and
 # `processor` as nulls, so the enhancer is a separate download.
-ENHANCER_PATH = os.path.abspath("./local_ltx25_enhancer")
+# local_ltx25_enhancer/ (the older E2B checkpoint) is kept on disk for A/B
+# comparison but is no longer loaded by default.
+ENHANCER_PATH = os.path.abspath("./local_ltx25_enhancer_e4b")
 
 # Auto Duration's duration_head can predict up to 20s -- that's a property of
 # the head itself, not the hardware. What the *card* survives depends on
@@ -499,7 +501,7 @@ def _enhance_prompt_inproc(torch, p, image_path, max_words=None):
         from PIL import Image
         image = Image.open(image_path).convert("RGB")
 
-    print("  -> Loading prompt enhancer (Gemma-4 E2B)...")
+    print("  -> Loading prompt enhancer (Gemma-4 E4B)...")
     pipe_text = types.SimpleNamespace(_execution_device="cpu")
     pipe_text.enhance_prompt = LTX2Pipeline.enhance_prompt.__get__(pipe_text)
     pipe_text.processor = AutoProcessor.from_pretrained(ENHANCER_PATH, local_files_only=True)
@@ -739,6 +741,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                              "in ltx_engine.py).")
 
         input_image = None
+        input_end_image = None
         if use_image:
             from PIL import Image
 
@@ -746,6 +749,12 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             if not image_path or not os.path.exists(image_path):
                 raise ValueError(f"Image-to-video mode selected but no valid image path was given: '{image_path}'")
             input_image = Image.open(image_path).convert("RGB")
+
+            end_image_path = config.get("end_image_path", "")
+            if end_image_path:
+                if not os.path.exists(end_image_path):
+                    raise ValueError(f"End frame image path does not exist: '{end_image_path}'")
+                input_end_image = Image.open(end_image_path).convert("RGB")
 
         input_video_frames = None
         if use_video:
@@ -1187,13 +1196,14 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         # noise stream (this is what the LTX-2.5 reference two-stage recipe does).
         generator = torch.Generator("cuda").manual_seed(config["active_seed"])
 
+        stage1_conditions = None
         with torch.inference_mode():
             if use_image:
                 # Shares the already-loaded/onloaded transformer, VAE, text
                 # encoder etc with `pipe` -- this just wraps the same resident
                 # component instances in the image-conditioned __call__, no
                 # extra weights are loaded or moved.
-                i2v_pipe = LTX2ImageToVideoPipeline(**pipe.components)
+                #
                 # image_crf: LTX-2.5 re-compresses the conditioning image to CRF
                 # 18 by default to match training. 0 skips it and keeps the
                 # source detail.
@@ -1201,7 +1211,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 # `None` does NOT mean "model default" here despite what this
                 # used to say: diffusers picks the default via
                 # resolve_default_image_crf(text_encoder), which keys off the
-                # text encoder's config.model_type -- and i2v_pipe's
+                # text encoder's config.model_type -- and this pipe's
                 # text_encoder is None (we never load it, on purpose, to save
                 # 23GB). That resolves to DEFAULT_IMAGE_CRF = 33, the LTX-2.3
                 # value, not this checkpoint's 18. So `None` silently
@@ -1210,18 +1220,44 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 crf = config.get("image_crf")
                 if crf is None:
                     crf = LTX2_5_IMAGE_CRF
-                stage1 = i2v_pipe(
-                    image=input_image,
-                    width=stage1_w,
-                    height=stage1_h,
-                    generator=generator,
-                    output_type="latent" if use_upscale else "np",
-                    image_crf=int(crf),
-                    **stage1_schedule,
-                    **stage1_guidance,
-                    **length_call,
-                    **shared_call,
-                )
+                if input_end_image is not None:
+                    # Start+end frame conditioning needs the keyframe-aware
+                    # condition pipeline -- LTX2ImageToVideoPipeline only ever
+                    # conditions frame 0. `index=-1` is a *latent* index (see
+                    # preprocess_conditions in pipeline_ltx2_condition.py): it
+                    # always resolves to the last frame of whatever length
+                    # gets generated, so this works under Auto Duration too,
+                    # not just a fixed frame count.
+                    i2v_pipe = LTX2ConditionPipeline(**pipe.components)
+                    stage1_conditions = [
+                        LTX2VideoCondition(frames=input_image, index=0, strength=1.0, crf=int(crf)),
+                        LTX2VideoCondition(frames=input_end_image, index=-1, strength=1.0, crf=int(crf)),
+                    ]
+                    stage1 = i2v_pipe(
+                        conditions=stage1_conditions,
+                        width=stage1_w,
+                        height=stage1_h,
+                        generator=generator,
+                        output_type="latent" if use_upscale else "np",
+                        **stage1_schedule,
+                        **stage1_guidance,
+                        **length_call,
+                        **shared_call,
+                    )
+                else:
+                    i2v_pipe = LTX2ImageToVideoPipeline(**pipe.components)
+                    stage1 = i2v_pipe(
+                        image=input_image,
+                        width=stage1_w,
+                        height=stage1_h,
+                        generator=generator,
+                        output_type="latent" if use_upscale else "np",
+                        image_crf=int(crf),
+                        **stage1_schedule,
+                        **stage1_guidance,
+                        **length_call,
+                        **shared_call,
+                    )
             elif use_video:
                 # Same "wrap the resident components" pattern as i2v_pipe above --
                 # no extra weights loaded, just the condition-aware __call__.
@@ -1318,12 +1354,42 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 # is None, so passing 5D latents skips it entirely (and CRF
                 # re-compression along with it, correctly: the image was
                 # already conditioned once, in stage 1).
-                # v2v_pipe gets the same treatment as i2v_pipe here, on the
-                # assumption LTX2ConditionPipeline's prepare_latents() special-
-                # cases 5D latents the same way -- UNTESTED against this
-                # checkpoint specifically, unlike the i2v case above which was
-                # verified by reading pipeline_ltx2_image2video.py directly.
+                #
+                # LTX2ConditionPipeline (used for v2v, and for i2v when an end
+                # frame is set) is NOT like i2v_pipe here -- read directly from
+                # pipeline_ltx2_condition.py's prepare_latents(): it always
+                # re-derives the conditioning mask from `conditions`, even when
+                # 5D `latents` are supplied, so `conditions` must be passed
+                # again on this stage-2 call or the keyframe anchoring is
+                # silently dropped for the refinement pass.
+                #
+                # `height`/`width` must go with it. __call__ infers
+                # latent_height/width from the 5D `latents` shape for the base
+                # grid, but that inferred size is NOT what it uses to
+                # preprocess `conditions` -- preprocess_conditions() is called
+                # with the raw height/width *parameters* instead (a diffusers
+                # quirk/bug, confirmed by reading __call__: it computes the
+                # inferred size into local latent_height/width but then still
+                # passes the original height/width through to
+                # prepare_latents()). Omitting them defaults to 512x768,
+                # so the encoded keyframe tokens come out sized for 512x768
+                # instead of this run's actual stage-2 resolution, and the
+                # sequence-length mismatch throws ValueError at
+                # prepare_latents(). Verified against this checkpoint: this
+                # exact call raised "Provided latents tensor has shape
+                # [1, 1792, 128], but the expected shape is [1, 2688, 128]"
+                # (256x256 stage 1 upscaled to 512x512, defaults implying
+                # 512x768) before out_w/out_h were added here.
                 stage2_pipe = i2v_pipe if use_image else v2v_pipe if use_video else pipe
+                stage2_conditions = {}
+                if use_image and stage1_conditions is not None:
+                    stage2_conditions["conditions"] = stage1_conditions
+                    stage2_conditions["height"] = out_h
+                    stage2_conditions["width"] = out_w
+                elif use_video:
+                    stage2_conditions["conditions"] = [condition]
+                    stage2_conditions["height"] = out_h
+                    stage2_conditions["width"] = out_w
                 output = stage2_pipe(
                     num_frames=realized_frames,
                     sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
@@ -1332,6 +1398,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                     noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0],
                     generator=generator,
                     output_type="np",
+                    **stage2_conditions,
                     **distilled_guidance,
                     **shared_call,
                 )

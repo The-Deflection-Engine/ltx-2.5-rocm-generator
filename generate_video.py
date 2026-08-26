@@ -134,6 +134,7 @@ def main():
             "upscale": False,
             "mode": "text2video",
             "image_path": "",
+            "end_image_path": "",
             "video_path": "",
             "video_strength": 0.05,
             "lora_path": "",
@@ -322,6 +323,7 @@ def main():
         initial_mode = "text2video"
     mode_var = tk.StringVar(value=initial_mode)
     image_path_var = tk.StringVar(value=config.get("image_path", ""))
+    end_image_path_var = tk.StringVar(value=config.get("end_image_path", ""))
     video_path_var = tk.StringVar(value=config.get("video_path", ""))
 
     mode_row = ttk.Frame(mode_frame)
@@ -361,6 +363,28 @@ def main():
 
     btn_browse = ttk.Button(image_row, text="📁 Choose Image...", command=browse_image)
 
+    end_image_row = ttk.Frame(mode_frame)
+    end_image_row.pack(fill=tk.X, pady=(6, 0))
+    lbl_end_image = ttk.Label(end_image_row, textvariable=end_image_path_var, foreground="#666666")
+
+    def browse_end_image():
+        path = filedialog.askopenfilename(
+            title="Select end-frame image (optional)",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp"), ("All files", "*.*")],
+        )
+        if path:
+            end_image_path_var.set(path)
+
+    def clear_end_image():
+        end_image_path_var.set("")
+
+    btn_browse_end = ttk.Button(end_image_row, text="📁 Choose End Frame...", command=browse_end_image)
+    btn_clear_end = ttk.Button(end_image_row, text="✕", width=2, command=clear_end_image)
+    tooltip(btn_browse_end,
+            "Optional. Conditions the LAST frame of the video on this image,\n"
+            "in addition to the start frame above. Works with Auto Duration --\n"
+            "the end frame always lands on whatever length gets generated.")
+
     video_row = ttk.Frame(mode_frame)
     video_row.pack(fill=tk.X, pady=(6, 0))
     lbl_video = ttk.Label(video_row, textvariable=video_path_var, foreground="#666666")
@@ -396,9 +420,15 @@ def main():
         if mode == "image2video":
             btn_browse.pack(side=tk.LEFT)
             lbl_image.pack(side=tk.LEFT, padx=(8, 0))
+            btn_browse_end.pack(side=tk.LEFT)
+            btn_clear_end.pack(side=tk.LEFT, padx=(2, 0))
+            lbl_end_image.pack(side=tk.LEFT, padx=(8, 0))
         else:
             btn_browse.pack_forget()
             lbl_image.pack_forget()
+            btn_browse_end.pack_forget()
+            btn_clear_end.pack_forget()
+            lbl_end_image.pack_forget()
         if mode == "video2video":
             btn_browse_video.pack(side=tk.LEFT)
             lbl_video_strength.pack(side=tk.LEFT, padx=(8, 0))
@@ -1058,6 +1088,10 @@ def main():
                 if not img or not os.path.exists(img):
                     messagebox.showerror("Error", "Image-to-Video mode needs a valid image. Click 'Choose Image...'.")
                     return
+                end_img = end_image_path_var.get().strip()
+                if end_img and not os.path.exists(end_img):
+                    messagebox.showerror("Error", "End frame image path does not exist.")
+                    return
 
             if mode_var.get() == "video2video":
                 vid = video_path_var.get().strip()
@@ -1154,6 +1188,7 @@ def main():
                 'upscale': upscale_var.get(),
                 'mode': mode_var.get(),
                 'image_path': image_path_var.get().strip(),
+                'end_image_path': end_image_path_var.get().strip(),
                 'video_path': video_path_var.get().strip(),
                 'video_strength': float(video_strength_var.get() or 0.05),
                 'auto_duration': auto_dur_var.get(),
