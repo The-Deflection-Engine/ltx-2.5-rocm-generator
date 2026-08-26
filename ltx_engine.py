@@ -219,6 +219,50 @@ def _probe_video_fps(path):
         return None
 
 
+def resolve_loras(config):
+    """The LoRA stack as a list of `{"path": str, "scale": float}`.
+
+    Config key is `loras`. The older single-adapter pair `lora_path`/`lora_scale`
+    is still read when `loras` is absent, so an existing config keeps working --
+    and cli_gen_vid's `--lora` still writes the old pair.
+
+    Shared by the engine and every front-end so the pre-flight view, the
+    pipeline-cache identity and the actual load cannot disagree about what is
+    stacked.
+    """
+    if not LORA_LOADING_ENABLED:
+        return []
+    entries = config.get("loras")
+    if entries is None:
+        path = (config.get("lora_path") or "").strip()
+        if not path:
+            return []
+        return [{"path": path, "scale": float(config.get("lora_scale", 1.0))}]
+    out = []
+    for e in entries:
+        path = (e.get("path") or "").strip() if isinstance(e, dict) else str(e).strip()
+        if not path:
+            continue
+        scale = float(e.get("scale", 1.0)) if isinstance(e, dict) else 1.0
+        out.append({"path": path, "scale": scale})
+    return out
+
+
+def resolve_reference_downscale_factor(config, default=1):
+    """The reference downscale factor for an IC-LoRA run, from the LoRA stack.
+
+    With several adapters stacked, only the IC-LoRA carries a
+    `reference_downscale_factor` in its metadata -- a plain style LoRA has no
+    such key. So scan the stack and take the first that actually declares one,
+    rather than assuming a single adapter or trusting position.
+    """
+    for entry in resolve_loras(config):
+        found = read_lora_reference_downscale_factor(entry["path"], default=None)
+        if found:
+            return found
+    return default
+
+
 def read_lora_reference_downscale_factor(lora_path, default=1):
     """An IC-LoRA's `reference_downscale_factor`, from its safetensors metadata.
 
@@ -560,8 +604,7 @@ def ic_reference_token_factor(config):
     """
     if config.get("mode") != "ic_v2v":
         return 1.0
-    lora_path = config.get("lora_path") or ""
-    factor = read_lora_reference_downscale_factor(lora_path) if lora_path else 1
+    factor = resolve_reference_downscale_factor(config)
     return 1.0 + 1.0 / float(max(1, factor) ** 2)
 
 
@@ -1534,8 +1577,12 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         # adapter weights), so it joins the same identity tuple.
         build_opts = (int(config.get("blocks_per_group", 4)),
                       config.get("attention_backend", "native"),
-                      config.get("lora_path") or None if LORA_LOADING_ENABLED else None,
-                      float(config.get("lora_scale", 1.0)) if LORA_LOADING_ENABLED else None)
+                      # The whole stack, in order: adding, removing, reordering
+                      # or re-scaling any adapter has to force a rebuild, since
+                      # they are merged into the resident transformer. A tuple
+                      # of pairs rather than just the paths -- a scale change
+                      # alone changes the weights just as much.
+                      tuple((e["path"], e["scale"]) for e in resolve_loras(config)))
 
         if (_MODEL_CACHE["pipe"] is not None
                 and _MODEL_CACHE["path"] == MODEL_PATH
@@ -1574,13 +1621,25 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             )
             pipe.set_progress_bar_config(disable=True)
 
-            lora_path = config.get("lora_path") if LORA_LOADING_ENABLED else None
             if config.get("lora_path") and not LORA_LOADING_ENABLED:
                 print("  -> LoRA loading is disabled (see LORA_LOADING_ENABLED in "
                       "ltx_engine.py); ignoring lora_path.")
-            if lora_path:
+            # Each adapter gets its own name so they compose; set_adapters()
+            # then activates the whole stack with per-adapter weights. A file
+            # that fails to load is skipped rather than taking the run down,
+            # and the others still apply.
+            loaded_names, loaded_scales = [], []
+            for i, entry in enumerate(resolve_loras(config)):
+                name = f"lora_{i}"
                 try:
-                    pipe.load_lora_weights(lora_path, adapter_name="default_0")
+                    pipe.load_lora_weights(entry["path"], adapter_name=name)
+                    loaded_names.append(name)
+                    loaded_scales.append(entry["scale"])
+                    print(f"  -> LoRA loaded: {entry['path']} (scale {entry['scale']})")
+                except Exception as exc:
+                    print(f"  -> LoRA load failed for {entry['path']} ({exc}); skipping it.")
+            if loaded_names:
+                try:
                     # PEFT creates lora_A/lora_B in the same dtype as the layer
                     # they adapt -- fp8 here, since the transformer's weights
                     # rest in fp8 and are only just-in-time upcast inside
@@ -1591,6 +1650,8 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                     # not implemented for 'Float8_e4m3fn'). Cast just the LoRA
                     # adapter weights to bf16 -- same dtype everything else in
                     # the pipeline computes in -- so that path never touches fp8.
+                    # Done once after the whole stack is loaded, so it catches
+                    # every adapter's tensors in one pass.
                     n_cast = 0
                     for name, param in pipe.transformer.named_parameters():
                         if "lora_" in name and param.dtype in fp8_types:
@@ -1598,12 +1659,13 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                             n_cast += 1
                     if n_cast:
                         dbg(f"cast {n_cast} LoRA adapter tensors fp8 -> bf16")
-                    pipe.set_adapters(["default_0"], adapter_weights=[float(config.get("lora_scale", 1.0))])
-                    print(f"  -> LoRA loaded: {lora_path} (scale {config.get('lora_scale', 1.0)})")
+                    pipe.set_adapters(loaded_names, adapter_weights=loaded_scales)
+                    if len(loaded_names) > 1:
+                        print(f"  -> {len(loaded_names)} LoRAs active, stacked in listed order.")
                 except Exception as exc:
-                    # A bad or incompatible LoRA file shouldn't take down the
-                    # whole run -- continue with the base model instead.
-                    print(f"  -> LoRA load failed ({exc}); continuing without it.")
+                    # A bad combination shouldn't take down the whole run --
+                    # continue with the base model instead.
+                    print(f"  -> LoRA activation failed ({exc}); continuing without them.")
 
             # "native" = torch SDPA auto-dispatch. On this GPU (gfx1201) the flash,
             # mem-efficient and math kernels are all available, and auto-dispatch
@@ -1890,7 +1952,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 # Must match what the adapter was trained with -- it scales the
                 # reference tokens' positional coordinates into the target's
                 # space. Read from the LoRA's own metadata rather than assumed.
-                ref_downscale = read_lora_reference_downscale_factor(config["lora_path"])
+                ref_downscale = resolve_reference_downscale_factor(config)
                 # strength=1.0 keeps the reference tokens fully clean, which is
                 # the trained setup. The user-facing dial is
                 # conditioning_attention_strength below, which scales how hard

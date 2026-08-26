@@ -141,6 +141,7 @@ def main():
             # 1.0 = full adherence (trained default), 0.5 = balanced.
             "conditioning_attention_strength": 1.0,
             "lora_path": "",
+            "loras": [],
             "lora_scale": 1.0,
             # Auto Duration: let the model pick clip length from the prompt.
             # Capped by auto_duration_cap_s() regardless of what's set here.
@@ -549,41 +550,109 @@ def main():
     mode_var.trace_add("write", on_mode_switch)
     on_mode_switch()
 
-    # LoRA is orthogonal to mode (text/image/video-to-video) and doesn't
-    # change VRAM/compute enough to need a confirmation dialog like CFG/
-    # upscale -- just an optional per-run weights file. Off by default (see
-    # LORA_LOADING_ENABLED in ltx_engine.py) -- vars still exist unconditionally
-    # since config.update() below always reads them.
-    lora_path_var = tk.StringVar(value=config.get("lora_path", "") if LORA_LOADING_ENABLED else "")
-    lora_scale_var = tk.StringVar(value=str(config.get("lora_scale", 1.0)))
+    # LoRA applies in every mode -- the adapters are merged into the shared
+    # transformer, and every mode wraps that same resident component set, so
+    # there is no mode where a loaded LoRA is inert. Off by default (see
+    # LORA_LOADING_ENABLED in ltx_engine.py).
+    #
+    # Deliberately NOT restored from the saved config: the stack starts empty
+    # every launch. A LoRA is a per-experiment choice, and silently inheriting
+    # last session's adapters is the kind of thing you only notice three
+    # renders later. `loras` is written to the config on Generate so the run
+    # is reproducible from it, but never read back at startup.
+    lora_stack = []          # list of {"path":..., "scale":...}, in apply order
+    lora_scale_var = tk.StringVar(value="1.00")
 
     if LORA_LOADING_ENABLED:
-        lora_frame = ttk.LabelFrame(main_frame, text=" LoRA ", padding="8")
+        lora_frame = ttk.LabelFrame(main_frame, text=" LoRA stack ", padding="8")
         lora_frame.pack(fill=tk.X, pady=(0, 12))
-        lora_row = ttk.Frame(lora_frame)
-        lora_row.pack(fill=tk.X)
-        lbl_lora = ttk.Label(lora_row, textvariable=lora_path_var, foreground="#666666")
 
-        def browse_lora():
-            path = filedialog.askopenfilename(
-                title="Select LoRA weights",
+        lora_list = tk.Listbox(lora_frame, height=3, activestyle="none",
+                               font=("Consolas", 9))
+        lora_list.pack(fill=tk.X, side=tk.TOP)
+
+        lora_row = ttk.Frame(lora_frame)
+        lora_row.pack(fill=tk.X, pady=(6, 0))
+
+        def refresh_lora_list(select=None):
+            lora_list.delete(0, tk.END)
+            for entry in lora_stack:
+                lora_list.insert(tk.END, f"{entry['scale']:.2f}  {os.path.basename(entry['path'])}")
+            if select is not None and 0 <= select < len(lora_stack):
+                lora_list.selection_clear(0, tk.END)
+                lora_list.selection_set(select)
+            if not lora_stack:
+                lora_list.insert(tk.END, "  (none -- output uses the base model)")
+
+        def selected_lora_index():
+            sel = lora_list.curselection()
+            if not sel or not lora_stack:
+                return None
+            return sel[0] if sel[0] < len(lora_stack) else None
+
+        def add_lora():
+            paths = filedialog.askopenfilenames(
+                title="Select LoRA weights (multi-select to stack several)",
                 filetypes=[("LoRA weights", "*.safetensors *.pt *.bin"), ("All files", "*.*")],
             )
-            if path:
-                lora_path_var.set(path)
+            for p in paths:
+                lora_stack.append({"path": p, "scale": 1.0})
+            if paths:
+                refresh_lora_list(select=len(lora_stack) - 1)
 
-        def clear_lora():
-            lora_path_var.set("")
+        def remove_lora():
+            i = selected_lora_index()
+            if i is None:
+                return
+            lora_stack.pop(i)
+            refresh_lora_list(select=min(i, len(lora_stack) - 1))
 
-        ttk.Button(lora_row, text="📁 LoRA...", command=browse_lora).pack(side=tk.LEFT)
-        ttk.Button(lora_row, text="✕", width=2, command=clear_lora).pack(side=tk.LEFT, padx=(2, 0))
-        ttk.Label(lora_row, text="scale:").pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Spinbox(lora_row, from_=0.0, to=2.0, increment=0.05, width=5,
-                   textvariable=lora_scale_var, format="%.2f").pack(side=tk.LEFT, padx=(2, 0))
-        lbl_lora.pack(side=tk.LEFT, padx=(8, 0))
-        tooltip(lbl_lora, "Optional LoRA weights file, applied on top of the base "
-                          "model. Baked in at pipeline build time, so changing it "
-                      "or its scale triggers a rebuild (one slow reload).")
+        def clear_loras():
+            lora_stack.clear()
+            refresh_lora_list()
+
+        def on_lora_select(_event=None):
+            i = selected_lora_index()
+            if i is not None:
+                lora_scale_var.set(f"{lora_stack[i]['scale']:.2f}")
+
+        def apply_scale(*_args):
+            """Scale spinbox edits whichever adapter is selected."""
+            i = selected_lora_index()
+            if i is None:
+                return
+            try:
+                lora_stack[i]["scale"] = float(lora_scale_var.get())
+            except (ValueError, tk.TclError):
+                return
+            refresh_lora_list(select=i)
+
+        lora_list.bind("<<ListboxSelect>>", on_lora_select)
+        lora_scale_var.trace_add("write", apply_scale)
+
+        ttk.Button(lora_row, text="📁 Add LoRA...", command=add_lora).pack(side=tk.LEFT)
+        ttk.Button(lora_row, text="− Remove", command=remove_lora).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(lora_row, text="✕ Clear", command=clear_loras).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(lora_row, text="scale:").pack(side=tk.LEFT, padx=(12, 0))
+        spin_lora_scale = ttk.Spinbox(lora_row, from_=0.0, to=2.0, increment=0.05, width=5,
+                                      textvariable=lora_scale_var, format="%.2f")
+        spin_lora_scale.pack(side=tk.LEFT, padx=(2, 0))
+        tooltip(spin_lora_scale,
+                "Weight for the adapter selected in the list above. Select a\n"
+                "row first -- this edits that entry, not the whole stack.")
+        tooltip(lora_list,
+                "Adapters applied on top of the base model, in listed order.\n"
+                "Multi-select in the file dialog to add several at once.\n\n"
+                "Applies in every mode: the weights are merged into the shared\n"
+                "transformer. An IC-LoRA is the exception in practice -- its\n"
+                "weights load anywhere but it has nothing to attend to outside\n"
+                "IC-LoRA Video -> Video.\n\n"
+                "Baked in at pipeline build time, so adding, removing,\n"
+                "reordering or re-scaling any of them triggers a rebuild (one\n"
+                "slow ~18GB reload).\n\n"
+                "Starts empty every launch -- last session's adapters are never\n"
+                "silently inherited.")
+        refresh_lora_list()
 
     pp_header = ttk.Frame(main_frame)
     pp_header.pack(fill=tk.X)
@@ -1260,7 +1329,7 @@ def main():
                     messagebox.showerror("Error", "IC-LoRA Video-to-Video needs a valid reference clip. "
                                                   "Click 'Choose Video...'.")
                     return
-                if not lora_path_var.get().strip():
+                if not lora_stack:
                     messagebox.showerror(
                         "Error",
                         "IC-LoRA Video-to-Video needs an IC-LoRA -- the reference clip is only "
@@ -1337,12 +1406,13 @@ def main():
             # loaded/saved config -- same as everywhere else it's used.
             passes = guidance_pass_count(cfg_var.get(), stg_var.get(),
                                          eng.resolve_modality_scale(config))
-            # Live widget values, not the last-saved config, for the things the
-            # user can change without saving; the IC-LoRA reference tail is
-            # read from the config's lora_path, which is where it lives.
+            # Live widget values, not the last-saved config, for the things
+            # the user can change without saving. The IC-LoRA reference tail
+            # needs the live stack too -- it is read from whichever adapter
+            # declares a reference_downscale_factor.
             eff_tokens = int(tokens * passes * eng.ic_reference_token_factor(
                 {**config, "mode": mode_var.get(),
-                 "lora_path": lora_path_var.get().strip()}))
+                 "loras": [dict(e) for e in lora_stack]}))
             if eff_tokens > threshold:
                 _, _, vram_total = hw_monitor.get_gpu_stats()
                 est = eng.estimate_vram_gb(eff_tokens, config)
@@ -1386,8 +1456,12 @@ def main():
                 'enhance_max_words': max(0, int(enh_words_var.get() or 0)),
                 'enhancer_model': enhancer_model_var.get(),
                 'auto_max_seconds': auto_max_val,
-                'lora_path': lora_path_var.get().strip(),
-                'lora_scale': float(lora_scale_var.get() or 1.0),
+                # Written so the run is reproducible from the config; never
+                # read back at startup (the stack starts empty each launch).
+                # lora_path/lora_scale cleared so the legacy single-adapter
+                # fallback in resolve_loras() can't resurrect an old pick.
+                'loras': [dict(e) for e in lora_stack],
+                'lora_path': '', 'lora_scale': 1.0,
             })
             save_config(config)
             

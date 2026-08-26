@@ -84,10 +84,15 @@ def resolve(config, args):
         config["conditioning_attention_strength"] = args.attention_strength
     if args.video_strength is not None:
         config["video_strength"] = args.video_strength
-    if args.lora is not None:
-        config["lora_path"] = args.lora
-    if args.lora_scale is not None:
-        config["lora_scale"] = args.lora_scale
+    if args.lora:
+        # Repeatable: --lora a.safetensors --lora b.safetensors stacks them in
+        # order. --lora-scale is matched positionally; any adapter without a
+        # scale gets 1.0. Clears the legacy single-adapter keys so
+        # resolve_loras() cannot fall back to a stale one from the config.
+        scales = args.lora_scale or []
+        config["loras"] = [{"path": p, "scale": float(scales[i]) if i < len(scales) else 1.0}
+                           for i, p in enumerate(args.lora)]
+        config["lora_path"], config["lora_scale"] = "", 1.0
     if args.upscale is not None:
         config["upscale"] = args.upscale
     if args.cfg is not None:
@@ -168,8 +173,8 @@ def summarise(config):
     if config.get("mode") == "ic_v2v":
         print(f"  reference  : {config.get('video_path') or '(none!)'}"
               f"  (attention {config.get('conditioning_attention_strength', 1.0)})")
-    if config.get("lora_path"):
-        print(f"  lora       : {config['lora_path']}  (scale {config.get('lora_scale', 1.0)})")
+    for i, e in enumerate(gv.resolve_loras(config)):
+        print(f"  {'lora' if i == 0 else '    '}       : {e['path']}  (scale {e['scale']})")
     return eff, threshold, est
 
 
@@ -200,8 +205,12 @@ def main():
                          "(prompt has maximum freedom). Opposite direction from "
                          "img2img denoise strength. Measured: the interesting range "
                          "is roughly 0-0.05, snapping back to 'locked' by ~0.07.")
-    ap.add_argument("--lora", help="path to a LoRA weights file, applied on top of the base model")
-    ap.add_argument("--lora-scale", type=float, help="LoRA adapter weight (default 1.0)")
+    ap.add_argument("--lora", action="append",
+                    help="LoRA weights file, applied on top of the base model. "
+                         "Repeat to stack several, in order.")
+    ap.add_argument("--lora-scale", action="append", type=float,
+                    help="weight for the matching --lora (default 1.0). Repeat to "
+                         "give each stacked adapter its own.")
     ap.add_argument("--upscale", action=argparse.BooleanOptionalAction,
                     help="2-stage 2x latent upscale + refine")
     ap.add_argument("--cfg", action=argparse.BooleanOptionalAction,
@@ -251,7 +260,7 @@ def main():
     if config.get("mode") == "ic_v2v":
         if not os.path.exists(config.get("video_path", "")):
             sys.exit(f"IC-LoRA video-to-video needs a valid reference clip: {config.get('video_path')!r}")
-        if not config.get("lora_path"):
+        if not gv.resolve_loras(config):
             sys.exit("IC-LoRA video-to-video needs --lora: the reference clip only means "
                      "something to a model trained to attend to it.")
     if config.get("mode") == "video2video" and not os.path.exists(config.get("video_path", "")):
