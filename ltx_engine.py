@@ -238,6 +238,134 @@ TOKEN_WARN_FALLBACK = 30000   # if VRAM can't be read: the measured 16GB value
 # already logs at the end of a full-resident run.
 FULL_RESIDENT_VRAM_THRESHOLD_GB = 29.0
 
+# --- Self-calibration ---------------------------------------------------------
+# The constants above are a two-point fit from one RX 9070 XT. Rather than ship
+# more hardcoded numbers for hardware nobody here can test on, every successful
+# run appends the one pair it already knows -- effective token count and
+# process-local peak reserved VRAM -- and the model is refitted from whatever
+# this machine has actually produced.
+#
+# Keyed by offload profile, and that is not optional: a card big enough to skip
+# group offload keeps the ~18GB transformer resident, which moves the intercept
+# by more than the whole token-dependent term. Mixing the two profiles in one
+# fit would produce a line that describes neither.
+VRAM_CALIBRATION_FILE = os.path.abspath("./vram_calibration.json")
+VRAM_CALIB_MIN_POINTS = 3     # 2 fits a line exactly, incl. through noise
+VRAM_CALIB_MIN_SPAN = 1.5     # need real leverage, not 3 near-identical runs
+VRAM_CALIB_MAX_POINTS = 200
+# Don't let a handful of 256x256 drafts set the ceiling for full-size renders.
+# A line fitted entirely below this and extrapolated 10x is precisely how you
+# get a confidently wrong threshold, and the failure mode at the top end is an
+# OOM that has taken this desktop session down before (see the hardware note in
+# the README). Until a run of real size exists, the shipped fit stands.
+VRAM_CALIB_MIN_MAX_TOKENS = 5000
+# Sanity bounds. A fit outside these is rejected in favour of the shipped
+# constants -- a wrong-but-plausible threshold is recoverable, one built from a
+# negative slope or a 40GB intercept is not.
+VRAM_CALIB_SLOPE_RANGE = (2e-5, 2e-3)
+VRAM_CALIB_BASE_RANGE = (0.5, 32.0)
+
+
+def vram_profile(vram_total_gb=None):
+    """Which offload regime a card runs in. Observations only combine within one."""
+    if vram_total_gb is None:
+        _, _, vram_total_gb = hw_monitor.get_gpu_stats()
+    return ("resident" if vram_total_gb and vram_total_gb >= FULL_RESIDENT_VRAM_THRESHOLD_GB
+            else "offload")
+
+
+def _load_calibration():
+    try:
+        with open(VRAM_CALIBRATION_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def record_vram_observation(eff_tokens, peak_gb, vram_total_gb=None):
+    """Append one (tokens, peak GB) point from a completed run.
+
+    Never raises: this runs at the tail of a successful generation, and losing
+    a calibration sample must not turn a finished render into a failed one.
+    """
+    try:
+        if not eff_tokens or peak_gb <= 0:
+            return
+        points = _load_calibration()
+        points.append({
+            "profile": vram_profile(vram_total_gb),
+            "tokens": int(eff_tokens),
+            "peak_gb": round(float(peak_gb), 3),
+            "ts": int(time.time()),
+        })
+        # Keep the most recent N: an old point from a since-changed offload
+        # setting is worse than no point.
+        points = points[-VRAM_CALIB_MAX_POINTS:]
+        tmp = VRAM_CALIBRATION_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(points, f, indent=1)
+        os.replace(tmp, VRAM_CALIBRATION_FILE)
+    except Exception as exc:
+        dbg(f"VRAM calibration record skipped: {exc}")
+
+
+def fit_vram_model(points, profile):
+    """Least-squares (base_gb, per_token) over one profile's points.
+
+    Returns None when the data can't support a fit -- too few points, too
+    little spread in token count, or a result outside the sanity bounds.
+    Pure function of its arguments so it can be tested without a GPU
+    (see tests/test_vram_calibration.py).
+    """
+    xs = [p["tokens"] for p in points if p.get("profile") == profile]
+    ys = [p["peak_gb"] for p in points if p.get("profile") == profile]
+    if len(xs) < VRAM_CALIB_MIN_POINTS:
+        return None
+    if min(xs) <= 0 or max(xs) / min(xs) < VRAM_CALIB_MIN_SPAN:
+        return None
+    if max(xs) < VRAM_CALIB_MIN_MAX_TOKENS:
+        return None
+
+    n = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    denom = sum((x - mx) ** 2 for x in xs)
+    if denom <= 0:
+        return None
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom
+    base = my - slope * mx
+
+    if not (VRAM_CALIB_SLOPE_RANGE[0] <= slope <= VRAM_CALIB_SLOPE_RANGE[1]):
+        return None
+    if not (VRAM_CALIB_BASE_RANGE[0] <= base <= VRAM_CALIB_BASE_RANGE[1]):
+        return None
+    return base, slope
+
+
+def vram_model(config=None, vram_total_gb=None):
+    """(base_gb, per_token, source) actually used for estimates and warnings.
+
+    Explicit config values win, then this machine's own calibration, then the
+    shipped one-card fit.
+    """
+    if config and config.get("vram_base_gb") and config.get("vram_gb_per_token"):
+        return (float(config["vram_base_gb"]),
+                float(config["vram_gb_per_token"]), "config")
+    profile = vram_profile(vram_total_gb)
+    fit = fit_vram_model(_load_calibration(), profile)
+    if fit:
+        return fit[0], fit[1], f"calibrated:{profile}"
+    return VRAM_BASE_GB, VRAM_GB_PER_TOKEN, "shipped"
+
+
+def estimate_vram_gb(eff_tokens, config=None, vram_total_gb=None):
+    """Predicted peak VRAM for a run of this effective token count. Shared by
+    both front-ends' pre-flight dialogs so they cannot disagree with the
+    threshold below."""
+    base, per_token, _ = vram_model(config, vram_total_gb)
+    return base + per_token * eff_tokens
+
 
 def token_warn_threshold(config=None):
     """Latent-token count above which to warn, scaled to the card actually
@@ -256,8 +384,14 @@ def token_warn_threshold(config=None):
     _, _, vram_total = hw_monitor.get_gpu_stats()
     if not vram_total:
         return TOKEN_WARN_FALLBACK
-    extra_desktop_gb = max(0.0, hw_monitor.desktop_baseline_gb - FIT_DESKTOP_BASELINE_GB)
-    tokens = (vram_total * VRAM_HEADROOM - VRAM_BASE_GB - extra_desktop_gb) / VRAM_GB_PER_TOKEN
+    base_gb, per_token, source = vram_model(config, vram_total)
+    # The shipped intercept was fitted on a machine with this much desktop
+    # already on the card, so only the excess is charged. A calibrated fit came
+    # from this machine's own runs and has whatever its desktop was already
+    # baked in, so there is nothing to subtract.
+    extra_desktop_gb = (0.0 if source.startswith("calibrated")
+                        else max(0.0, hw_monitor.desktop_baseline_gb - FIT_DESKTOP_BASELINE_GB))
+    tokens = (vram_total * VRAM_HEADROOM - base_gb - extra_desktop_gb) / per_token
     # A card too small to hold the base footprint gets the floor, not a
     # negative threshold -- it will warn on essentially everything, correctly.
     return max(2000, int(tokens))
@@ -1658,6 +1792,19 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         final_frames = len(video[0])
         if use_auto_duration:
             print(f"  --> Auto Duration produced {final_frames} frames ({final_frames / float(config['fps']):.2f}s).")
+
+        # Feed this run back into the VRAM model. `final_frames` rather than
+        # config["frames"] so an Auto Duration run records the length it
+        # actually ran, and latent_tokens() already reports the *final* stage,
+        # which is the one the peak belongs to. Only successful runs get here,
+        # which is deliberate: a cancelled or OOMed run's peak describes where
+        # it stopped, not what the settings cost.
+        _, _, _vram_total_gb = hw_monitor.get_gpu_stats()
+        record_vram_observation(
+            latent_tokens(stage1_w, stage1_h, final_frames, use_upscale) * _passes,
+            torch.cuda.max_memory_reserved() / 1024**3,
+            _vram_total_gb,
+        )
         # Guidance mode goes in the name: without it a same-seed A/B (STG on
         # vs off) writes the identical filename and the second run silently
         # overwrites the first -- destroying the comparison being made.

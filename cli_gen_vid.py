@@ -132,7 +132,7 @@ def summarise(config):
     passes = gv.guidance_pass_count(config.get("cfg_mode"), config.get("stg_mode"),
                                     gv.resolve_modality_scale(config))
     eff = tokens * passes
-    est = gv.VRAM_BASE_GB + gv.VRAM_GB_PER_TOKEN * eff
+    est = gv.estimate_vram_gb(eff, config)
     _, _, vram_total = gv.hw_monitor.get_gpu_stats()
     threshold = gv.token_warn_threshold(config)
 

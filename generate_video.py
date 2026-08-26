@@ -23,8 +23,6 @@ from ltx_engine import (
     SPATIAL_COMPRESSION,
     LORA_LOADING_ENABLED,
     VIDEO_TO_VIDEO_ENABLED,
-    VRAM_BASE_GB,
-    VRAM_GB_PER_TOKEN,
     align_frames,
     auto_duration_cap_s,
     enhancer_is_downloaded,
@@ -1262,7 +1260,7 @@ def main():
             eff_tokens = tokens * passes
             if eff_tokens > threshold:
                 _, _, vram_total = hw_monitor.get_gpu_stats()
-                est = VRAM_BASE_GB + VRAM_GB_PER_TOKEN * eff_tokens
+                est = eng.estimate_vram_gb(eff_tokens, config)
                 card = f"{vram_total:.1f}GB card" if vram_total else "this card"
                 cfg_note = (f"\n\n{passes} transformer passes per step (CFG"
                             f"{'+STG' if stg_var.get() else ''}"
