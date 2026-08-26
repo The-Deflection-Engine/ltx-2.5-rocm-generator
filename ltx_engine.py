@@ -118,7 +118,17 @@ AUTO_DURATION_HARD_CEILING_S = 20.0
 # source dominates and the prompt nudges a minor change -- that's still here
 # in the code, just not surfaced as a headline feature. Flip this to True to
 # turn the mode back on in both front-ends.
-VIDEO_TO_VIDEO_ENABLED = False
+#
+# Re-enabled 2026-08-26 to retest. The strength-range finding above was
+# measured with upscale OFF (tests/variants.strength_sweep.json's base
+# config), so it stands independent of this: the FLF2V work separately
+# surfaced a real stage-2 bug in LTX2ConditionPipeline (the pipeline v2v
+# shares) where the 2-stage/upscale refinement pass silently dropped the
+# source-video conditioning entirely (missing `conditions`/`height`/`width`
+# on that call -- see the stage2_conditions block below). Now fixed, but
+# the *upscale* path specifically was never re-measured under it -- that's
+# the new thing worth testing here, not a re-check of the strength finding.
+VIDEO_TO_VIDEO_ENABLED = True
 
 # Off by default, for a different reason than video-to-video above: plain
 # LoRA loading here actually works (confirmed -- a Cinemagraph LoRA produced
