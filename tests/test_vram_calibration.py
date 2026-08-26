@@ -94,31 +94,31 @@ def _rec(threshold):
 
 
 def test_defaults_never_choose_the_consent_knobs():
-    # upscale / stg / cfg are the user's call at every card size, however big.
+    # Every quality knob is the user's call at every card size, however big:
+    # defaults pick a resolution and nothing else.
     for thr in (2000, 30000, 100000, 5_000_000):
         r = _rec(thr)
-        for key in ("upscale", "stg_mode", "cfg_mode"):
+        for key in ("upscale", "stg_mode", "cfg_mode", "modality_scale"):
             assert key not in r, f"{key} must never be auto-enabled ({thr})"
 
 
 def test_defaults_stay_inside_their_budget():
     for thr in (2000, 10000, 33837, 200000):
         r = _rec(thr)
-        cost = eng._preset_cost(r["width"], r["height"], 121,
-                                r["modality_scale"])
-        # The floor preset is allowed to exceed it -- there is nothing smaller.
-        floor = eng.DEFAULT_PRESETS[-1]
-        if (r["width"], r["height"]) != (floor[0], floor[1]):
+        cost = eng.latent_tokens(r["width"], r["height"], 121, False)
+        # The floor is allowed to exceed it -- there is nothing smaller.
+        floor = eng.DEFAULT_RESOLUTIONS[-1]
+        if (r["width"], r["height"]) != floor:
             assert cost <= thr * eng.DEFAULT_BUDGET_FRACTION, (thr, r, cost)
 
 
 def test_defaults_are_monotonic_in_headroom():
     """More VRAM must never select a leaner preset than less VRAM."""
-    order = {p: i for i, p in enumerate(eng.DEFAULT_PRESETS)}
+    order = {res: i for i, res in enumerate(eng.DEFAULT_RESOLUTIONS)}
     prev_rank = None
     for thr in (2000, 5000, 15000, 35000, 70000, 200000):
         r = _rec(thr)
-        rank = order[(r["width"], r["height"], r["modality_scale"])]
+        rank = order[(r["width"], r["height"])]
         if prev_rank is not None:
             assert rank <= prev_rank, f"threshold {thr} picked a leaner preset"
         prev_rank = rank
@@ -126,8 +126,7 @@ def test_defaults_are_monotonic_in_headroom():
 
 def test_tiny_card_gets_the_floor_not_a_crash():
     r = _rec(1)
-    floor = eng.DEFAULT_PRESETS[-1]
-    assert (r["width"], r["height"]) == (floor[0], floor[1])
+    assert (r["width"], r["height"]) == eng.DEFAULT_RESOLUTIONS[-1]
 
 
 def test_apply_is_a_noop_when_a_config_exists():
@@ -144,6 +143,7 @@ def test_apply_seeds_a_fresh_config():
     assert (out["width"], out["height"]) != (111, 222)
     # Seeding must not switch on anything that needs the user's consent.
     assert out["stg_mode"] is False
+    assert out["modality_scale"] == 1.0
     assert out.get("upscale", False) is False
 
 

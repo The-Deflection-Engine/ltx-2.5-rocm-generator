@@ -398,103 +398,88 @@ def token_warn_threshold(config=None):
 
 
 # --- Adaptive defaults --------------------------------------------------------
-# The shipped defaults were picked for one 16GB card: everything expensive off,
-# 960x544 base. On a smaller card that still won't fit; on a bigger one it
-# leaves most of the card idle and quietly withholds quality the hardware could
-# afford. With the VRAM model now calibrated per-machine, the starting settings
-# can be derived instead of guessed.
+# The shipped defaults were picked for one 16GB card: 960x544 base, everything
+# expensive off. On a smaller card that still doesn't fit; on a bigger one it
+# is simply the wrong starting point. With the VRAM model now calibrated
+# per-machine, the opening resolution can be derived instead of guessed.
+#
+# RESOLUTION IS ALL THIS PICKS. Every quality knob -- upscale, STG, CFG,
+# modality guidance -- stays a tick the user makes on purpose, however much
+# VRAM is going spare:
+#   upscale: doubles output dimensions and costs 4x. Nobody should discover
+#     that happened to them because their GPU is roomy. (Note the original
+#     reason it defaults off does NOT survive the calibration work: the
+#     960x544 2-stage 193-frame run that took the desktop down is ~51k tokens,
+#     still far above the calibrated threshold, so it would be warned about
+#     today regardless. The argument that stands is consent, not headroom.)
+#   stg: 2x wall-clock. A fresh install should not silently run at half speed.
+#   cfg: ~7-8x. A considered choice, never a consequence of owning a big GPU.
+#   modality: one extra pass, and it does not change the output format, so it
+#     was briefly a default here. Pulled back for two reasons. It is the same
+#     consent argument at a smaller scale; and its justification was weaker
+#     than it first looked -- 3.0 is upstream's value, but it belongs to the
+#     *guided* presets (LTX_2_PARAMS.video_guider_params, the HQ preset) and
+#     to diffusers' __call__ default. Upstream's DistilledPipeline, the recipe
+#     this app runs, uses SimpleDenoiser ("Single transformer call, no
+#     guidance") for both stages, so it never runs modality guidance, CFG or
+#     STG on the 8-step schedule at all. Using it here is off-recipe in the
+#     same way STG-on-distilled is, and rests on one informal A/B (audio
+#     changed a lot, video barely), not a controlled measurement.
+#
+# So what remains is the uncontroversial part: pick an opening resolution this
+# card can actually run. That is also the part that matters most at the edges
+# -- an 8GB card cannot open on 960x544, and a 48GB one has no reason to.
 #
 # These only ever seed a *fresh* config. Every front-end loads saved settings
-# over the top of its defaults dict, so once a user has clicked Generate once,
-# their choices win permanently -- this can never reach in and change a setting
-# someone deliberately picked.
+# over the top of its defaults dict, so once a user has clicked Generate once
+# their choices win permanently -- this can never reach in and change a
+# setting someone deliberately picked.
 #
 # Defaults get a fraction of the warning threshold rather than all of it: a
 # default that trips its own "large sequence" dialog on the first click is a
 # bad default, and the threshold is a ceiling, not a target.
 DEFAULT_BUDGET_FRACTION = 0.7
 
-# Explicit presets, richest first -- the first one that fits the budget wins.
-#
-# WHAT IS DELIBERATELY *NOT* AUTO-ENABLED, and why -- all three are user ticks:
-#
-#   upscale: the single biggest quality lever, and it would fit on a large
-#     card, but it doubles the output dimensions and costs 4x. Nobody should
-#     discover that happened to them because their GPU is roomy. Note the
-#     original reason it defaults off does NOT survive the calibration work:
-#     the 960x544 2-stage 193-frame run that took the desktop down is ~51k
-#     tokens, still far above the calibrated threshold, so it would be warned
-#     about today regardless. The argument that stands is consent, not
-#     headroom.
-#   stg: 2x wall-clock. Same consent argument -- a fresh install should not
-#     silently run at half speed because the card could absorb it.
-#   cfg: ~7-8x. A considered choice, never a consequence of owning a big GPU.
-#
-# That leaves resolution and modality guidance. Both are honest to adapt:
-# resolution is what actually decides whether the app runs at all on a given
-# card, and modality guidance costs one pass and does not change the output
-# format.
-#
-# On modality specifically: 3.0 is upstream's value, but it belongs to the
-# *guided* presets (LTX_2_PARAMS.video_guider_params / the HQ preset), and
-# diffusers ships it as its __call__ default. Upstream's DistilledPipeline --
-# the recipe this app runs -- uses SimpleDenoiser, "Single transformer call,
-# no guidance", for both stages, so it never runs modality guidance on the
-# 8-step schedule at all. Using it here is off-recipe in the same way
-# STG-on-distilled is: informally better in one small A/B (audio changed
-# substantially, video barely), not a controlled measurement.
-#
-# Ordering: resolution up to the reference 960x544 base first, then modality,
-# and only past 960x544 once modality is already affordable -- so a big card
-# spends its first headroom on quality rather than raw pixels.
-# (width, height, modality_scale)
-DEFAULT_PRESETS = (
-    (1280, 704, 3.0),
-    (960,  544, 3.0),
-    (960,  544, 1.0),
-    (768,  448, 1.0),
-    (640,  384, 1.0),
-    (512,  288, 1.0),
-    (320,  192, 1.0),
-    (MIN_DIMENSION, MIN_DIMENSION, 1.0),
+# Largest first; the first that fits the budget wins. The last entry is the
+# floor -- if even that does not fit there is nothing smaller to offer, so it
+# is taken anyway and the normal warning does its job.
+DEFAULT_RESOLUTIONS = (
+    (1280, 704),
+    (960, 544),
+    (768, 448),
+    (640, 384),
+    (512, 288),
+    (320, 192),
+    (MIN_DIMENSION, MIN_DIMENSION),
 )
 
 
-def _preset_cost(width, height, frames, modality_scale):
-    """Effective tokens for a candidate preset -- the same arithmetic the
-    pre-flight check and the engine's own pass count use. Always costed
-    single-stage with STG off, since neither is ever chosen here."""
-    return latent_tokens(width, height, frames, False) * \
-        guidance_pass_count(False, False, modality_scale)
-
-
 def recommended_defaults(config=None, vram_total_gb=None, frames=121):
-    """Starting settings sized to the card actually present.
+    """Opening resolution sized to the card actually present.
 
-    Returns a dict of config keys (width/height/modality_scale) plus `_budget`
-    and `_threshold` for the caller to log. Never returns `upscale`,
-    `stg_mode` or `cfg_mode` -- see the note on DEFAULT_PRESETS. Pure
+    Returns `width`/`height` plus `_budget` and `_threshold` for the caller to
+    log. Deliberately returns no quality flags -- see the note above. Pure
     arithmetic over token_warn_threshold(), so it inherits whatever the VRAM
-    model currently is -- shipped constants on a fresh install, this machine's
+    model currently is: shipped constants on a fresh install, this machine's
     own calibration once enough runs exist.
     """
     threshold = token_warn_threshold(config)
     budget = threshold * DEFAULT_BUDGET_FRACTION
 
-    # The last preset is the floor: if even that does not fit there is nothing
-    # smaller to offer, so take it and let the normal warning do its job.
-    w, h, modality = DEFAULT_PRESETS[-1]
-    for cand in DEFAULT_PRESETS:
-        if _preset_cost(cand[0], cand[1], frames, cand[2]) <= budget:
-            w, h, modality = cand
+    width, height = DEFAULT_RESOLUTIONS[-1]
+    for w, h in DEFAULT_RESOLUTIONS:
+        # Costed bare: single-stage, one pass. That is what a fresh config
+        # runs, since none of the multiplying knobs are enabled here.
+        if latent_tokens(w, h, frames, False) <= budget:
+            width, height = w, h
             break
 
-    return {"width": w, "height": h, "modality_scale": modality,
+    return {"width": width, "height": height,
             "_budget": int(budget), "_threshold": int(threshold)}
 
 
 def apply_recommended_defaults(defaults, config_exists, frames=121):
-    """Fold adaptive values into a front-end's defaults dict, in place.
+    """Fold the adaptive resolution into a front-end's defaults dict, in place.
 
     No-op once a saved config exists: the settings file is the record of what
     the user chose, and re-deriving on top of it would silently move settings
@@ -508,13 +493,12 @@ def apply_recommended_defaults(defaults, config_exists, frames=121):
     except Exception as exc:
         dbg(f"adaptive defaults skipped: {exc}")
         return defaults
-    for key in ("width", "height", "modality_scale"):
-        defaults[key] = rec[key]
-    enabled = ["modality guidance"] if rec["modality_scale"] > 1.0 else []
-    print(f"  -> First run: sized defaults to this GPU -- "
-          f"{rec['width']}x{rec['height']}"
-          f"{', ' + ' + '.join(enabled) if enabled else ', no extra guidance'} "
-          f"(budget {rec['_budget']:,} of {rec['_threshold']:,} tokens).")
+    defaults["width"] = rec["width"]
+    defaults["height"] = rec["height"]
+    print(f"  -> First run: opening resolution sized to this GPU -- "
+          f"{rec['width']}x{rec['height']} "
+          f"(budget {rec['_budget']:,} of {rec['_threshold']:,} tokens). "
+          f"Upscale/STG/CFG stay off until you turn them on.")
     return defaults
 
 
