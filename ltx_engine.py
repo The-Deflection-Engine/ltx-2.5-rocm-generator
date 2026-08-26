@@ -108,6 +108,25 @@ def download_enhancer_model(model_key):
 # fixed at whatever was safe on one 16GB card at one resolution.
 AUTO_DURATION_HARD_CEILING_S = 20.0
 
+# The stock negative prompt, restored to upstream's. diffusers'
+# DEFAULT_NEGATIVE_PROMPT drops five leading tokens that Lightricks' own
+# constants.py carries (ltx-pipelines/src/ltx_pipelines/utils/constants.py):
+# has_subtitles, has_blurbox, transition from black, transition to black,
+# speech_ending_short. Checked 2026-08-26: those five are the only difference,
+# and they are the functionally distinctive ones -- they read as training
+# caption tags, so negating them suppresses burned-in subtitles, letterbox
+# bars, fade-from-black openings and clipped speech endings. Everything else
+# in the string is generic "blurry, low contrast" filler that any negative
+# prompt would carry. Only has an effect in CFG mode; the distilled schedule
+# is guidance-free and never evaluates the negative branch.
+def default_negative_prompt():
+    from diffusers.pipelines.ltx2.utils import DEFAULT_NEGATIVE_PROMPT
+    missing = ("has_subtitles, has_blurbox, transition from black, "
+               "transition to black, speech_ending_short, ")
+    if DEFAULT_NEGATIVE_PROMPT.startswith(missing):
+        return DEFAULT_NEGATIVE_PROMPT
+    return missing + DEFAULT_NEGATIVE_PROMPT
+
 # Enabled, but read this before trusting `video_strength`: it is NOT a
 # denoise/restyle dial, and its useful range is narrow for a specific,
 # understood reason. Traced 2026-08-26 through diffusers + upstream ltx-core.
@@ -851,6 +870,32 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         )
         from diffusers.pipelines.ltx2.pipeline_ltx2_condition import LTX2VideoCondition
         from diffusers.hooks import apply_group_offloading
+        # KNOWN DIVERGENCE FROM THE REFERENCE RECIPE (audited 2026-08-26).
+        # These sigma values match upstream exactly, but the *sampler* stepping
+        # through them does not. Lightricks' DistilledPipeline switches stage 1
+        # to an ancestral (SDE) Euler step for checkpoints at 2.5 or newer --
+        # `ANCESTRAL_SAMPLER_SINCE_VERSION = (2, 5)` in
+        # ltx-pipelines/src/ltx_pipelines/distilled.py, with eta=1.0,
+        # s_noise=1.0; stage 2 stays deterministic because its 3-step tail is
+        # too short to remove freshly injected noise. We run deterministic
+        # Euler for both stages, because that is what diffusers does here and
+        # what this checkpoint's own scheduler_config.json asks for
+        # ("stochastic_sampling": false).
+        #
+        # Not fixable by flipping that flag, for two separate reasons:
+        #   1. Different update rule. diffusers' stochastic branch is
+        #      `prev = (1 - s_next) * x0 + s_next * noise` -- it discards the
+        #      current sample entirely and re-draws from the forward process.
+        #      Upstream's eta=1 steps to `sigma_down = s_next**2 / s` (0.848
+        #      where diffusers would use 0.909) keeping a share of x, then
+        #      renoises variance-preservingly. They are not the same step.
+        #   2. It would break seed reproducibility. No LTX-2 pipeline in
+        #      diffusers passes `generator=` to `scheduler.step()`, so the
+        #      per-step noise would come from the global RNG -- and controlled
+        #      same-seed A/Bs are what this project measures with.
+        # Left as-is deliberately. Untested whether the ancestral sampler
+        # actually improves output here; it is a recipe difference, not a
+        # known defect.
         from diffusers.pipelines.ltx2.utils import (
             DISTILLED_SIGMA_VALUES,
             STAGE_2_DISTILLED_SIGMA_VALUES,

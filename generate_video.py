@@ -748,8 +748,7 @@ def main():
         text_np.insert(tk.END, "Loading default prompt...")
         root.update() 
         try:
-            from diffusers.pipelines.ltx2.utils import DEFAULT_NEGATIVE_PROMPT
-            real_default = DEFAULT_NEGATIVE_PROMPT
+            real_default = eng.default_negative_prompt()
         except ImportError:
             real_default = "worst quality, inconsistent, deformed, blurry, watermark"
         text_np.delete("1.0", tk.END)
