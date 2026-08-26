@@ -263,14 +263,25 @@ def token_warn_threshold(config=None):
     return max(2000, int(tokens))
 
 
+def resolve_modality_scale(config):
+    """Modality-guidance scale from a config, honouring the legacy key name.
+
+    Lives here rather than in each front-end because the GUI, CLI and server
+    all need it for their pre-flight VRAM estimate, and a front-end reading
+    the old key while the engine reads the new one would under-count a pass.
+    """
+    return float(config.get("modality_scale",
+                            config.get("cfg_modality_scale", 1.0)))
+
+
 def auto_duration_cap_s(width, height, upscale, cfg_mode, stg_mode, fps,
-                        cfg_modality_scale=1.0, config=None):
+                        modality_scale=1.0, config=None):
     """Longest clip Auto Duration may pick at this resolution/guidance mode
     without exceeding token_warn_threshold() on the card actually present --
     replaces a flat seconds figure that was only ever valid for one 16GB card
     at one resolution."""
     threshold = token_warn_threshold(config)
-    passes = guidance_pass_count(cfg_mode, stg_mode, cfg_modality_scale)
+    passes = guidance_pass_count(cfg_mode, stg_mode, modality_scale)
     scale = 2 if upscale else 1
     tokens_per_frame = ((height * scale) // 32) * ((width * scale) // 32)
     if tokens_per_frame <= 0 or passes <= 0:
@@ -546,7 +557,7 @@ def latent_tokens(width, height, frames, upscale):
     return lat_f * ((height * scale) // 32) * ((width * scale) // 32)
 
 
-def guidance_pass_count(cfg_mode, stg_mode, cfg_modality_scale=1.0):
+def guidance_pass_count(cfg_mode, stg_mode, modality_scale=1.0):
     """How many full transformer forward passes stage 1 runs per step.
 
     Base is 1. CFG and STG each add one (see the comments in
@@ -560,7 +571,7 @@ def guidance_pass_count(cfg_mode, stg_mode, cfg_modality_scale=1.0):
     what plain CFG costs.
     """
     return 1 + (1 if cfg_mode else 0) + (1 if stg_mode else 0) + \
-        (1 if (cfg_mode and cfg_modality_scale > 1.0) else 0)
+        (1 if modality_scale > 1.0 else 0)
 
 
 def _embed_cache_key(model_path, p, np_text, need_negative):
@@ -1020,20 +1031,6 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         # less than half the reference strength. Costs nothing extra: audio
         # CFG rides the same doubled forward pass as video CFG.
         audio_cfg_scale = float(config.get("audio_cfg_scale", 7.0))
-        # Modality-isolation guidance: a third guidance term the reference CFG
-        # presets always run alongside CFG (LTX_2_PARAMS and the HQ preset both
-        # set modality_scale=3.0 for video AND audio -- constants.py:54,64,
-        # :102,110). Unlike audio_cfg_scale this is NOT free: do_modality_isolation
-        # _guidance (pipeline_ltx2.py:907-908) adds its own extra, *unbatched*
-        # transformer call each step (the "uncond_modality" pass, :1509-1524) --
-        # a third full forward pass on top of CFG's doubled one, so a real VRAM
-        # and time cost on a 16GB card that's already paying for CFG.
-        # Off by default (1.0, i.e. do_modality_isolation_guidance stays False)
-        # rather than matching the reference's 3.0: unlike the audio_cfg_scale
-        # fix, defaulting this on would silently make every existing CFG-mode
-        # run slower and heavier. Opt in via cfg_modality_scale in the config
-        # once you have headroom to spare.
-        cfg_modality_scale = float(config.get("cfg_modality_scale", 1.0))
 
         # --- Spatio-Temporal Guidance ----------------------------------------
         # STG runs a second pass with one transformer block perturbed and pushes
@@ -1052,6 +1049,18 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         stg_scale = float(config.get("stg_scale", 1.0))
         stg_blocks = config.get("stg_blocks") or [28]
 
+        # Modality guidance is NOT tied to CFG: diffusers gates it purely on
+        # `modality_scale > 1.0 or audio_modality_scale > 1.0`
+        # (do_modality_isolation_guidance, pipeline_ltx2.py), the same shape as
+        # STG's gate. So it can ride the 8-step distilled schedule for one extra
+        # pass, exactly like STG -- it does not require CFG's 30 doubled steps.
+        # `cfg_modality_scale` is the older key name from when this was only
+        # reachable inside CFG mode; it is still honoured so existing configs
+        # keep working, but `modality_scale` is the one to set now.
+        modality_scale = float(config.get("modality_scale",
+                                          config.get("cfg_modality_scale", 1.0)))
+        use_modality = modality_scale > 1.0
+
         if use_cfg:
             stage1_guidance = dict(
                 guidance_scale=cfg_scale,
@@ -1067,8 +1076,8 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 # the `or` as itself and is numerically off (it only scales a
                 # delta that gets added in, see :1505).
                 audio_stg_scale=1e-8,
-                modality_scale=cfg_modality_scale,
-                audio_modality_scale=cfg_modality_scale,
+                modality_scale=modality_scale,
+                audio_modality_scale=modality_scale,
             )
             stage1_schedule = dict(num_inference_steps=cfg_steps)
             need_negative = True        # the negative prompt is finally encoded and used
@@ -1082,8 +1091,8 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 # silently replaced by `stg_scale` via diffusers' `or`
                 # fallback, applying audio STG we never asked for.
                 audio_stg_scale=1e-8,
-                modality_scale=1.0,
-                audio_modality_scale=1.0,
+                modality_scale=modality_scale,
+                audio_modality_scale=modality_scale,
             )
             stage1_schedule = dict(sigmas=DISTILLED_SIGMA_VALUES)
             need_negative = False
@@ -1091,6 +1100,8 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             stage1_guidance = dict(distilled_guidance)  # copy: stage 2 reuses
             # distilled_guidance directly (**distilled_guidance below), so an
             # in-place edit of stage1_guidance here would leak into stage 2
+            stage1_guidance["modality_scale"] = modality_scale
+            stage1_guidance["audio_modality_scale"] = modality_scale
             stage1_schedule = dict(sigmas=DISTILLED_SIGMA_VALUES)
             need_negative = False       # CFG off => negative branch is never evaluated
 
@@ -1107,7 +1118,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         want_auto_duration = bool(config.get("auto_duration"))
         auto_cap_s = auto_duration_cap_s(
             stage1_w, stage1_h, use_upscale, use_cfg, use_stg,
-            float(config["fps"]), cfg_modality_scale, config)
+            float(config["fps"]), modality_scale, config)
         auto_min_s = float(config.get("auto_min_seconds", 2.0))
         auto_max_s = min(float(config.get("auto_max_seconds", 5.0)), auto_cap_s)
         auto_min_s = min(auto_min_s, auto_max_s - 0.1)
@@ -1373,14 +1384,13 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             f"(latent {_lat_f}x{stage1_h // 32}x{stage1_w // 32}"
             f"{', worst-case under Auto Duration' if use_auto_duration else ''}), "
             f"blocks_per_group={config.get('blocks_per_group', 4)}, seed={config['active_seed']}")
-        use_modality = use_cfg and cfg_modality_scale > 1.0
-        _passes = guidance_pass_count(use_cfg, use_stg, cfg_modality_scale)
+        _passes = guidance_pass_count(use_cfg, use_stg, modality_scale)
         dbg(f"guidance: CFG {'on' if use_cfg else 'off'}"
             f"{f' (scale {cfg_scale}, audio {audio_cfg_scale})' if use_cfg else ''}, "
             f"STG {'on' if use_stg else 'off'}"
             f"{f' (scale {stg_scale}, blocks {stg_blocks})' if use_stg else ''}, "
             f"modality {'on' if use_modality else 'off'}"
-            f"{f' (scale {cfg_modality_scale})' if use_modality else ''} "
+            f"{f' (scale {modality_scale})' if use_modality else ''} "
             f"-> {_passes} transformer pass{'es' if _passes > 1 else ''} per step")
 
         steps_done = [0]

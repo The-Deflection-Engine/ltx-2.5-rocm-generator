@@ -120,7 +120,7 @@ def summarise(config):
     if config.get("auto_duration"):
         auto_cap = gv.auto_duration_cap_s(
             w, h, up, config.get("cfg_mode"), config.get("stg_mode"),
-            float(config["fps"]), config.get("cfg_modality_scale", 1.0), config)
+            float(config["fps"]), gv.resolve_modality_scale(config), config)
         auto_max = min(float(config.get("auto_max_seconds", 5.0)), auto_cap)
         check_frames = int(auto_max * float(config["fps"]))
     else:
@@ -130,7 +130,7 @@ def summarise(config):
     # full forward call, so scale the estimate by the actual pass count --
     # not a hardcoded x2, which used to under-count STG-only and CFG+STG runs.
     passes = gv.guidance_pass_count(config.get("cfg_mode"), config.get("stg_mode"),
-                                    config.get("cfg_modality_scale", 1.0))
+                                    gv.resolve_modality_scale(config))
     eff = tokens * passes
     est = gv.VRAM_BASE_GB + gv.VRAM_GB_PER_TOKEN * eff
     _, _, vram_total = gv.hw_monitor.get_gpu_stats()

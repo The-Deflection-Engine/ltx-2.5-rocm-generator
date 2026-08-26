@@ -1051,7 +1051,7 @@ def main():
             return config.get("auto_max_seconds", 5.0)
         return auto_duration_cap_s(w, h, upscale_var.get(), cfg_var.get(),
                                    stg_var.get(), fps,
-                                   config.get("cfg_modality_scale", 1.0))
+                                   eng.resolve_modality_scale(config))
 
     def refresh_auto_cap_label(_event=None):
         chk_auto.config(text=f"Auto Duration (max {current_auto_cap():.0f}s)")
@@ -1236,7 +1236,7 @@ def main():
 
             auto_cap = auto_duration_cap_s(w_adj, h_adj, upscale_var.get(), cfg_var.get(),
                                           stg_var.get(), fps,
-                                          config.get("cfg_modality_scale", 1.0))
+                                          eng.resolve_modality_scale(config))
             try:
                 auto_max_val = min(float(entry_auto_max.get()), auto_cap)
             except ValueError:
@@ -1258,7 +1258,7 @@ def main():
             # cfg_modality_scale has no GUI control, so read it from the last
             # loaded/saved config -- same as everywhere else it's used.
             passes = guidance_pass_count(cfg_var.get(), stg_var.get(),
-                                         config.get("cfg_modality_scale", 1.0))
+                                         eng.resolve_modality_scale(config))
             eff_tokens = tokens * passes
             if eff_tokens > threshold:
                 _, _, vram_total = hw_monitor.get_gpu_stats()
@@ -1266,7 +1266,7 @@ def main():
                 card = f"{vram_total:.1f}GB card" if vram_total else "this card"
                 cfg_note = (f"\n\n{passes} transformer passes per step (CFG"
                             f"{'+STG' if stg_var.get() else ''}"
-                            f"{'+modality' if config.get('cfg_modality_scale', 1.0) > 1.0 else ''}"
+                            f"{'+modality' if eng.resolve_modality_scale(config) > 1.0 else ''}"
                             f"), roughly {passes}x the compute of a plain run."
                             ) if cfg_var.get() else (
                             "\n\n2 transformer passes per step (STG), roughly "
