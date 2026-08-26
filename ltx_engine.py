@@ -564,8 +564,16 @@ DEFAULT_BUDGET_FRACTION = 0.7
 # Largest first; the first that fits the budget wins. The last entry is the
 # floor -- if even that does not fit there is nothing smaller to offer, so it
 # is taken anyway and the normal warning does its job.
+#
+# Capped at 960x544, the documented LTX-2.5 reference base, rather than the
+# largest thing a card can hold. 1280x704 was the top of this list briefly and
+# a 16GB card selected it: it ran fine (14,080 tokens, 9.21GB peak of 15.92)
+# but took 7 minutes, where 960x544 is roughly half that. A default should be
+# the quick, safe starting point, not the most the hardware will take -- the
+# same reasoning that keeps upscale, STG and CFG off. Anyone wanting more
+# raises it in one click, and a big card's headroom is theirs to spend
+# deliberately. This is why a 48GB card and a 16GB one open on the same size.
 DEFAULT_RESOLUTIONS = (
-    (1280, 704),
     (960, 544),
     (768, 448),
     (640, 384),
