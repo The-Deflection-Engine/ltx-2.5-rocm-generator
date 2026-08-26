@@ -307,10 +307,48 @@ def main():
 
     update_telemetry()
     
-    # Main Form
-    main_frame = ttk.Frame(root, padding="15")
-    main_frame.pack(fill=tk.BOTH, expand=True)
-    
+    # Main Form -- wrapped in a Canvas + Scrollbar so a window shorter than
+    # the packed content (small display, tall layout after adding a mode)
+    # scrolls instead of clipping the bottom row off-screen, the underlying
+    # problem behind the Cancel/Generate-off-screen bug. Everything below
+    # still just packs into `main_frame` exactly as before -- only its
+    # parent changed, from `root` directly to a canvas window.
+    scroll_container = ttk.Frame(root)
+    scroll_container.pack(fill=tk.BOTH, expand=True)
+    canvas = tk.Canvas(scroll_container, highlightthickness=0)
+    vscroll = ttk.Scrollbar(scroll_container, orient=tk.VERTICAL, command=canvas.yview)
+    canvas.configure(yscrollcommand=vscroll.set)
+    vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    main_frame = ttk.Frame(canvas, padding="15")
+    main_frame_window = canvas.create_window((0, 0), window=main_frame, anchor="nw")
+
+    def _sync_scrollregion(_event=None):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+    main_frame.bind("<Configure>", _sync_scrollregion)
+
+    def _sync_content_width(event):
+        # Widgets packed with fill=tk.X inside main_frame need the canvas's
+        # actual width, not their own, to stretch/wrap correctly.
+        canvas.itemconfigure(main_frame_window, width=event.width)
+    canvas.bind("<Configure>", _sync_content_width)
+
+    def _on_mousewheel(event):
+        if event.num == 4:
+            canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            canvas.yview_scroll(1, "units")
+        else:
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+    # Bound globally (bind_all), not just on the canvas, so scrolling works
+    # over any child widget the pointer happens to be on -- Linux sends
+    # Button-4/5 for wheel events, Windows/macOS send <MouseWheel> with
+    # `delta`, so all three are wired up.
+    canvas.bind_all("<Button-4>", _on_mousewheel)
+    canvas.bind_all("<Button-5>", _on_mousewheel)
+    canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
     # --- Generation mode ---
     # Unload Models sits inside this box, at the right of the mode row -- not
     # among the Generate/Cancel buttons at the bottom, where it used to be one
@@ -1287,20 +1325,23 @@ def main():
             "so you never restart and reload 18GB to diagnose something.")
 
     root.update_idletasks()
-    # Floor the window at whatever the packed layout actually needs, measured
-    # rather than hardcoded -- font metrics and CPU core count (the telemetry
-    # grid wraps at 8 per row) both change the requirement per machine.
-    #
-    # `usable_h` leaves headroom below the raw screen height for window-manager
-    # chrome (title bar, taskbar/dock) -- capping at the *raw* screen height
-    # (the old behaviour) produces a window exactly as tall as the display with
-    # zero margin, so on any screen where the packed layout needs that much
-    # (more controls = taller layout, e.g. FLF2V's extra row) the bottom
-    # Cancel/Generate row renders behind the taskbar, off-screen.
+    # Width still floors at whatever the packed layout actually needs --
+    # telemetry_frame (CPU/RAM/VRAM bar) is a direct child of `root`, not of
+    # the scrollable canvas below, so its reqwidth (font metrics and CPU core
+    # count both change it -- the telemetry grid wraps at 8 per row) still
+    # propagates normally. Height is different: main_frame's own content
+    # (mode/prompt/resolution panels, log, Generate/Cancel) now lives inside
+    # a Canvas, which does NOT propagate a child's size upward, so
+    # `root.winfo_reqheight()` no longer reflects the full unscrolled content
+    # -- deliberately. A window shorter than that content is exactly what the
+    # scrollbar above is for, so height is capped at `usable_h` (screen
+    # height minus headroom for window-manager chrome) rather than grown to
+    # fit everything, which is what let the bottom row render off-screen on
+    # short displays before the scrollable panel existed.
     usable_h = max(400, root.winfo_screenheight() - 80)
     req_w = max(640, root.winfo_reqwidth())
     req_h = min(root.winfo_reqheight(), usable_h)
-    root.minsize(req_w, req_h)
+    root.minsize(req_w, min(req_h, 400))
     win_w, win_h = max(WIN_W, req_w), min(max(WIN_H, req_h), usable_h)
     x = (root.winfo_screenwidth() // 2) - (win_w // 2)
     y = (root.winfo_screenheight() // 2) - (win_h // 2)
