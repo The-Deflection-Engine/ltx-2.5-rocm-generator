@@ -27,3 +27,8 @@ pillow>=12.0.0
 imageio>=2.37.0
 imageio-ffmpeg>=0.6.0
 av>=18.0.0
+
+# Optional: only needed for the FastAPI front-end (server.py + static/), which
+# is deliberately untracked -- see CLAUDE.md. Nothing in the repo imports these.
+fastapi>=0.115.0
+uvicorn>=0.34.0
