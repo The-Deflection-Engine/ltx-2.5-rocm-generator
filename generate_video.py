@@ -571,6 +571,15 @@ def main():
                                font=("Consolas", 9))
         lora_list.pack(fill=tk.X, side=tk.TOP)
 
+        # An IC-LoRA loads fine in any mode but has nothing to attend to
+        # outside IC-LoRA Video -> Video, so it silently does nothing there.
+        # That is the one genuine "loaded a LoRA, saw no effect" trap, and it
+        # is invisible without this -- the run succeeds and looks normal.
+        lora_note_var = tk.StringVar(value="")
+        lbl_lora_note = ttk.Label(lora_frame, textvariable=lora_note_var,
+                                  foreground="#b8860b", wraplength=760,
+                                  justify=tk.LEFT)
+
         lora_row = ttk.Frame(lora_frame)
         lora_row.pack(fill=tk.X, pady=(6, 0))
 
@@ -599,6 +608,7 @@ def main():
                 lora_stack.append({"path": p, "scale": 1.0})
             if paths:
                 refresh_lora_list(select=len(lora_stack) - 1)
+                refresh_lora_note()
 
         def remove_lora():
             i = selected_lora_index()
@@ -606,10 +616,12 @@ def main():
                 return
             lora_stack.pop(i)
             refresh_lora_list(select=min(i, len(lora_stack) - 1))
+            refresh_lora_note()
 
         def clear_loras():
             lora_stack.clear()
             refresh_lora_list()
+            refresh_lora_note()
 
         def on_lora_select(_event=None):
             i = selected_lora_index()
@@ -627,7 +639,22 @@ def main():
                 return
             refresh_lora_list(select=i)
 
+        def refresh_lora_note(*_args):
+            """Warn when the stack holds an IC-LoRA but the mode can't use it."""
+            ic = [os.path.basename(e["path"]) for e in lora_stack
+                  if eng.looks_like_ic_lora(e["path"])]
+            if ic and mode_var.get() != "ic_v2v":
+                lora_note_var.set(
+                    "⚠ " + ", ".join(ic) + " looks like an IC-LoRA. Its weights will load, "
+                    "but it has nothing to attend to outside IC-LoRA Video → Video, so it "
+                    "will have no visible effect. Switch mode and pick a reference clip.")
+                lbl_lora_note.pack(fill=tk.X, side=tk.TOP, pady=(6, 0))
+            else:
+                lora_note_var.set("")
+                lbl_lora_note.pack_forget()
+
         lora_list.bind("<<ListboxSelect>>", on_lora_select)
+        mode_var.trace_add("write", refresh_lora_note)
         lora_scale_var.trace_add("write", apply_scale)
 
         ttk.Button(lora_row, text="📁 Add LoRA...", command=add_lora).pack(side=tk.LEFT)

@@ -248,6 +248,33 @@ def resolve_loras(config):
     return out
 
 
+def looks_like_ic_lora(lora_path):
+    """Best-effort "does this adapter want a reference clip?".
+
+    A heuristic, and deliberately labelled as one: an IC-LoRA is structurally
+    an ordinary LoRA -- same key layout, same target modules -- so nothing in
+    the tensors distinguishes it. Two signals, in order of trust:
+
+      1. `reference_downscale_factor` in the safetensors metadata. Reliable
+         when present (Union-Control ships 2), but an adapter trained at
+         factor 1 may simply omit the key, so absence proves nothing.
+      2. The filename. Lightricks name every one of these `*ic-lora*`, and
+         people generally keep that name.
+
+    Used only to warn, never to block or to change behaviour -- a false
+    positive costs a dismissible note, a false negative costs nothing beyond
+    the status quo.
+    """
+    try:
+        from safetensors import safe_open
+        with safe_open(lora_path, framework="pt") as f:
+            if (f.metadata() or {}).get("reference_downscale_factor"):
+                return True
+    except Exception:
+        pass
+    return "ic-lora" in os.path.basename(lora_path).lower().replace("_", "-")
+
+
 def resolve_reference_downscale_factor(config, default=1):
     """The reference downscale factor for an IC-LoRA run, from the LoRA stack.
 
