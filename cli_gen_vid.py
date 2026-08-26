@@ -64,6 +64,8 @@ def resolve(config, args):
     if args.image is not None:
         config["image_path"] = args.image
         config["mode"] = "image2video" if args.image else "text2video"
+    if args.end_image is not None:
+        config["end_image_path"] = args.end_image
     if args.video is not None:
         config["video_path"] = args.video
         config["mode"] = "video2video" if args.video else "text2video"
@@ -145,6 +147,8 @@ def summarise(config):
           f"   [warn above {threshold:,} tokens]")
     if config.get("mode") == "image2video":
         print(f"  image      : {config.get('image_path') or '(none!)'}")
+        if config.get("end_image_path"):
+            print(f"  end image  : {config['end_image_path']}")
     if config.get("mode") == "video2video":
         print(f"  video      : {config.get('video_path') or '(none!)'}"
               f"  (strength {config.get('video_strength', 0.05)})")
@@ -167,6 +171,7 @@ def main():
     ap.add_argument("--fps", type=float)
     ap.add_argument("--seed", help="integer, or 'r' for random")
     ap.add_argument("--image", help="conditioning image for image-to-video ('' for text-to-video)")
+    ap.add_argument("--end-image", help="optional end-frame image for image-to-video ('' to clear)")
     ap.add_argument("--video", help="source clip for video-to-video ('' for text-to-video)")
     ap.add_argument("--video-strength", type=float,
                     help="how strongly the source video is locked in, 0-1 (default 0.05) -- "
@@ -202,7 +207,7 @@ def main():
     defaults = {
         "prompt": "", "negative_prompt": "", "width": 960, "height": 544,
         "frames": 121, "fps": 24.0, "seed": "42", "upscale": False,
-        "mode": "text2video", "image_path": "", "video_path": "", "video_strength": 0.05,
+        "mode": "text2video", "image_path": "", "end_image_path": "", "video_path": "", "video_strength": 0.05,
         "lora_path": "", "lora_scale": 1.0, "auto_duration": False,
         "auto_min_seconds": 2.0, "auto_max_seconds": 5.0, "image_crf": None,
         "cfg_mode": False, "cfg_steps": 30, "cfg_scale": 3.0, "audio_cfg_scale": 7.0, "cfg_modality_scale": 1.0,
@@ -216,6 +221,8 @@ def main():
         sys.exit("Positive prompt is empty -- set it in the config or pass --prompt.")
     if config.get("mode") == "image2video" and not os.path.exists(config.get("image_path", "")):
         sys.exit(f"Image-to-video needs a valid image: {config.get('image_path')!r}")
+    if config.get("end_image_path") and not os.path.exists(config["end_image_path"]):
+        sys.exit(f"End frame image path does not exist: {config['end_image_path']!r}")
     if config.get("mode") == "video2video" and not os.path.exists(config.get("video_path", "")):
         sys.exit(f"Video-to-video needs a valid video: {config.get('video_path')!r}")
     if config.get("mode") == "video2video" and not gv.VIDEO_TO_VIDEO_ENABLED:
