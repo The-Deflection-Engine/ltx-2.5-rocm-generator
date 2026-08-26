@@ -147,20 +147,37 @@ AUTO_DURATION_HARD_CEILING_S = 20.0
 # amount of tuning this number makes it restyling.
 VIDEO_TO_VIDEO_ENABLED = True
 
-# Off by default, for a different reason than video-to-video above: plain
-# LoRA loading here actually works (confirmed -- a Cinemagraph LoRA produced
-# a real, visible effect: locked composition vs. the base model's normal
-# camera drift). The problem is that most LoRAs published for LTX-2 are
-# IC-LoRAs (in-context conditioning -- Water-Simulation, Relight,
-# Colorization, Depth-Control, etc.), which need a completely different
-# pipeline (LTX2InContextPipeline), a reference video as a second input, and
-# a structured trigger-phrase prompt ("Reference shows X. Edited shows the
-# same scene with Y. ADD <effect> ..."). None of that is built. Loading an
-# IC-LoRA through the plain path here either does nothing useful or crashes,
-# with no way for someone picking a LoRA off Hugging Face to know which kind
-# they got. Flip this to True if you specifically have a plain (non-IC)
-# LoRA file -- Cinemagraph and Foley-V2A are the two known-plain ones as of
-# this writing.
+# Plain LoRA loading works (confirmed -- a Cinemagraph LoRA produced a real,
+# visible effect: locked composition vs. the base model's normal camera
+# drift). Most LoRAs published for LTX-2 are IC-LoRAs (in-context
+# conditioning -- Union-Control, Relight, Day-To-Night, Water-Simulation,
+# etc.), which need a reference video and LTX2InContextPipeline. That is
+# still not built, so an IC-LoRA loaded through this plain path will apply
+# its weights and then do nothing useful -- there is no reference for it to
+# attend to.
+#
+# What was measured 2026-08-26 (against LTX-2.3-22b-IC-LoRA-Union-Control,
+# rank 64, on this 2.5 fp8 stack), correcting earlier guesses here:
+#   - It does NOT crash. `pipe.load_lora_weights()` accepts the file as-is:
+#     diffusers' LTX2LoraLoaderMixin already converts Lightricks' key format
+#     ("diffusion_model.*" -> "transformer.*"), all 960 tensors, no shim.
+#   - A 2.3-22b IC-LoRA is structurally compatible with the 2.5 transformer:
+#     all 960 targeted modules exist, blocks 0..47 line up exactly, and all
+#     480 A/B pairs are shape-clean. (LTX's own 2.5 ComfyUI workflows load
+#     the 2.3-22b adapters, which is consistent with this.)
+#   - All 960 adapter tensors land in fp8, so the fp8 -> bf16 cast below is
+#     required for IC-LoRAs too, not just plain ones.
+#   - There is no universal trigger-phrase prompt format. It is per-adapter:
+#     Day-To-Night takes a plain descriptive prompt with a trailing "only
+#     the lighting changes..." clause; Ingredients uses a two-part
+#     "Reference sheet: / Generated video:" form. It belongs in a per-adapter
+#     registry, not a global rule.
+#   - Reference cost is set by the adapter's own `reference_downscale_factor`
+#     safetensors metadata key (Union-Control ships 2 = half-res reference,
+#     so +25% tokens; Day-To-Night ships 1, so +100%). Read it, don't assume.
+# So the remaining work for real v2v is the pipeline and the reference
+# plumbing, not LoRA loading -- see VIDEO_TO_VIDEO_ENABLED above for why the
+# current v2v mode is a crossfade rather than a restyle.
 LORA_LOADING_ENABLED = True
 
 # From the VAE config: spatial_compression_ratio 32, temporal_compression_ratio 8.
