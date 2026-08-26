@@ -108,26 +108,43 @@ def download_enhancer_model(model_key):
 # fixed at whatever was safe on one 16GB card at one resolution.
 AUTO_DURATION_HARD_CEILING_S = 20.0
 
-# Off by default: measured (see tests/variants.strength_sweep.json and its
-# runs/ report) to not do what it sounds like it does. `video_strength` is one
-# global noise/clean blend, not separate content/style control -- the range
-# that shows real stylistic change (roughly 0-0.05 here) discards nearly all
-# of the source's pixel content, so the result is close to plain
-# text-to-video steered by the prompt, not "the source video, restyled".
-# What's structurally sound is a small edit near strength~0.9-1.0, where the
-# source dominates and the prompt nudges a minor change -- that's still here
-# in the code, just not surfaced as a headline feature. Flip this to True to
-# turn the mode back on in both front-ends.
+# Enabled, but read this before trusting `video_strength`: it is NOT a
+# denoise/restyle dial, and its useful range is narrow for a specific,
+# understood reason. Traced 2026-08-26 through diffusers + upstream ltx-core.
 #
-# Re-enabled 2026-08-26 to retest. The strength-range finding above was
-# measured with upscale OFF (tests/variants.strength_sweep.json's base
-# config), so it stands independent of this: the FLF2V work separately
-# surfaced a real stage-2 bug in LTX2ConditionPipeline (the pipeline v2v
-# shares) where the 2-stage/upscale refinement pass silently dropped the
-# source-video conditioning entirely (missing `conditions`/`height`/`width`
-# on that call -- see the stage2_conditions block below). Now fixed, but
-# the *upscale* path specifically was never re-measured under it -- that's
-# the new thing worth testing here, not a re-check of the strength finding.
+# WHY THE RANGE IS NARROW. We pass the source clip as an LTX2VideoCondition at
+# `index=0`. In diffusers that routes to apply_first_frame_conditioning(),
+# i.e. upstream's `VideoConditionByLatentIndex` -- which *overwrites* canvas
+# tokens and sets `denoise_mask = 1 - strength` over them. Because the
+# condition spans the whole clip, every token gets the same mask (verified:
+# per-frame correlation to the source is flat across all 49 frames, slope
+# -0.00016/frame -- frame 0 is not privileged). The denoise loop then does
+#     x0 = model_out * (1 - mask) + clean_source * mask
+# on EVERY step. That per-step pull compounds: the model's free contribution
+# decays roughly as (1 - strength)**num_steps, so on the 8-step distilled
+# schedule s=0.2 leaves ~17% and s=0.4 ~2%. Measured sweep at fixed seed
+# (256x256/49f, corr between outputs): s=0.4 vs s=1.0 = 0.984, s=0.6 vs
+# s=1.0 = 0.994, s=0.8 vs s=1.0 = 0.997, while s=0.0 vs any s>=0.2 is ~0.16.
+# So it is a near-step function, not a ramp -- everything from ~0.2 up is the
+# source. Corollary worth knowing: the usable range is a function of STEP
+# COUNT, so it gets narrower still on longer schedules.
+#
+# WHAT UPSTREAM ACTUALLY USES FOR V2V. Per Lightricks' own docs
+# (packages/ltx-pipelines/docs/conditioning.md: "Video Conditioning
+# (ICLoraPipeline only) ... Uses VideoConditionByKeyframeIndex"), real v2v
+# does not touch the canvas at all -- the reference is *appended* to the
+# token sequence as extra clean tokens the transformer attends to
+# (ltx-core's VideoConditionByReferenceLatent), and the dial is
+# `conditioning_attention_strength`, which scales cross-attention scores
+# rather than blending pixels. That is why theirs has a usable mid-range and
+# this does not. It needs an IC-LoRA trained to attend across ref<->target;
+# in diffusers that is LTX2InContextPipeline + LTX2ReferenceCondition (see
+# the LORA_LOADING_ENABLED note below -- the 2.3-22b IC-LoRAs are the ones
+# LTX's own 2.5 ComfyUI workflows load, so they are version-compatible).
+#
+# So: what is here is a source/generation crossfade that happens to be usable
+# near s~0.9-1.0 for small prompt-nudged edits. It is not restyling, and no
+# amount of tuning this number makes it restyling.
 VIDEO_TO_VIDEO_ENABLED = True
 
 # Off by default, for a different reason than video-to-video above: plain

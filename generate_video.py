@@ -456,9 +456,17 @@ def main():
             "direction from img2img denoise strength. 1.0 keeps the source\n"
             "frames untouched (clean, unnoised); 0.0 is fully noised, giving\n"
             "the prompt maximum room to diverge.\n\n"
-            "Measured: the interesting range is roughly 0.0-0.05 (real style\n"
-            "change) before snapping back to 'basically the source' by ~0.07.\n"
-            "See tests/variants.strength_sweep.json for the sweep this came from.")
+            "This is a crossfade toward the source, not a restyle dial, and\n"
+            "it saturates fast: the blend is re-applied every denoising step,\n"
+            "so the model's free contribution decays as (1-strength)^steps.\n"
+            "Measured at a fixed seed: outputs at 0.4 and 1.0 are 98.4%\n"
+            "identical, 0.6 and 1.0 are 99.4%. Anything from ~0.2 up is\n"
+            "effectively just the source.\n\n"
+            "Useful settings are therefore either very low (0.0-0.05, real\n"
+            "change but little of the source survives) or very high\n"
+            "(~0.9-1.0, source dominates and the prompt nudges a small edit).\n"
+            "See VIDEO_TO_VIDEO_ENABLED in ltx_engine.py for the mechanism\n"
+            "and why LTX's own v2v (IC-LoRA) behaves differently.")
 
     def on_mode_switch(*_args):
         mode = mode_var.get()
