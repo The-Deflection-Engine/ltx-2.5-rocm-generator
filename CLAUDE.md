@@ -177,6 +177,24 @@ under WSL2, since WSL2 provides its own Linux-style `/proc` and `/sys`.
 Untested which of the AMD sysfs GPU attributes (`gpu_busy_percent`,
 `mem_info_vram_used`) WSL2 actually populates versus leaves absent.
 
+**IC-LoRAs are indistinguishable from plain LoRAs by inspection.** Same key
+layout, same target modules, same rank -- nothing in the tensors says which is
+which. `looks_like_ic_lora()` is therefore a heuristic and labelled as one:
+`reference_downscale_factor` in the safetensors metadata (reliable when
+present, but an adapter trained at factor 1 may omit it), else an `ic-lora`
+filename. It only ever warns. Do not promote it to a gate.
+
+**The LoRA stack is part of the pipeline cache identity, scales included.**
+Adapters are merged into the resident transformer, so adding, removing,
+reordering *or re-scaling* any of them must force a rebuild -- a scale change
+alters the weights as much as swapping the file. `build_opts` hashes the whole
+ordered list of (path, scale) pairs for that reason.
+
+**The GUI has three separate `✕ Clear` buttons** (positive prompt, negative
+prompt, LoRA stack). Any headless test that finds widgets by label text will
+grab the wrong one -- this produced a convincing false bug report. Scope the
+search to the containing frame instead.
+
 ## Conventions
 
 Measure before claiming. Several confident conclusions this project were wrong
