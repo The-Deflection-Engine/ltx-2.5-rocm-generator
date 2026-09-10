@@ -93,6 +93,8 @@ def resolve(config, args):
         config["loras"] = [{"path": p, "scale": float(scales[i]) if i < len(scales) else 1.0}
                            for i, p in enumerate(args.lora)]
         config["lora_path"], config["lora_scale"] = "", 1.0
+    if args.precision is not None:
+        config["model_precision"] = args.precision
     if args.upscale is not None:
         config["upscale"] = args.upscale
     if args.cfg is not None:
@@ -158,6 +160,11 @@ def summarise(config):
               f"{auto_max:.1f}s) -- tokens below are the worst case")
     else:
         print(f"  length     : {f} frames @ {config['fps']}fps ({f / float(config['fps']):.2f}s)")
+    _mp = gv.resolve_model_path(config)
+    _prec = "bf16" if _mp == gv.BF16_MODEL_PATH else "fp8"
+    _asked = config.get("model_precision", "fp8")
+    print(f"  transformer: {_prec}"
+          f"{'  (bf16 asked for but not on disk)' if _asked == 'bf16' and _prec != 'bf16' else ''}")
     print(f"  seed       : {config['active_seed']}")
     print(f"  tokens     : {tokens:,}{f'  ({passes}x passes = {eff:,} effective)' if eff != tokens else ''}")
     print(f"  est. VRAM  : ~{est:.1f}GB"
@@ -211,6 +218,10 @@ def main():
     ap.add_argument("--lora-scale", action="append", type=float,
                     help="weight for the matching --lora (default 1.0). Repeat to "
                          "give each stacked adapter its own.")
+    ap.add_argument("--precision", choices=("fp8", "bf16"),
+                    help="transformer checkpoint precision (default: config, else fp8). "
+                         "bf16 needs local_ltx25_bf16 on disk and always streams -- "
+                         "measured ~1.9x slower with no visible quality gain.")
     ap.add_argument("--upscale", action=argparse.BooleanOptionalAction,
                     help="2-stage 2x latent upscale + refine")
     ap.add_argument("--cfg", action=argparse.BooleanOptionalAction,

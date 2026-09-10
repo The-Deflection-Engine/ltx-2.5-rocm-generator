@@ -87,7 +87,42 @@ CONFIG_FILE = "ltx2_config.json"
 # not tracked.
 PROMPT_HISTORY_FILE = "prompt_history.json"
 PROMPT_HISTORY_MAX = 50
-MODEL_PATH = os.path.abspath("./local_ltx25_fp8")
+# LTX_MODEL_PATH swaps the checkpoint without editing this file, so an fp8-vs-bf16
+# comparison is a one-line change to the launch rather than a source edit. The
+# default is unchanged. The transformer is the only component the fp8 quantisation
+# touched (see quant_transformer_fp8.py), so an alternative checkpoint only has to
+# supply that; the rest can be symlinked from the fp8 tree.
+MODEL_PATH = os.path.abspath(os.environ.get("LTX_MODEL_PATH", "./local_ltx25_fp8"))
+# The unquantised transformer, when one has been fetched. Only the transformer
+# differs -- every other component is shared (symlinked) with the fp8 tree, since
+# quant_transformer_fp8.py touched nothing else.
+BF16_MODEL_PATH = os.path.abspath("./local_ltx25_bf16")
+
+
+def bf16_checkpoint_available():
+    """Whether a usable unquantised transformer is on disk.
+
+    Checks for the shard index rather than the directory: a half-finished
+    download leaves the directory and the symlinked components in place, and
+    offering the switch then would fail at load time instead of being greyed out.
+    """
+    return os.path.isfile(os.path.join(
+        BF16_MODEL_PATH, "transformer", "diffusion_pytorch_model.safetensors.index.json"))
+
+
+def resolve_model_path(config=None):
+    """Checkpoint directory for this run.
+
+    LTX_MODEL_PATH still wins outright -- it is the escape hatch for pointing at
+    an arbitrary checkpoint. Otherwise `model_precision` in the config selects
+    between the quantised default and the bf16 tree, falling back to fp8 when
+    bf16 was asked for but never downloaded.
+    """
+    if os.environ.get("LTX_MODEL_PATH"):
+        return MODEL_PATH
+    if (config or {}).get("model_precision") == "bf16" and bf16_checkpoint_available():
+        return BF16_MODEL_PATH
+    return MODEL_PATH
 # LTX-2.5 model dir: holds the *correct* latent_upsampler config. Don't be
 # tempted by Lightricks/ltxv-spatial-upscaler-0.9.7 -- that is an LTX-1 / 0.9.x
 # upsampler and is architecturally incompatible with the LTX-2.5 VAE.
@@ -419,6 +454,31 @@ FULL_RESIDENT_VRAM_THRESHOLD_GB = 29.0
 # trying, not the point at which it always works.
 RESIDENT_TRANSFORMER_GB = 18.0
 
+
+def resident_transformer_gb(config=None):
+    """GiB the transformer occupies once resident, read from the checkpoint.
+
+    RESIDENT_TRANSFORMER_GB above was measured against the fp8 checkpoint. With
+    the precision switch a run can now load the unquantised transformer, which
+    is twice the size -- and the resident-vs-offload decision made with the fp8
+    figure picks "resident" for a 35GB model on a 32GB card, then OOMs at the
+    VAE decode with the entire denoise already paid for. That is exactly the
+    failure this function exists to prevent.
+
+    Reading the shard sizes is exact and self-correcting: it is right for either
+    checkpoint, and for any other one someone points LTX_MODEL_PATH at. Falls
+    back to the measured constant if the files cannot be read.
+    """
+    tdir = os.path.join(resolve_model_path(config), "transformer")
+    try:
+        total = sum(os.path.getsize(f)
+                    for f in glob.glob(os.path.join(tdir, "*.safetensors")))
+        if total > 0:
+            return total / (1024 ** 3)
+    except OSError:
+        pass
+    return RESIDENT_TRANSFORMER_GB
+
 # --- Self-calibration ---------------------------------------------------------
 # The constants above are a two-point fit from one RX 9070 XT. Rather than ship
 # more hardcoded numbers for hardware nobody here can test on, every successful
@@ -543,7 +603,8 @@ def vram_model(config=None, vram_total_gb=None):
     if fit:
         return fit[0], fit[1], f"calibrated:{profile}"
     if profile == "resident":
-        return VRAM_BASE_GB + RESIDENT_TRANSFORMER_GB, VRAM_GB_PER_TOKEN, "shipped:resident"
+        return (VRAM_BASE_GB + resident_transformer_gb(config),
+                VRAM_GB_PER_TOKEN, "shipped:resident")
     return VRAM_BASE_GB, VRAM_GB_PER_TOKEN, "shipped"
 
 
@@ -1003,6 +1064,67 @@ def align_frames(n):
     return (max(1, round((n - 1) / 8)) * 8) + 1
 
 
+# safetensors dtype tags -> torch dtypes. Only the ones a transformer checkpoint
+# realistically ships in; anything else falls back to the caller's default.
+_ST_DTYPES = {
+    "F8_E4M3": "float8_e4m3fn",
+    "F8_E4M3FN": "float8_e4m3fn",
+    "F8_E4M3FNUZ": "float8_e4m3fnuz",
+    "BF16": "bfloat16",
+    "F16": "float16",
+    "F32": "float32",
+}
+
+
+def transformer_checkpoint_dtype(model_path, default_name="float8_e4m3fn"):
+    """The dtype the transformer weights are actually STORED in.
+
+    The loader used to pass torch_dtype=float8_e4m3fn unconditionally. That is
+    right for the quantised checkpoint and silently DOWNCASTS an unquantised
+    one -- which would turn an fp8-vs-bf16 comparison into fp8-vs-fp8 while
+    looking like it worked. Read the safetensors header instead: it is the
+    first 8 bytes (little-endian u64 header length) followed by that many bytes
+    of JSON, so this costs one short read and no weight loading.
+
+    Falls back to `default_name` on anything unexpected, so a checkpoint this
+    cannot parse behaves exactly as before.
+    """
+    import struct
+    import collections
+    import torch  # module-level import is deliberately avoided in this file
+    tdir = os.path.join(model_path, "transformer")
+    shards = sorted(glob.glob(os.path.join(tdir, "*.safetensors")))
+    if not shards:
+        return getattr(torch, default_name)
+    seen = collections.Counter()
+    try:
+        for shard in shards:
+            with open(shard, "rb") as fh:
+                (hdr_len,) = struct.unpack("<Q", fh.read(8))
+                header = json.loads(fh.read(hdr_len))
+            for key, meta in header.items():
+                if key == "__metadata__":
+                    continue
+                tag = meta.get("dtype")
+                if tag:
+                    seen[tag] += 1
+    except Exception:
+        return getattr(torch, default_name)
+    if not seen:
+        return getattr(torch, default_name)
+    # A quantised checkpoint is MIXED: quant_transformer_fp8.py converted only
+    # the Linear modules, so norms, embeddings and the scale_shift tables stayed
+    # bf16. Picking the first or even the most common tag would therefore call
+    # the fp8 checkpoint "bf16". Any fp8 tensor at all means fp8 is the dtype to
+    # load at -- that is what preserves the quantisation.
+    for tag in seen:
+        name = _ST_DTYPES.get(tag, "")
+        if name.startswith("float8") and hasattr(torch, name):
+            return getattr(torch, name)
+    name = _ST_DTYPES.get(seen.most_common(1)[0][0])
+    return getattr(torch, name) if name and hasattr(torch, name) else getattr(torch, default_name)
+
+
 def load_prompt_history():
     """Most-recent-first. Missing/corrupt file reads as empty -- history is a
     convenience, not something worth failing a run over."""
@@ -1387,6 +1509,10 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                       status_var=None):
     pipe = None
     upscale_pipe = None
+    # Resolved per run, not at import: the GUI can switch precision between
+    # generations. _MODEL_CACHE already keys on the path, so a switch rebuilds
+    # the pipeline instead of silently reusing the previous precision's.
+    model_path = resolve_model_path(config)
     try:
         print("\n[*] Initializing PyTorch and ROCm backends...")
         script_start_time = time.time()
@@ -1713,7 +1839,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
 
         # --- Stage 1: Prompt embeddings (memory -> disk -> subprocess) ---
         print("\n--- [1/4] Resolving Prompt Embeddings ---")
-        key = _embed_cache_key(MODEL_PATH, config["prompt"], config["negative_prompt"], need_negative)
+        key = _embed_cache_key(model_path, config["prompt"], config["negative_prompt"], need_negative)
         embeds = _EMBED_MEM_CACHE.get(key)
 
         if embeds is not None:
@@ -1727,7 +1853,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             else:
                 run_subprocess_logged(
                     "encode_in_subprocess",
-                    (MODEL_PATH, config["prompt"], config["negative_prompt"], need_negative, cache_path),
+                    (model_path, config["prompt"], config["negative_prompt"], need_negative, cache_path),
                     cancel_error=CancellationError("Cancelled during text encoding."),
                 )
                 if not os.path.exists(cache_path):
@@ -1784,7 +1910,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                       full_resident)
 
         if (_MODEL_CACHE["pipe"] is not None
-                and _MODEL_CACHE["path"] == MODEL_PATH
+                and _MODEL_CACHE["path"] == model_path
                 and _MODEL_CACHE.get("opts") == build_opts):
             pipe = _MODEL_CACHE["pipe"]
             print("--- [2/4] Reusing resident FP8 pipeline (no disk reload) ---")
@@ -1798,10 +1924,17 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 gc.collect()
                 torch.cuda.empty_cache()
             print("--- [2/4] Loading FP8 Transformer & Enabling VRAM Protections ---")
+            # Follow the checkpoint rather than forcing fp8: passing
+            # float8_e4m3fn against an unquantised checkpoint downcasts it on
+            # load, which would quietly convert a bf16 run back into an fp8 one.
+            _ckpt_dtype = transformer_checkpoint_dtype(model_path)
+            if _ckpt_dtype is not torch.float8_e4m3fn:
+                print(f"  -> transformer checkpoint is {str(_ckpt_dtype).replace('torch.','')}, "
+                      "loading at that precision (not fp8)")
             transformer = LTX2VideoTransformer3DModel.from_pretrained(
-                MODEL_PATH,
+                model_path,
                 subfolder="transformer",
-                torch_dtype=torch.float8_e4m3fn,
+                torch_dtype=_ckpt_dtype,
                 local_files_only=True,
             )
             patch_transformer_fp8_params(transformer, target_dtype=torch.bfloat16)
@@ -1811,7 +1944,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 raise CancellationError("Cancelled during model load.")
 
             pipe = LTX2Pipeline.from_pretrained(
-                MODEL_PATH,
+                model_path,
                 transformer=transformer,
                 text_encoder=None,
                 tokenizer=None,
@@ -1940,7 +2073,7 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             if getattr(pipe, "duration_head", None) is not None:
                 pipe.duration_head.to(onload_device)
 
-            _MODEL_CACHE.update({"pipe": pipe, "path": MODEL_PATH, "opts": build_opts})
+            _MODEL_CACHE.update({"pipe": pipe, "path": model_path, "opts": build_opts})
 
         # VAE tiling. The old `tile_sample_min_size` / `tile_latent_min_size`
         # assignments did nothing at all -- AutoencoderKLLTX2Video has no such
@@ -2436,7 +2569,18 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             effective_tokens(config, stage1_w, stage1_h, final_frames),
             torch.cuda.max_memory_reserved() / 1024**3,
             _vram_total_gb,
-            profile="resident" if full_resident else "offload",
+            # A bf16 run's peak is ~17GB of transformer above an fp8 one's, so
+            # it must not be fitted together with the fp8 points that drive the
+            # warning threshold. Suffixing keeps the existing "resident"/
+            # "offload" series -- and the calibration already on disk -- intact;
+            # bf16 simply has no fit yet and falls back to the shipped model,
+            # which now reads the real checkpoint size.
+            profile=(("resident" if full_resident else "offload")
+                     # Not _ckpt_dtype: that is only bound on the rebuild path,
+                     # so a cache hit would raise NameError here. Re-read the
+                     # header instead -- four short reads, once per run.
+                     + ("-bf16" if transformer_checkpoint_dtype(model_path)
+                        is torch.bfloat16 else "")),
         )
         # Guidance mode goes in the name: without it a same-seed A/B (STG on
         # vs off) writes the identical filename and the second run silently

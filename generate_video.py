@@ -178,7 +178,10 @@ def main():
             "image_crf": None,
             # 48 transformer blocks. 4 => 12 offload groups; raise to 6-8 for a bit
             # more speed at the cost of VRAM, drop to 2 if stage 2 OOMs.
-            "blocks_per_group": 4
+            "blocks_per_group": 4,
+            # Which transformer checkpoint to load. bf16 needs local_ltx25_bf16
+            # on disk; resolve_model_path() falls back to fp8 if it is absent.
+            "model_precision": "fp8"
         }
         # Size the starting settings to this GPU, but only when there is no
         # saved config -- the file below is the record of what the user chose,
@@ -1099,6 +1102,44 @@ def main():
     stg_scale_var = tk.StringVar(value=str(config.get("stg_scale", 1.0)))
     ttk.Spinbox(stg_row, from_=0.0, to=3.0, increment=0.25, width=5,
                 textvariable=stg_scale_var, format="%.2f").pack(side=tk.LEFT, padx=(6, 0))
+    # Transformer precision. Only the transformer differs between the two
+    # checkpoints -- everything else is shared -- so this swaps one component,
+    # not the whole pipeline. Greyed out until the bf16 tree is actually on disk.
+    _have_bf16 = eng.bf16_checkpoint_available()
+    precision_var = tk.StringVar(
+        value=config.get("model_precision", "fp8") if _have_bf16 else "fp8")
+    prec_row = ttk.Frame(res_frame)
+    prec_row.pack(pady=(5, 0))
+    ttk.Label(prec_row, text="Transformer:").pack(side=tk.LEFT)
+    rb_fp8 = ttk.Radiobutton(prec_row, text="fp8", variable=precision_var, value="fp8")
+    rb_fp8.pack(side=tk.LEFT, padx=(4, 0))
+    rb_bf16 = ttk.Radiobutton(
+        prec_row, text="bf16" if _have_bf16 else "bf16 (not downloaded)",
+        variable=precision_var, value="bf16")
+    rb_bf16.pack(side=tk.LEFT, padx=(8, 0))
+    if not _have_bf16:
+        rb_bf16.state(["disabled"])
+    _prec_tip = (
+        "Which transformer checkpoint to load. Switching rebuilds the pipeline,\n"
+        "so the next run after a change pays one slow load.\n\n"
+        "fp8  -- 18GB on disk, and the only one that fits GPU-resident on a\n"
+        "        32GB card. The quantisation touched Linear layers only.\n"
+        "bf16 -- 36GB, unquantised. Too big to be resident on one 32GB card, so\n"
+        "        it always streams: measured ~1.9x slower here (48.8s vs 25.5s\n"
+        "        of denoise at 1024x576x49).\n\n"
+        "Measured on this box, 3 matched seeds: NO visible quality advantage to\n"
+        "bf16 -- a sharpness proxy came out marginally higher for fp8. Note the\n"
+        "two cannot be compared frame-by-frame: quantisation shifts the denoise\n"
+        "trajectory, so the same seed gives a different valid sample, not a\n"
+        "degraded one. Judge across seeds, not by diffing.")
+    tooltip(rb_fp8, _prec_tip)
+    tooltip(rb_bf16, _prec_tip if _have_bf16 else
+            "The unquantised transformer is not on disk.\n\n"
+            "Fetch just the transformer (~35GB) -- the other components are\n"
+            "shared with the fp8 tree and do not need downloading again:\n\n"
+            "  hf download Lightricks/LTX-2.5-Diffusers \\\n"
+            "     --include 'transformer/*' --local-dir local_ltx25_bf16\n\n"
+            "then symlink the remaining components from local_ltx25_fp8.")
     tooltip(chk_stg,
             "Spatio-Temporal Guidance. Perturbs one transformer block and\n"
             "steers away from the degraded prediction -- aimed at duplicated\n"
@@ -1516,6 +1557,7 @@ def main():
                 'video_strength': float(video_strength_var.get() or 0.05),
                 'conditioning_attention_strength': float(attn_strength_var.get() or 1.0),
                 'show_log': show_log_var.get(),
+                'model_precision': precision_var.get(),
                 'auto_duration': auto_dur_var.get(),
                 'cfg_mode': cfg_var.get(),
                 'stg_mode': stg_var.get(),
