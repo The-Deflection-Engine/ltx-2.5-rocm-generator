@@ -1578,6 +1578,15 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                       status_var=None):
     pipe = None
     upscale_pipe = None
+    # Terminal state for the progress bar / status line. report() only ever
+    # sets "<phase>...", so without this the bar stopped at the *start* of the
+    # last phase (960/1000, "Encoding video...") and stayed there after the file
+    # was already written -- which reads as a run that never finished, and left
+    # users clicking an already-disabled Cancel. Set in the finally below so it
+    # runs on the success, cancel and error paths alike.
+    # Neutral default: only the success path claims "Done", so an exit that
+    # escapes all three branches (SystemExit, say) can't report a finished run.
+    outcome = ("Idle.", 0)
     # Resolved per run, not at import: the GUI can switch precision between
     # generations. _MODEL_CACHE already keys on the path, so a switch rebuilds
     # the pipeline instead of silently reusing the previous precision's.
@@ -2778,14 +2787,17 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         gen_elapsed = time.time() - generation_start_time
         print(f"Generation pass time: {gen_elapsed:.1f}s ({gen_elapsed/60:.2f}m)")
         print(f"Total time to completion: {total_elapsed:.1f}s ({total_elapsed/60:.2f}m)")
+        outcome = (f"Done -- saved {output_file}", 1000)
 
     except CancellationError as e:
         print(f"\n[!] {str(e)}")
         print("[!] Memory is being cleared. Ready for new input.")
+        outcome = ("Cancelled.", 0)
     except Exception as e:
         print(f"\n[!] AN ERROR OCCURRED:\n{str(e)}")
         import traceback
         traceback.print_exc()
+        outcome = ("Error -- see log.", 0)
     finally:
         # NOTE: `pipe` / the upsampler are deliberately NOT deleted -- they live in
         # _MODEL_CACHE so the next run skips ~18GB of disk reads. Use the
@@ -2806,6 +2818,10 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
 
         root.after(0, btn_generate.config, {"state": "normal"})
         root.after(0, btn_cancel.config, {"state": "disabled"})
+        _msg, _pct = outcome
+        root.after(0, progress_var.set, _pct)
+        if status_var is not None:
+            root.after(0, status_var.set, _msg)
         print("-" * 60)
 
 

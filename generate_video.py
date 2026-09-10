@@ -448,9 +448,15 @@ def main():
     if initial_mode == "video2video" and not VIDEO_TO_VIDEO_ENABLED:
         initial_mode = "text2video"
     mode_var = tk.StringVar(value=initial_mode)
-    image_path_var = tk.StringVar(value=config.get("image_path", ""))
-    end_image_path_var = tk.StringVar(value=config.get("end_image_path", ""))
-    video_path_var = tk.StringVar(value=config.get("video_path", ""))
+    # Input files deliberately start EMPTY rather than restoring from the config
+    # -- same reasoning as the upscale checkbox below. A prompt is a setting you
+    # keep; a conditioning image is a per-run input, and silently re-arming the
+    # previous one meant an Image -> Video run could pick up a file from days ago
+    # that the user had forgotten was selected. The keys stay in the config so
+    # cli_gen_vid and server.py can still be driven from it.
+    image_path_var = tk.StringVar(value="")
+    end_image_path_var = tk.StringVar(value="")
+    video_path_var = tk.StringVar(value="")
 
     mode_row = ttk.Frame(mode_frame)
     mode_row.pack(fill=tk.X)
@@ -764,10 +770,24 @@ def main():
     # 7 rows: an enhanced prompt is ~850 chars, which is about 8 lines at this width.
     text_prompt = tk.Text(main_frame, height=7, wrap=tk.WORD, font=("Arial", 10))
 
-    btn_clear_pp = ttk.Button(pp_header, text="✕ Clear",
-                              command=lambda: text_prompt.delete("1.0", tk.END))
+    def clear_positive_prompt():
+        """Empty the box AND forget the saved prompt.
+
+        The box is repopulated from config['prompt'] at startup, and the config
+        is otherwise only written when a generation runs -- which cannot happen
+        with an empty prompt, since validation rejects it. So clearing without
+        persisting left the old prompt on disk and it reappeared next launch.
+        Clear History already writes through immediately; this matches it.
+        """
+        text_prompt.delete("1.0", tk.END)
+        config["prompt"] = ""
+        save_config(config)
+
+    btn_clear_pp = ttk.Button(pp_header, text="✕ Clear", command=clear_positive_prompt)
     btn_clear_pp.pack(side=tk.RIGHT)
-    tooltip(btn_clear_pp, "Empty the positive prompt box.")
+    tooltip(btn_clear_pp,
+            "Empty the positive prompt box, and forget the saved one so it\n"
+            "does not come back next launch.")
 
     def open_history():
         """Recorded once per Generate click (see record_prompt_history in
@@ -984,10 +1004,17 @@ def main():
                           "distilled schedule is guidance-free and never evaluates\n"
                           "the negative branch.")
 
-    btn_clear_np = ttk.Button(np_header, text="✕ Clear",
-                              command=lambda: text_np.delete("1.0", tk.END))
+    def clear_negative_prompt():
+        """Same persistence problem as the positive box -- see above."""
+        text_np.delete("1.0", tk.END)
+        config["negative_prompt"] = ""
+        save_config(config)
+
+    btn_clear_np = ttk.Button(np_header, text="✕ Clear", command=clear_negative_prompt)
     btn_clear_np.pack(side=tk.RIGHT, padx=(0, 4))
-    tooltip(btn_clear_np, "Empty the negative prompt box.")
+    tooltip(btn_clear_np,
+            "Empty the negative prompt box, and forget the saved one so it\n"
+            "does not come back next launch.")
 
     text_np.pack(fill=tk.X, pady=(4, 12))
     text_np.insert(tk.END, config.get('negative_prompt', ""))
