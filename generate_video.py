@@ -460,11 +460,37 @@ def main():
 
     mode_row = ttk.Frame(mode_frame)
     mode_row.pack(fill=tk.X)
-    ttk.Radiobutton(mode_row, text="Text → Video", variable=mode_var, value="text2video").pack(side=tk.LEFT)
-    ttk.Radiobutton(mode_row, text="Image → Video", variable=mode_var, value="image2video").pack(side=tk.LEFT, padx=(12, 0))
-    ttk.Radiobutton(mode_row, text="First+Last Frame → Video", variable=mode_var, value="flf2v").pack(side=tk.LEFT, padx=(12, 0))
+    # Bound to names so each can carry a tooltip -- these are the first controls
+    # anyone meets, and which inputs a mode needs is not obvious from its label.
+    rb_t2v = ttk.Radiobutton(mode_row, text="Text → Video", variable=mode_var, value="text2video")
+    rb_t2v.pack(side=tk.LEFT)
+    tooltip(rb_t2v,
+            "Generate purely from the prompt. No image or clip needed.\n\n"
+            "The cheapest mode, and the one the prompt wording matters most\n"
+            "for -- nothing else constrains the result.")
+    rb_i2v = ttk.Radiobutton(mode_row, text="Image → Video", variable=mode_var, value="image2video")
+    rb_i2v.pack(side=tk.LEFT, padx=(12, 0))
+    tooltip(rb_i2v,
+            "Animate outward from a single still, which becomes the first\n"
+            "frame. Needs an image below.\n\n"
+            "The prompt describes what should HAPPEN, not what is in the\n"
+            "picture -- the image already supplies the subject.")
+    rb_flf = ttk.Radiobutton(mode_row, text="First+Last Frame → Video", variable=mode_var, value="flf2v")
+    rb_flf.pack(side=tk.LEFT, padx=(12, 0))
+    tooltip(rb_flf,
+            "Interpolate between two stills: the run starts on the first and\n"
+            "lands on the last. Needs both images below.\n\n"
+            "Works with Auto Duration -- the end frame is placed at whatever\n"
+            "length gets generated, not at a fixed frame number.")
     if VIDEO_TO_VIDEO_ENABLED:
-        ttk.Radiobutton(mode_row, text="Video → Video", variable=mode_var, value="video2video").pack(side=tk.LEFT, padx=(12, 0))
+        rb_v2v = ttk.Radiobutton(mode_row, text="Video → Video", variable=mode_var, value="video2video")
+        rb_v2v.pack(side=tk.LEFT, padx=(12, 0))
+        tooltip(rb_v2v,
+                "Re-generate an existing clip, guided by the prompt. Needs a\n"
+                "video below.\n\n"
+                "Strength is a crossfade re-applied every denoise step, not a\n"
+                "restyle dial, so its useful range is narrow and low -- values\n"
+                "much above ~0.1 mostly return the source clip.")
     if LORA_LOADING_ENABLED:
         rb_ic = ttk.Radiobutton(mode_row, text="IC-LoRA Video → Video",
                                 variable=mode_var, value="ic_v2v")
@@ -509,6 +535,11 @@ def main():
             image_path_var.set(path)
 
     btn_browse = ttk.Button(image_row, text="📁 Choose Image...", command=browse_image)
+    tooltip(btn_browse,
+            "Pick the image the video starts from (Image -> Video, and the\n"
+            "first frame of First+Last Frame -> Video).\n\n"
+            "It is resampled to the Resolution set below, so an image with\n"
+            "the same aspect ratio avoids a stretch.")
 
     # Shares image_row with the start-frame controls above (rather than its
     # own row) -- one more full row here is exactly the kind of thing that
@@ -528,6 +559,9 @@ def main():
 
     btn_browse_end = ttk.Button(image_row, text="📁 Choose End Frame...", command=browse_end_image)
     btn_clear_end = ttk.Button(image_row, text="✕", width=2, command=clear_end_image)
+    tooltip(btn_clear_end,
+            "Forget the end frame and go back to a start-frame-only run.\n"
+            "Clears the selection only -- the file on disk is untouched.")
     tooltip(btn_browse_end,
             "Conditions the LAST frame of the video on this image, in\n"
             "addition to the start frame above. Works with Auto Duration --\n"
@@ -546,6 +580,11 @@ def main():
             video_path_var.set(path)
 
     btn_browse_video = ttk.Button(video_row, text="📁 Choose Video...", command=browse_video)
+    tooltip(btn_browse_video,
+            "Pick the source clip for Video -> Video and IC-LoRA Video -> Video.\n\n"
+            "Only the leading frames are used -- as many as the Frames setting\n"
+            "below asks for. How far the result departs from it is set by the\n"
+            "strength dial, not by this button.")
 
     # IC-LoRA's dial. Unlike video_strength below this scales cross-attention
     # between the noisy tokens and the appended reference tokens, so it has a
@@ -739,9 +778,19 @@ def main():
         mode_var.trace_add("write", refresh_lora_note)
         lora_scale_var.trace_add("write", apply_scale)
 
-        ttk.Button(lora_row, text="📁 Add LoRA...", command=add_lora).pack(side=tk.LEFT)
-        ttk.Button(lora_row, text="− Remove", command=remove_lora).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Button(lora_row, text="✕ Clear", command=clear_loras).pack(side=tk.LEFT, padx=(4, 0))
+        _b_add = ttk.Button(lora_row, text="📁 Add LoRA...", command=add_lora)
+        _b_add.pack(side=tk.LEFT)
+        tooltip(_b_add,
+                "Add a .safetensors LoRA to the stack. Several can be stacked;\n"
+                "they all load at the scale set to the right.\n\n"
+                "An IC-LoRA added here still loads, but has nothing to attend\n"
+                "to outside IC-LoRA Video -> Video mode.")
+        _b_rem = ttk.Button(lora_row, text="− Remove", command=remove_lora)
+        _b_rem.pack(side=tk.LEFT, padx=(4, 0))
+        tooltip(_b_rem, "Drop the selected LoRA from the stack. The file is left alone.")
+        _b_clr = ttk.Button(lora_row, text="✕ Clear", command=clear_loras)
+        _b_clr.pack(side=tk.LEFT, padx=(4, 0))
+        tooltip(_b_clr, "Empty the stack and go back to the plain base model.")
         ttk.Label(lora_row, text="scale:").pack(side=tk.LEFT, padx=(12, 0))
         spin_lora_scale = ttk.Spinbox(lora_row, from_=0.0, to=2.0, increment=0.05, width=5,
                                       textvariable=lora_scale_var, format="%.2f")
@@ -835,8 +884,15 @@ def main():
         listbox.bind("<Double-Button-1>", use_selected)
         btn_row = ttk.Frame(win, padding=(8, 0, 8, 8))
         btn_row.pack(fill=tk.X)
-        ttk.Button(btn_row, text="Use Selected", command=use_selected).pack(side=tk.RIGHT)
-        ttk.Button(btn_row, text="Clear History", command=clear_history).pack(side=tk.LEFT)
+        _b_use = ttk.Button(btn_row, text="Use Selected", command=use_selected)
+        _b_use.pack(side=tk.RIGHT)
+        tooltip(_b_use,
+                "Load the highlighted entry back into the prompt boxes,\n"
+                "replacing what is there now (negative prompt included, if the\n"
+                "entry recorded one). Double-clicking the list does the same.")
+        _b_clrh = ttk.Button(btn_row, text="Clear History", command=clear_history)
+        _b_clrh.pack(side=tk.LEFT)
+        tooltip(_b_clrh, "Delete every recorded prompt. Asks first, and cannot be undone.")
 
     btn_history = ttk.Button(pp_header, text="🕘 History", command=open_history)
     btn_history.pack(side=tk.RIGHT, padx=(0, 6))
@@ -1059,6 +1115,14 @@ def main():
     entry_h = ttk.Entry(custom_frame, width=5)
     entry_h.pack(side=tk.LEFT, padx=(2, 0))
     entry_h.insert(0, str(config['height']))
+    _dim_tip = ("Only editable when the preset above is Custom.\n\n"
+                "Both must be multiples of 32 -- the VAE compresses 32:1\n"
+                "spatially, so anything else is rounded to the nearest 32\n"
+                "before the run starts, and the log says so.\n\n"
+                "VRAM scales with width x height x frames, so this is the\n"
+                "cheapest dial to turn if a run warns or runs out.")
+    tooltip(entry_w, _dim_tip)
+    tooltip(entry_h, _dim_tip)
 
     # Always starts OFF, deliberately not restored from the config -- same
     # reasoning as cfg_var below: 2-stage upscale roughly doubles VRAM
@@ -1197,8 +1261,15 @@ def main():
     # it in the config instead would mean a restart -- and a restart drops the
     # resident pipeline, so each attempt would cost an 18GB reload.
     stg_scale_var = tk.StringVar(value=str(config.get("stg_scale", 1.0)))
-    ttk.Spinbox(stg_row, from_=0.0, to=3.0, increment=0.25, width=5,
-                textvariable=stg_scale_var, format="%.2f").pack(side=tk.LEFT, padx=(6, 0))
+    spin_stg = ttk.Spinbox(stg_row, from_=0.0, to=3.0, increment=0.25, width=5,
+                           textvariable=stg_scale_var, format="%.2f")
+    spin_stg.pack(side=tk.LEFT, padx=(6, 0))
+    tooltip(spin_stg,
+            "How hard STG steers away from the perturbed prediction.\n\n"
+            "STG is untested against this model's distilled schedule, so if a\n"
+            "run comes out smeared or over-contrasted, lowering this is the\n"
+            "first thing to try. 0 disables the steering without unticking\n"
+            "the box (the extra pass is still run).")
     # Multi-GPU. Sharding is decided when the transformer is loaded, and which
     # cards are visible is decided before the process starts, so this is a
     # next-launch setting -- said plainly on toggle rather than looking broken.
@@ -1323,7 +1394,13 @@ def main():
     entry_fps = ttk.Entry(fps_sub, width=6)
     entry_fps.pack(side=tk.LEFT, padx=4)
     entry_fps.insert(0, str(config['fps']))
-    
+    tooltip(entry_fps,
+            "Playback rate written into the output file.\n\n"
+            "This is a container setting, not a generation one: it does not\n"
+            "change what the model produces or what the run costs. It decides\n"
+            "how long a given frame count plays for, so changing it rescales\n"
+            "the Seconds field below against the same frames.")
+
     length_type = tk.StringVar(value="frames")
     entry_len = ttk.Entry(time_frame, width=8)
     base_frames = float(config['frames'])
@@ -1359,10 +1436,25 @@ def main():
 
     mode_sub = ttk.Frame(time_frame)
     mode_sub.pack(anchor=tk.W, pady=4)
-    ttk.Radiobutton(mode_sub, text="Frames", variable=length_type, value="frames", command=on_mode_change).pack(side=tk.LEFT)
-    ttk.Radiobutton(mode_sub, text="Seconds", variable=length_type, value="seconds", command=on_mode_change).pack(side=tk.LEFT, padx=(5,0))
+    _rb_fr = ttk.Radiobutton(mode_sub, text="Frames", variable=length_type, value="frames", command=on_mode_change)
+    _rb_fr.pack(side=tk.LEFT)
+    tooltip(_rb_fr,
+            "Enter length as a frame count. Values snap to the 8k+1 rule\n"
+            "(9, 17, 25, ... 241) that the VAE's 8:1 temporal compression needs.")
+    _rb_sec = ttk.Radiobutton(mode_sub, text="Seconds", variable=length_type, value="seconds", command=on_mode_change)
+    _rb_sec.pack(side=tk.LEFT, padx=(5,0))
+    tooltip(_rb_sec,
+            "Enter length in seconds; frames are derived from it and FPS,\n"
+            "then snapped to the 8k+1 rule. Switching unit converts the\n"
+            "current value rather than clearing it.")
     entry_len.pack(anchor=tk.W, padx=2)
     entry_len.insert(0, str(config['frames']))
+    tooltip(entry_len,
+            "How long to generate, in whichever unit the radio buttons above\n"
+            "select. Switching unit converts the value rather than resetting it.\n\n"
+            "Frames snap to the 8k+1 rule (9, 17, 25, ... 241) because the VAE\n"
+            "compresses 8:1 in time; anything else is rounded and the log says\n"
+            "so. Length drives VRAM as directly as resolution does.")
     entry_fps.bind("<KeyRelease>", on_fps_typing)
     entry_len.bind("<KeyRelease>", on_len_typing)
 
@@ -1402,6 +1494,12 @@ def main():
         command=on_auto_toggle,
     )
     chk_auto.pack(anchor=tk.W, pady=(6, 0))
+    tooltip(chk_auto,
+            "Let the model decide when the shot is finished, instead of\n"
+            "generating exactly the length set above.\n\n"
+            "The cap in the label is what this resolution and VRAM budget\n"
+            "allow, so it moves when resolution, FPS, upscale, CFG or STG\n"
+            "change. The output filename records the length actually produced.")
     entry_w.bind("<KeyRelease>", refresh_auto_cap_label, add="+")
     entry_h.bind("<KeyRelease>", refresh_auto_cap_label, add="+")
     entry_fps.bind("<KeyRelease>", refresh_auto_cap_label, add="+")
@@ -1414,6 +1512,11 @@ def main():
     lbl_auto_max = ttk.Label(auto_row, text="max s:")
     entry_auto_max = ttk.Entry(auto_row, width=4)
     entry_auto_max.insert(0, str(config.get("auto_max_seconds", 5.0)))
+    tooltip(entry_auto_max,
+            "Upper bound, in seconds, for an Auto Duration run.\n\n"
+            "Only lowers the limit: the hard cap shown on the checkbox is what\n"
+            "this resolution's VRAM budget allows, and asking for more than\n"
+            "that is clamped back down to it.")
     refresh_auto_cap_label()
     on_auto_toggle()
 
@@ -1803,7 +1906,13 @@ def main():
         root.update_idletasks()
         content_h = main_frame.winfo_reqheight() + telemetry_frame.winfo_reqheight() + 8
         win_h = max(400, min(content_h, usable_h))
-        win_w = max(WIN_W, max(640, root.winfo_reqwidth()))
+        # main_frame lives in a canvas window, so root's requested width is the
+        # canvas's, not the content's -- it never grew past WIN_W, and the widest
+        # row (the five mode radios plus Unload Models) was clipped mid-label.
+        # Ask the frame itself, leave room for the scrollbar, and stay on screen.
+        usable_w = max(640, root.winfo_screenwidth() - 80)
+        content_w = main_frame.winfo_reqwidth() + vscroll.winfo_reqwidth() + 4
+        win_w = max(WIN_W, min(max(640, content_w), usable_w))
         root.minsize(min(win_w, 640), 400)
         # Keep the window centred on its new size rather than growing downward
         # off the bottom of the screen when the log is revealed.
