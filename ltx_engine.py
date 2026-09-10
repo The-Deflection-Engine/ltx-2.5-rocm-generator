@@ -28,10 +28,41 @@ import multiprocessing as mp
 # `expandable_segments` is the modern ROCm/CUDA fix for the fragmentation that
 # `max_split_size_mb` used to paper over; it copes far better with the large,
 # variable-sized tensors that VAE tiling and group-offload produce.
-os.environ.setdefault(
-    "PYTORCH_ALLOC_CONF",
-    "expandable_segments:True,garbage_collection_threshold:0.9",
-)
+def _torch_rocm_tag():
+    """ROCm version this venv's torch was built for, WITHOUT importing torch.
+
+    PYTORCH_ALLOC_CONF has to be set before the caching allocator initialises,
+    which is why this cannot just read torch.version.hip -- that would mean
+    importing torch at engine-import time. The installed wheel's dist-info
+    directory carries the build tag ("torch-2.10.0+rocm7.0.dist-info"), which is
+    all that is needed here and costs one glob.
+    """
+    for d in glob.glob(os.path.join(sys.prefix, "lib", "python*",
+                                    "site-packages", "torch-*.dist-info")):
+        name = os.path.basename(d)
+        if "+rocm" in name:
+            return name.split("+rocm", 1)[1].split(".dist-info")[0]
+    return None
+
+
+_ROCM_TAG = _torch_rocm_tag()
+# `expandable_segments` is the modern fix for the fragmentation that
+# `max_split_size_mb` used to paper over, and it is what the 6.3 stack uses.
+#
+# It is NOT supported on the ROCm 7.x builds for gfx1201: torch warns
+# "expandable_segments not supported on this platform" and then runs without it,
+# so the defence is silently absent. Measured cost: 2.59GB lost to fragmentation
+# and the VAE decode OOMs in resident mode at 1024x576x49 -- while the OOM text
+# helpfully advises the very setting that is being ignored.
+#
+# max_split_size_mb IS supported there and recovers it: the same run goes from
+# OOM to 31.1s end-to-end, resident, output verified identical to the 6.3
+# reference (frame mean 88.73 / std 45.99 vs 88.7 / 45.7).
+if _ROCM_TAG and _ROCM_TAG.startswith("7."):
+    _ALLOC_CONF = "garbage_collection_threshold:0.9,max_split_size_mb:512"
+else:
+    _ALLOC_CONF = "expandable_segments:True,garbage_collection_threshold:0.9"
+os.environ.setdefault("PYTORCH_ALLOC_CONF", _ALLOC_CONF)
 os.environ["MIOPEN_LOG_LEVEL"] = "3"
 # MIOPEN_FIND_MODE is deliberately NOT set. It used to be forced to "1"
 # (NORMAL = exhaustive kernel search), which cost 13.8x on the VAE decode:
@@ -344,6 +375,13 @@ TOKEN_WARN_FALLBACK = 30000   # if VRAM can't be read: the measured 16GB value
 # the desktop baseline sampled at import). Treated as "unknown", not as "tiny
 # card" -- see apply_recommended_defaults.
 TOKEN_WARN_FLOOR = 2000
+
+# How far outside [0,1] a VAE decode may stray before it is treated as corrupt
+# rather than as float fuzz. A healthy decode on this stack sits inside [0,1];
+# a broken one (observed on ROCm 10 / torch 2.13, gfx1201) reached +/-2e36. There
+# is no legitimate middle ground, so the threshold only has to separate "rounding"
+# from "garbage" -- it does not need to be tuned.
+GROSS_DECODE_TOL = 0.5
 
 # Estimated, NOT yet measured on real hardware (no >=24GB card to test
 # against -- see CLAUDE.md "measure before claiming" / "state what is
@@ -2291,6 +2329,81 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         report("VAE decode", 1.0)
         video = output[0]
         audio = output[1] if len(output) > 1 else None
+
+        # Clamp the decode into [0,1] before it reaches the muxer.
+        #
+        # diffusers' encode_video only quantises to uint8 when EVERY value is
+        # inside [0,1]; a single stray value and it logs a warning, passes the
+        # raw float32 through instead, and av rejects it with
+        #   ValueError: Expected numpy array with dtype `uint8` but got `float32`
+        # -- after the whole generation has already been paid for.
+        #
+        # The VAE lands a hair outside the range often enough to matter: not on
+        # rocm6.3/torch-2.10 at any size tried, but on rocm10/torch-2.13 at
+        # 1024x576x49 (though not at 512x320x9). It is a numerical difference
+        # between stacks, not a bug in either, so the write has to be robust to
+        # it rather than depend on which one is installed.
+        #
+        # Clipping is what the uint8 conversion is already assuming: round(v*255)
+        # on an out-of-range value produces a wrapped byte, not a bright pixel.
+        # In-range pixels are untouched, so this changes no output that already
+        # worked.
+        import numpy as _np
+
+        def _clip01(v):
+            """Clip in place where possible; return the (possibly new) object.
+
+            The pipeline hands back a numpy array for output_type="np", but a
+            list of per-batch arrays and a torch tensor are both shapes this has
+            to survive, so dispatch rather than assume.
+            """
+            if isinstance(v, _np.ndarray):
+                if v.dtype.kind != "f":
+                    return v
+                # Non-finite values first. min()/max() propagate NaN and every
+                # comparison against NaN is False, so a plain range check
+                # silently does nothing -- while diffusers' own [0,1] test also
+                # quietly fails and hands av a float32 array. That combination
+                # is what makes this hard to read from the traceback alone.
+                n_bad = int(_np.count_nonzero(~_np.isfinite(v)))
+                if n_bad:
+                    raise RuntimeError(
+                        f"VAE decode produced {n_bad}/{v.size} non-finite values "
+                        f"({100.0 * n_bad / v.size:.4f}%). The decode is corrupt; "
+                        "refusing to write a video from it. This is a numerics "
+                        "failure in the GPU stack, not a muxing problem.")
+                lo, hi = float(v.min()), float(v.max())
+                if lo < -GROSS_DECODE_TOL or hi > 1.0 + GROSS_DECODE_TOL:
+                    raise RuntimeError(
+                        f"VAE decode range [{lo:.4g}, {hi:.4g}] is far outside [0,1]. "
+                        "The decode is corrupt; refusing to write a video from it. "
+                        "This is a numerics failure in the GPU stack, not a muxing "
+                        "problem.")
+                if lo < 0.0 or hi > 1.0:
+                    # Genuine float fuzz at the edges: clip, because that is what
+                    # the uint8 conversion assumes anyway (round(v*255) on an
+                    # out-of-range value wraps to a wrong byte). Without this,
+                    # diffusers skips the uint8 cast entirely and av raises
+                    # "Expected numpy array with dtype `uint8` but got `float32`"
+                    # after the whole generation has already been paid for.
+                    dbg(f"VAE decode marginally outside [0,1] "
+                        f"(min {lo:.6f}, max {hi:.6f}); clipping for mux")
+                    _np.clip(v, 0.0, 1.0, out=v)
+                return v
+            if isinstance(v, (list, tuple)):
+                return type(v)(_clip01(x) for x in v)
+            if torch.is_tensor(v):
+                if not v.is_floating_point():
+                    return v
+                lo, hi = float(v.min()), float(v.max())
+                if lo < 0.0 or hi > 1.0:
+                    dbg(f"VAE decode outside [0,1] (min {lo:.6f}, max {hi:.6f}); clipping for mux")
+                    return v.clamp_(0.0, 1.0)
+                return v
+            return v
+
+        dbg(f"decoded video container type={type(video).__name__}")
+        video = _clip01(video)
 
         # `reserved`, not `allocated`: the caching allocator holds far more than
         # live tensors, and it's the reserved pool that competes for the 16GB.
