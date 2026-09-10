@@ -41,6 +41,53 @@ Measured: 342.5s vs 24.8s for an identical VAE decode — same shape, same tiles
 same 6.63GB peak. The penalty *recurs every run*; exhaustive mode re-searches
 even with MIOpen's perf database populated. Do not re-add it.
 
+**The allocator flags depend on the ROCm build, and the wrong one is silent.**
+`expandable_segments` works on rocm6.3 and is *not supported* on the 7.x builds
+for gfx1201 -- torch warns once and runs without it, so the fragmentation
+defence is simply absent: 2.59GB lost, VAE decode OOMs resident at
+1024x576x49, and the OOM text advises the setting being ignored.
+`max_split_size_mb:512` recovers it (OOM -> 31.1s, output identical to the 6.3
+reference: frame mean 88.73/45.99 vs 88.7/45.7). `_torch_rocm_tag()` reads the
+wheel's `dist-info` name rather than `torch.version.hip`, because
+`PYTORCH_ALLOC_CONF` must be set before the allocator initialises and that
+rules out importing torch at engine-import time. Two venvs exist here:
+`venv` (rocm6.3) and `venv-rocm70`.
+
+**The VAE decode can land outside [0,1], and it surfaces as a muxing error.**
+diffusers only casts to uint8 when every value is in range; one stray value
+and `av` gets float32 and raises -- after the whole generation is paid for.
+Seen on rocm10/torch-2.13 at 1024x576x49, never on rocm6.3. Clip before mux;
+refuse non-finite or grossly-out-of-range output rather than writing it.
+
+**bf16 buys nothing here, measured.** 3 matched seeds against the fp8 tree: no
+visible quality advantage (a sharpness proxy came out marginally *higher* for
+fp8) and ~1.9x slower (48.8s vs 25.5s denoise at 1024x576x49) because 36GB
+cannot stay resident on 32GB. Do not diff the two frame-by-frame --
+quantisation shifts the denoise trajectory, so the same seed is a different
+valid sample, not a degraded one. Also: the loader must read the checkpoint's
+stored dtype, since passing `float8_e4m3fn` at an unquantised checkpoint
+downcasts it and turns the comparison into fp8-vs-fp8 while looking like it
+worked. A quantised checkpoint is *mixed* (Linear only), so any fp8 tensor at
+all means fp8.
+
+**Sharding: accelerate cannot place LTX2's output stage.** Its hooks dispatch
+submodules, but after the blocks the transformer does raw tensor maths on the
+root -- a bare `scale_shift_table` Parameter, `embedded_timestep` from the
+front (card 0), `hidden_states` from the last block (card 1). Balanced
+splitting therefore dies with "Expected all tensors to be on the same device".
+Pin `norm_out`/`proj_out` (and the audio pair) plus the scale-shift tables back
+onto cuda:0, updating each `_hf_hook.execution_device` -- moving weights
+without it sends inputs to the old card. Costs one activation across the bus
+per step. Also needs `_no_split_modules` set: the class ships without one and
+accelerate refuses to shard it.
+
+**`iconphoto` fails silently with a 256px image in the list.** No exception --
+`_NET_WM_ICON` is left present but EMPTY, so the window has *no* icon.
+Measured: [256,128,64,48] -> 26 bytes, [128,64,48] -> 140,752. And
+`iconphoto(True, ...)` only registers a default for *later* toplevels, so both
+calls are needed. `icons/ltx25.desktop`'s `StartupWMClass` must match the
+`className` Tk capitalises from `tk.Tk(className="LTX-2.5")`, i.e. "Ltx-2.5".
+
 **VAE tile defaults (512px / 24 frames) are optimal — measured, not assumed.**
 Bigger tiles are dramatically worse (1024px was 26x slower and peaked at
 15.03GB), smaller are worse too (256px was 4.5x slower). Peak VRAM tracks the

@@ -104,9 +104,10 @@ Nothing here ships weights — you build the environment and the FP8 model once,
    ```bash
    python3 -m venv venv && source venv/bin/activate
    pip install --pre torch torchvision torchaudio \
-       --index-url https://download.pytorch.org/whl/nightly/rocm6.3
+       --index-url https://download.pytorch.org/whl/rocm7.0
    pip install -r requirements.txt
    ```
+   Developed against two stacks: `torch 2.10.0.dev+rocm6.3` (nightly, the original) and `torch 2.10.0+rocm7.0` (current). Either works — the engine reads the installed wheel's build tag at import and picks its allocator flags from it, because `expandable_segments` is silently unsupported on the 7.x builds for gfx1201. See [ROCm 7.x: fragmentation and a VAE decode OOM](#rocm-7x-fragmentation-and-a-vae-decode-oom).
    Check ROCm actually sees the card before going further — if this prints `False`, nothing below will work:
    ```bash
    python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
@@ -136,6 +137,8 @@ python generate_video.py
 ```
 
 This opens the control panel. Fill in:
+
+For a desktop launcher, `icons/ltx25.desktop` is a working entry — edit its `Exec`/`Path` to your checkout, drop it in `~/.local/share/applications/`, and install `icons/ltx25-*.png` into the hicolor theme. Its `StartupWMClass=Ltx-2.5` must match the `className` `generate_video.py` passes to `tk.Tk()` (Tk capitalises it), or the taskbar icon silently reverts to the generic Tk one.
 
 * **Positive / Negative Prompt** — the negative prompt only takes effect with **CFG quality mode** on; the distilled schedule is guidance-free and never evaluates it. The label above the box says which state you're in. Both boxes have **✕ Clear**.
 * **Resolution** — landscape and portrait presets, or *Custom* for any size (snapped to multiples of 32, minimum 256 — the GUI tells you when it adjusts your input). A live readout under the checkbox shows the actual output size and whether the run is single- or 2-stage.
@@ -194,6 +197,8 @@ Going past the maximum recommended row (e.g. full-res 1280x704 direct at 2x, or 
 * `stg_mode` / `stg_scale` (default off / 1.0) — Spatio-Temporal Guidance. The strength has a GUI control beside its checkbox, unlike `cfg_scale`, because it is the setting you actually iterate on and editing the config would mean a restart plus an 18GB reload each try.
 * `modality_scale` (default 1.0 = off) — modality-isolation guidance. `3.0` is upstream's value. Costs one extra pass; changes the audio far more than the picture. See Key Features for the caveat about it being off-recipe on the distilled schedule. (The older key name `cfg_modality_scale` still works.)
 * `conditioning_attention_strength` (default 1.0) — IC-LoRA video-to-video only: how strongly the generated video attends to the reference. `1.0` full adherence, `0.5` balanced, `0.0` ignores it. Has a GUI control beside the reference picker. Unlike the crossfade mode's `video_strength`, the middle of this range is genuinely useful, because it scales attention scores rather than blending pixels.
+* `model_precision` (default `"fp8"`) — which transformer checkpoint to load. `"bf16"` needs `./local_ltx25_bf16` on disk and falls back to fp8 silently if it is absent; the GUI radio is greyed out until it is there. Only the transformer differs between the two trees, so fetch just that (`hf download Lightricks/LTX-2.5-Diffusers --include 'transformer/*' --local-dir local_ltx25_bf16`) and symlink the rest from `local_ltx25_fp8`. **Measured here, 3 matched seeds: no visible quality advantage to bf16**, and it is ~1.9x slower (48.8s vs 25.5s of denoise at 1024x576x49) because 36GB cannot stay resident on a 32GB card. Note the two cannot be compared frame-by-frame — quantisation shifts the denoise trajectory, so the same seed gives a *different valid* sample, not a degraded one. Judge across seeds.
+* `multi_gpu` (default `false`) — shard the transformer's blocks across every visible GPU instead of holding it on one and streaming the rest from system RAM. Two cards roughly double the budget, which is the difference between a resident run and one paying a PCIe round-trip per block per step. **Takes effect on the next launch**: which cards are visible has to be decided before torch initialises HIP. The cost is the spare card — with this off, generation runs on the GPU with no monitors attached and the desktop stays smooth. Sharded runs calibrate under their own profile, since their peak is a sum across cards.
 * `token_warn_threshold` — latent-token count above which the GUI warns before generating. Unset by default, in which case it is computed from your card's reported VRAM and the **calibrated** VRAM model — see *Self-calibrating VRAM model* under Key Features. Until your machine has produced enough real-size runs to fit its own, the shipped one-GPU constants (`VRAM_GB ≈ 7.68 + 1.814e-4 × tokens`, 15% headroom) stand in. Set an explicit number here to override both.
 * `vram_base_gb` / `vram_gb_per_token` — override the VRAM model outright, ahead of both the calibration and the shipped constants. Only needed if the self-calibration is somehow wrong for your setup; the calibration file itself (`vram_calibration.json`) can just be deleted to start over.
 
@@ -249,6 +254,20 @@ This script used to force `MIOPEN_FIND_MODE=1` (NORMAL = exhaustive kernel searc
 Identical shape, tiles and peak VRAM — the same computation, just a different kernel-selection strategy. The penalty **recurs on every run**: exhaustive mode re-searches even once MIOpen's perf database is populated, so it is not a one-off warm-up cost. It is now left unset; export it yourself only if you have a specific reason to force a mode.
 
 On a 2-stage 97-frame run this was roughly six minutes of the ten.
+
+### ROCm 7.x: fragmentation and a VAE decode OOM
+
+`expandable_segments` is the modern fragmentation fix and it is what the rocm6.3 stack uses. It is **not supported on the 7.x builds for gfx1201**: torch warns *"expandable_segments not supported on this platform"* once and then runs without it, so the defence is silently absent. Measured cost: 2.59GB lost to fragmentation, and the VAE decode OOMs in resident mode at 1024x576x49 — while the OOM message helpfully advises the very setting being ignored.
+
+`max_split_size_mb` *is* supported there and recovers it: the same run goes from OOM to 31.1s end to end, resident, with output verified identical to the 6.3 reference (frame mean 88.73 / std 45.99 vs 88.7 / 45.7).
+
+The engine picks between the two at import by reading the installed wheel's build tag out of its `dist-info` directory (not `torch.version.hip` — `PYTORCH_ALLOC_CONF` has to be set before the caching allocator initialises, which rules out importing torch that early). Nothing to configure; this is only here so an unexplained 7.x OOM is recognisable.
+
+### `Expected numpy array with dtype uint8 but got float32`
+
+A muxing error that is really a numerics one. diffusers only quantises the decoded video to uint8 when *every* value lands inside `[0, 1]`; one stray value and it logs a warning, passes raw float32 through, and `av` rejects it — after the whole generation has been paid for.
+
+The VAE lands a hair outside the range often enough to matter on the newer stacks (seen on rocm10/torch-2.13 at 1024x576x49, never on rocm6.3 at any size tried). It is a numerical difference between stacks, not a bug in either. The engine now clips before the mux, which is what the uint8 cast already assumes — in-range pixels are untouched. A decode that is *grossly* out of range or non-finite is refused outright rather than written to a file, since that is a corrupt decode, not float fuzz.
 
 ### Out of Memory (VRAM) Errors
 1. Drop `blocks_per_group` to 2 in `ltx2_config.json`. This takes effect on the next run on its own — the pipeline rebuilds because the setting changed.
