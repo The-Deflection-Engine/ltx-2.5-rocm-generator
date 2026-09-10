@@ -246,11 +246,33 @@ def main():
     lbl_ram = tk.Label(primary_metrics, text="RAM: -- / -- GB", bg="#111111", fg="#ffffff", font=("Consolas", 10, "bold"), width=20)
     lbl_ram.pack(side=tk.LEFT, expand=True)
     
+    # These two track the primary card only. With a second GPU present the
+    # per-GPU strip below lists every card including that one, so packing both
+    # showed the primary card twice -- "GPU: 0% / VRAM: 0.1/31.9" on this row and
+    # "GPU0: 0% 0.1/31.9" on the next. Build them either way (update_telemetry
+    # writes to them unconditionally) but only show them when they are not a
+    # duplicate, i.e. on a single-GPU box.
+    _all_gpus = hw_monitor.get_all_gpu_stats()
+    _multi_gpu_strip = len(_all_gpus) > 1
+
     lbl_gpu = tk.Label(primary_metrics, text="GPU: --%", bg="#111111", fg="#00ffcc", font=("Consolas", 10, "bold"), width=12)
-    lbl_gpu.pack(side=tk.LEFT, expand=True)
-    
     lbl_vram = tk.Label(primary_metrics, text="VRAM: -- / -- GB", bg="#111111", fg="#00ffcc", font=("Consolas", 10, "bold"), width=22, anchor=tk.E)
-    lbl_vram.pack(side=tk.RIGHT)
+    if not _multi_gpu_strip:
+        lbl_gpu.pack(side=tk.LEFT, expand=True)
+        lbl_vram.pack(side=tk.RIGHT)
+
+    # Per-GPU strip. One row per card, so a second card is visible instead of
+    # being silently dropped by the "biggest card wins" pick above. It replaces
+    # the primary GPU:/VRAM: pair rather than sitting alongside it -- see above.
+    gpu_rows = []
+    if _multi_gpu_strip:
+        gpu_box = tk.Frame(telemetry_frame, bg="#111111")
+        gpu_box.pack(fill=tk.X, pady=(4, 0))
+        for _g in _all_gpus:
+            lab = tk.Label(gpu_box, bg="#111111", fg="#00ffcc",
+                           font=("Consolas", 9, "bold"), anchor=tk.W)
+            lab.pack(side=tk.LEFT, expand=True, fill=tk.X)
+            gpu_rows.append((_g["card"], lab))
 
     cores_box = tk.Frame(telemetry_frame, bg="#222222", padx=6, pady=5, relief=tk.SUNKEN, bd=1)
     cores_box.pack(fill=tk.X, pady=(6, 0))
@@ -305,7 +327,21 @@ def main():
             vram_pct = (vram_used / vram_total * 100) if vram_total else 0
             lbl_vram.config(text=f"VRAM: {vram_used:.1f}/{vram_total:.1f} GB",
                             fg=load_colour(vram_pct, "#00ffcc"))
-            
+
+        if gpu_rows:
+            stats = {g["card"]: g for g in hw_monitor.get_all_gpu_stats()}
+            for card_idx, lab in gpu_rows:
+                g = stats.get(card_idx)
+                if not g or g["usage"] is None:
+                    lab.config(text=f"GPU{card_idx}: N/A", fg="#00ffcc")
+                    continue
+                tag = " [display]" if g["display"] else ""
+                lab.config(
+                    text=f"GPU{card_idx}{tag}: {g['usage']:3d}%  "
+                         f"{g['used_gb']:.1f}/{g['total_gb']:.1f} GB",
+                    fg=load_colour(g["usage"], "#00ffcc"))
+
+
         if cores:
             if not core_labels:
                 # pack() and grid() can't share a parent, so the placeholder goes
@@ -1102,6 +1138,34 @@ def main():
     stg_scale_var = tk.StringVar(value=str(config.get("stg_scale", 1.0)))
     ttk.Spinbox(stg_row, from_=0.0, to=3.0, increment=0.25, width=5,
                 textvariable=stg_scale_var, format="%.2f").pack(side=tk.LEFT, padx=(6, 0))
+    # Multi-GPU. Sharding is decided when the transformer is loaded, and which
+    # cards are visible is decided before the process starts, so this is a
+    # next-launch setting -- said plainly on toggle rather than looking broken.
+    multi_gpu_var = tk.BooleanVar(value=bool(config.get("multi_gpu", False)))
+    _gpu_total = len(getattr(hw_monitor, "gpus", []))
+
+    def on_multi_gpu_toggle():
+        if multi_gpu_var.get():
+            messagebox.showinfo(
+                "Use both GPUs",
+                "Saved. It takes effect the next time you start the app.\n\n"
+                "The transformer's blocks are split across both cards, so a big "
+                "run can stay resident instead of streaming from system RAM.\n\n"
+                "The trade-off: the second card is the one currently keeping "
+                "your desktop responsive. Sharing it means the mouse and "
+                "keyboard may stutter while a generation runs.")
+
+    chk_multi_gpu = ttk.Checkbutton(
+        res_frame,
+        text=f"Use both GPUs (shard transformer across {_gpu_total} cards)"
+             if _gpu_total > 1 else "Use both GPUs (needs a second GPU)",
+        variable=multi_gpu_var,
+        command=on_multi_gpu_toggle,
+    )
+    chk_multi_gpu.pack(pady=(5, 0))
+    if _gpu_total < 2:
+        chk_multi_gpu.state(["disabled"])
+
     # Transformer precision. Only the transformer differs between the two
     # checkpoints -- everything else is shared -- so this swaps one component,
     # not the whole pipeline. Greyed out until the bf16 tree is actually on disk.
@@ -1140,6 +1204,18 @@ def main():
             "  hf download Lightricks/LTX-2.5-Diffusers \\\n"
             "     --include 'transformer/*' --local-dir local_ltx25_bf16\n\n"
             "then symlink the remaining components from local_ltx25_fp8.")
+    tooltip(chk_multi_gpu,
+            "Split the transformer's blocks across every GPU instead of\n"
+            "holding it on one and streaming the rest from system RAM.\n\n"
+            "Two cards roughly double the budget, which is the difference\n"
+            "between a resident run and one paying a PCIe round-trip per\n"
+            "block per step -- the usual reason a long run crawls.\n\n"
+            "Takes effect on the NEXT launch: which cards are visible is\n"
+            "fixed before the app starts.\n\n"
+            "Costs you the spare card. With this off, generation runs on the\n"
+            "GPU with no monitors attached and the desktop stays smooth; with\n"
+            "it on, both are busy and input can stutter.")
+
     tooltip(chk_stg,
             "Spatio-Temporal Guidance. Perturbs one transformer block and\n"
             "steers away from the degraded prediction -- aimed at duplicated\n"
@@ -1557,6 +1633,7 @@ def main():
                 'video_strength': float(video_strength_var.get() or 0.05),
                 'conditioning_attention_strength': float(attn_strength_var.get() or 1.0),
                 'show_log': show_log_var.get(),
+                'multi_gpu': multi_gpu_var.get(),
                 'model_precision': precision_var.get(),
                 'auto_duration': auto_dur_var.get(),
                 'cfg_mode': cfg_var.get(),

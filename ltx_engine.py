@@ -76,7 +76,15 @@ os.environ["AMD_DIRECT_DISPATCH"] = "1"
 os.environ["HIP_FORCE_DEV_KERN_LAZY_COMPILE"] = "0"
 os.environ["TORCH_ROCM_AOTXN_ENABLE"] = "1"
 os.environ["AMD_SERIALIZE_KERNEL"] = "0"
-os.environ["HIP_VISIBLE_DEVICES"] = "0"
+# One GPU by default: the single-card assumption runs through the whole engine
+# (torch.device("cuda") with no index, group offload's onload_device), and
+# pinning it here means a second card can never be picked up by accident.
+# LTX_MULTI_GPU=1 opts out, because sharding the transformer needs to SEE both
+# cards -- runmefirst exports it when "Use both GPUs" is saved. Must be decided
+# before torch initialises HIP, which is why it lives at import time and not in
+# generation_worker.
+if os.environ.get("LTX_MULTI_GPU") != "1":
+    os.environ["HIP_VISIBLE_DEVICES"] = "0"
 # 16 threads: let the CPU-side maths (text encode, pinning,
 # numpy postprocess, ffmpeg staging) actually use the box.
 os.environ.setdefault("OMP_NUM_THREADS", "16")
@@ -417,6 +425,13 @@ TOKEN_WARN_FLOOR = 2000
 # is no legitimate middle ground, so the threshold only has to separate "rounding"
 # from "garbage" -- it does not need to be tuned.
 GROSS_DECODE_TOL = 0.5
+# Above this, a "desktop baseline" reading is not a desktop. sysfs VRAM is
+# system-wide, so a previous run still unwinding, a second copy of this app, or
+# any other GPU program lands in the sample taken at import. Charging that to
+# this run drives the threshold to TOKEN_WARN_FLOOR and warns on every
+# resolution, which is what "unknown" used to look like. A real compositor with
+# several monitors sits well under this even on a 4K desktop.
+DESKTOP_BASELINE_SANE_MAX_GB = 4.0
 
 # Estimated, NOT yet measured on real hardware (no >=24GB card to test
 # against -- see CLAUDE.md "measure before claiming" / "state what is
@@ -907,6 +922,12 @@ class LinuxHardwareMonitor:
         self.last_cpu_total = None
         self.last_cpu_cores = {}
         
+        # Every AMD card, not just the biggest: a two-card box wants both on the
+        # telemetry strip. self.gpus preserves discovery order (card0, card1...);
+        # sysfs_gpu_path stays the largest card, because the VRAM model and
+        # token_warn_threshold() are single-card notions and must not change
+        # meaning just because a second card appeared.
+        self.gpus = []
         max_vram = 0
         for i in range(10):
             path = f"/sys/class/drm/card{i}/device"
@@ -915,6 +936,16 @@ class LinuxHardwareMonitor:
                 try:
                     with open(vram_path, "r") as f:
                         vram = int(f.read().strip())
+                    # A card with displays attached is the one whose stalls the
+                    # user feels as input lag, so the strip labels it.
+                    has_display = any(
+                        os.path.exists(f"/sys/class/drm/card{i}-{c}/status")
+                        and open(f"/sys/class/drm/card{i}-{c}/status").read().strip() == "connected"
+                        for c in ("DP-1", "DP-2", "DP-3", "HDMI-A-1", "HDMI-A-2", "eDP-1")
+                    )
+                    self.gpus.append({"card": i, "path": path,
+                                      "total_gb": vram / (1024 ** 3),
+                                      "display": has_display})
                     if vram > max_vram:
                         max_vram = vram
                         self.sysfs_gpu_path = path
@@ -924,8 +955,24 @@ class LinuxHardwareMonitor:
         # Sampled here, before any model is ever loaded, so it's whatever the
         # desktop itself holds -- compositor, open windows, monitor count --
         # not the pipeline's own footprint. See token_warn_threshold().
+        #
+        # Two corrections, both of which used to end in a threshold pinned to
+        # TOKEN_WARN_FLOOR and a warning on every resolution:
+        #   - No displays on the card the run will use (ROCR_VISIBLE_DEVICES
+        #     pinning compute to the spare card) means the compositor is not on
+        #     it, so there is nothing to charge against the budget.
+        #   - A reading too big to be a desktop is another workload, not this
+        #     one's overhead. Treat it as unknown and use the fit machine's
+        #     value, so the estimate degrades to the shipped model instead of
+        #     collapsing.
         _, desktop_used, _ = self.get_gpu_stats()
-        self.desktop_baseline_gb = desktop_used or 0.0
+        primary = next((g for g in self.gpus if g["path"] == self.sysfs_gpu_path), None)
+        if primary is not None and not primary["display"]:
+            self.desktop_baseline_gb = 0.0
+        elif desktop_used is None or desktop_used > DESKTOP_BASELINE_SANE_MAX_GB:
+            self.desktop_baseline_gb = FIT_DESKTOP_BASELINE_GB
+        else:
+            self.desktop_baseline_gb = desktop_used
 
     def get_cpu_stats(self):
         try:
@@ -984,6 +1031,28 @@ class LinuxHardwareMonitor:
             return gpu_usage, vram_used, vram_total
         except Exception:
             return None, None, None
+
+    def get_all_gpu_stats(self):
+        """Live stats for every discovered card, in card order.
+
+        A card that disappears mid-session (or whose sysfs read races an
+        unbind) is reported with None values rather than dropped, so the
+        telemetry strip keeps a stable number of columns instead of
+        reshuffling under the cursor.
+        """
+        out = []
+        for g in self.gpus:
+            entry = {"card": g["card"], "display": g["display"],
+                     "usage": None, "used_gb": None, "total_gb": g["total_gb"]}
+            try:
+                with open(os.path.join(g["path"], "gpu_busy_percent")) as f:
+                    entry["usage"] = int(f.read().strip())
+                with open(os.path.join(g["path"], "mem_info_vram_used")) as f:
+                    entry["used_gb"] = int(f.read().strip()) / (1024 ** 3)
+            except Exception:
+                pass
+            out.append(entry)
+        return out
 
 hw_monitor = LinuxHardwareMonitor()
 
@@ -1879,6 +1948,19 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         onload_device = torch.device("cuda")
         offload_device = torch.device("cpu")
 
+        # Shard the transformer's blocks across every visible GPU instead of
+        # holding it on one and streaming the overflow from host RAM. Two cards
+        # give roughly twice the budget, which is the difference between a run
+        # that is resident and one that pays a PCIe round-trip per block, per
+        # step. Only meaningful with more than one GPU actually visible --
+        # runmefirst hides the second one unless this is switched on, because
+        # the spare card is what keeps the desktop responsive.
+        use_multi_gpu = bool(config.get("multi_gpu")) and torch.cuda.device_count() > 1
+        if config.get("multi_gpu") and torch.cuda.device_count() < 2:
+            print("  [!] 'Use both GPUs' is on but only one GPU is visible -- "
+                  "running single-GPU. Relaunch so both cards are visible "
+                  "(runmefirst does this automatically when the option is saved).")
+
         # `blocks_per_group` and `attention_backend` are baked into the pipeline at
         # build time, so a reused pipe would silently ignore edits to them. Make
         # them part of the cache identity -- changing either rebuilds by itself.
@@ -1907,7 +1989,12 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                       # Offload regime: the transformer is either .to(cuda)'d or
                       # wrapped in group-offload hooks at build time, and neither
                       # is undone by reuse.
-                      full_resident)
+                      full_resident,
+                      # Sharding is decided at load time and cannot be applied
+                      # or undone on a built pipeline, so it joins the identity
+                      # too -- otherwise toggling it would silently reuse the
+                      # previous arrangement.
+                      use_multi_gpu)
 
         if (_MODEL_CACHE["pipe"] is not None
                 and _MODEL_CACHE["path"] == model_path
@@ -1924,6 +2011,17 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 gc.collect()
                 torch.cuda.empty_cache()
             print("--- [2/4] Loading FP8 Transformer & Enabling VRAM Protections ---")
+            _load_kwargs = {}
+            if use_multi_gpu:
+                # accelerate refuses to shard a class that hasn't declared what
+                # its atomic unit is; LTX2's transformer ships without one. A
+                # block is the right granularity -- residuals stay on one card,
+                # and only the block boundaries cross the bus.
+                if not getattr(LTX2VideoTransformer3DModel, "_no_split_modules", None):
+                    LTX2VideoTransformer3DModel._no_split_modules = ["LTX2VideoTransformerBlock"]
+                _load_kwargs["device_map"] = "balanced"
+                print(f"  -> Sharding transformer across {torch.cuda.device_count()} GPUs "
+                      "(device_map=balanced).")
             # Follow the checkpoint rather than forcing fp8: passing
             # float8_e4m3fn against an unquantised checkpoint downcasts it on
             # load, which would quietly convert a bf16 run back into an fp8 one.
@@ -1936,9 +2034,49 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
                 subfolder="transformer",
                 torch_dtype=_ckpt_dtype,
                 local_files_only=True,
+                **_load_kwargs,
             )
             patch_transformer_fp8_params(transformer, target_dtype=torch.bfloat16)
             dbg("transformer loaded + fp8 params patched")
+
+            if use_multi_gpu:
+                # accelerate dispatches SUBMODULES, and inserts hooks that move a
+                # submodule's inputs to its card. LTX2's output stage is not made
+                # of submodule calls: after the blocks it does raw tensor maths on
+                # the root module --
+                #     scale_shift_values = self.scale_shift_table + embedded_timestep
+                #     hidden_states = hidden_states * (1 + scale) + shift
+                # -- mixing three things no hook aligns: a bare nn.Parameter on the
+                # root (accelerate warns these "do not match any submodules"),
+                # `embedded_timestep` from time_embed at the FRONT (card 0), and
+                # `hidden_states` from the LAST block (card 1). Balanced splitting
+                # puts the head on 0 and the tail on 1, so it dies with "Expected
+                # all tensors to be on the same device".
+                #
+                # Pin the tail back onto the head's card and the whole expression
+                # is on one device again. The only cost is hidden_states crossing
+                # the bus once per step -- one activation, against the ~9GB of
+                # weights the split is buying room for.
+                _head_dev = torch.device("cuda:0")
+                for _tail in ("norm_out", "proj_out", "audio_norm_out", "audio_proj_out"):
+                    _mod = getattr(transformer, _tail, None)
+                    if _mod is None:
+                        continue
+                    _mod.to(_head_dev)
+                    # The hook caches where to stage inputs; moving the weights
+                    # without updating it would send them to the old card.
+                    _hook = getattr(_mod, "_hf_hook", None)
+                    if _hook is not None and getattr(_hook, "execution_device", None) is not None:
+                        _hook.execution_device = _head_dev
+                    if isinstance(getattr(transformer, "hf_device_map", None), dict):
+                        for _k in list(transformer.hf_device_map):
+                            if _k == _tail or _k.startswith(_tail + "."):
+                                transformer.hf_device_map[_k] = 0
+                for _param_name in ("scale_shift_table", "audio_scale_shift_table"):
+                    _prm = getattr(transformer, _param_name, None)
+                    if _prm is not None and _prm.device != _head_dev:
+                        _prm.data = _prm.data.to(_head_dev)
+                dbg(f"multi-GPU: output stage pinned to {_head_dev}")
 
             if cancel_flag:
                 raise CancellationError("Cancelled during model load.")
@@ -2016,7 +2154,14 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
             # Big enough card *and* a run that fits in it: skip offload/streaming
             # entirely and keep the transformer GPU-resident. Decided above, in
             # resident_profile_fits(), because it is part of the cache identity.
-            if full_resident:
+            if use_multi_gpu:
+                # accelerate's dispatch hooks already own placement: every block
+                # sits on its assigned card and inputs are moved in for it. A
+                # .to() here would drag the whole model onto one GPU and undo
+                # the split; group offload would fight the same hooks.
+                print("  -> Transformer is sharded across GPUs; skipping both "
+                      "the resident .to() and group offload.")
+            elif full_resident:
                 print(f"  -> {vram_total_gb:.0f}GB VRAM and this run fits; "
                       "keeping transformer GPU-resident, no offload streaming.")
                 pipe.transformer.to(onload_device)
@@ -2565,17 +2710,26 @@ def generation_worker(config, root, progress_var, progress_bar, btn_generate, bt
         # which is deliberate: a cancelled or OOMed run's peak describes where
         # it stopped, not what the settings cost.
         _, _, _vram_total_gb = hw_monitor.get_gpu_stats()
+        # max_memory_reserved() is per-device and defaults to the current one, so
+        # a sharded run would report only the first card's share. Sum them.
+        _peak_gb = (sum(torch.cuda.max_memory_reserved(i)
+                        for i in range(torch.cuda.device_count())) / 1024**3
+                    if use_multi_gpu else torch.cuda.max_memory_reserved() / 1024**3)
         record_vram_observation(
             effective_tokens(config, stage1_w, stage1_h, final_frames),
-            torch.cuda.max_memory_reserved() / 1024**3,
+            _peak_gb,
             _vram_total_gb,
+            # A third label on purpose: a sharded peak is a sum across cards and
+            # describes a different regime, so it must not be fitted together
+            # with the single-card points that drive the warning threshold.
             # A bf16 run's peak is ~17GB of transformer above an fp8 one's, so
             # it must not be fitted together with the fp8 points that drive the
             # warning threshold. Suffixing keeps the existing "resident"/
             # "offload" series -- and the calibration already on disk -- intact;
             # bf16 simply has no fit yet and falls back to the shipped model,
             # which now reads the real checkpoint size.
-            profile=(("resident" if full_resident else "offload")
+            profile=(("sharded" if use_multi_gpu
+                      else ("resident" if full_resident else "offload"))
                      # Not _ckpt_dtype: that is only bound on the rebuild path,
                      # so a cache hit would raise NameError here. Re-read the
                      # header instead -- four short reads, once per run.
