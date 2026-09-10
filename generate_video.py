@@ -208,8 +208,42 @@ def main():
 
     config = load_saved_config()
     
-    root = tk.Tk()
+    # className sets WM_CLASS, which is how a desktop matches a window to its
+    # .desktop file and therefore to its taskbar icon. Left at the default this
+    # is the literal string "Tk" -- generic, and shared with every other Tk app
+    # on the system. Tk capitalises what it is given, so the resulting class is
+    # "Ltx-2.5"; that exact string is what icons/ltx25.desktop has to name in
+    # StartupWMClass, so change the two together or the icon silently reverts.
+    root = tk.Tk(className="LTX-2.5")
     root.title(f"🎬 LTX-2.5 Control Panel v{eng.__version__}")
+
+    # Window icon. realpath, not abspath: generate_video.py is symlinked into
+    # live-ver, and abspath would look for icons/ next to the symlink rather
+    # than next to the real file. Held on `root` because Tk keeps only a weak
+    # reference to PhotoImages -- let them be collected and the icon vanishes.
+    try:
+        _icon_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "icons")
+        root._app_icons = [
+            tk.PhotoImage(file=os.path.join(_icon_dir, f"ltx25-{s}.png"))
+            # 256 is deliberately NOT in this list. Including it makes
+            # iconphoto fail SILENTLY -- no exception, but _NET_WM_ICON is left
+            # present and empty, so the window ends up with no icon at all.
+            # Measured: [256,128,64,48] -> 26 bytes (empty); [128,64,48] ->
+            # 140,752 bytes. 128 is ample for a taskbar; the 256 file is kept
+            # for the .desktop/hicolor theme, which reads it from disk instead.
+            for s in (128, 64, 48, 32)
+            if os.path.exists(os.path.join(_icon_dir, f"ltx25-{s}.png"))
+        ]
+        if root._app_icons:
+            # Both calls, deliberately. iconphoto(True, ...) only registers the
+            # default for toplevels created LATER -- on this Tk it leaves the
+            # existing root window's _NET_WM_ICON present but EMPTY, so the
+            # window ends up with no icon at all. The False call is what sets it
+            # on this window; the True call covers dialogs opened afterwards.
+            root.iconphoto(False, *root._app_icons)
+            root.iconphoto(True, *root._app_icons)
+    except Exception as exc:
+        print(f"[!] could not set window icon: {exc}")
     # Opening size: 1080 tall pays for the 7-row prompt box (Arial-10 is 16px
     # per row). Resizable both ways; spare height goes to the log pane, the only
     # widget packed with expand=True, and spare width to everything on fill=X.

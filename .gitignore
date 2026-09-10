@@ -19,6 +19,10 @@
 !tests/
 tests/__pycache__/
 
+# App icon, its .desktop entry, and the script that renders the sizes from
+# the source PNG. generate_video.py reads icons/ next to itself at startup.
+!icons/
+
 # Prompt + screenshot + video examples, same reasoning as tests/ above.
 !Examples/
 !Prompting Guide/

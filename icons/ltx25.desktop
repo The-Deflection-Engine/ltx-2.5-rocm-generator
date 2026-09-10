@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=LTX-2.5 Control Panel
+GenericName=Video Generator
+Comment=Local LTX-2.5 video generation on AMD ROCm
+Exec=/home/euan/LTX-2.5/live-ver/runmefirst
+Path=/home/euan/LTX-2.5/live-ver
+Icon=ltx25
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=video;generation;diffusion;LTX;ROCm;
+# Must match the WM_CLASS Tk derives from className in generate_video.py.
+# Tk capitalises what it is given, so className="LTX-2.5" becomes "Ltx-2.5".
+StartupWMClass=Ltx-2.5
