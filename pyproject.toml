@@ -1,3 +1,10 @@
+# NOTE: this file configures the vendored Lightricks LTX-2 trainer under
+# packages/ (a uv workspace, CUDA-pinned), which this repo inherited from
+# upstream and keeps as reference source. It is NOT the install path for the
+# ROCm app in this repo's root -- that is requirements.txt plus a ROCm torch
+# wheel; see "First-time setup" in README.md. `uv sync` / `pip install .` here
+# will pull a CUDA stack and will not give you a working app.
+
 [tool.uv.sources]
 ltx-core = { workspace = true }
 ltx-pipelines = { workspace = true }

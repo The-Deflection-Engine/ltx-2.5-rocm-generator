@@ -1,16 +1,21 @@
-# Known-good versions for the RX 9070 XT (gfx1201) / ROCm 6.3 setup this repo
-# was built on. Python 3.12.
+# Python 3.12, gfx1201 (RX 9070 XT / R9700). THIS is the install path for the
+# app -- the pyproject.toml at the repo root belongs to the vendored Lightricks
+# trainer under packages/ and pins a CUDA stack; do not `pip install .` or
+# `uv sync` for this app.
 #
 # torch/torchvision/torchaudio are NOT installed from here -- they come from
-# AMD's ROCm nightly index. See "Environment setup" in the README:
+# AMD's ROCm index, and which one depends on your ROCm version. See "First-time
+# setup" in the README:
 #
 #   pip install --pre torch torchvision torchaudio \
-#       --index-url https://download.pytorch.org/whl/nightly/rocm6.3
+#       --index-url https://download.pytorch.org/whl/rocm7.0
 #
-# Pinned for reference; these were the working versions:
-#   torch        2.10.0.dev20250926+rocm6.3
-#   torchvision  0.25.0.dev20250929+rocm6.3
-#   torchaudio   2.8.0.dev20250929+rocm6.3
+# Both stacks below have been run end to end; the engine reads the installed
+# wheel's build tag and picks its allocator flags to match, so either is fine:
+#   torch 2.10.0+rocm7.0                    (current)
+#   torch 2.10.0.dev20250926+rocm6.3        (original; nightly/rocm6.3 index)
+#   torchvision 0.25.0.dev20250929+rocm6.3
+#   torchaudio  2.8.0.dev20250929+rocm6.3
 
 # LTX-2.5 support landed after 0.35, so a release wheel will not work.
 diffusers @ git+https://github.com/huggingface/diffusers.git@9284607295a09f759aadd65ed08f48b35feea6d9

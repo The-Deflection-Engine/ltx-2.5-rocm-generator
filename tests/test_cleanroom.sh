@@ -15,7 +15,7 @@ set -uo pipefail
 # Repo root is one level up now that this lives in tests/.
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="${1:-/tmp/ltx-cleanroom}"
-ROCM_INDEX="https://download.pytorch.org/whl/nightly/rocm6.3"
+ROCM_INDEX="${ROCM_INDEX:-https://download.pytorch.org/whl/rocm7.0}"
 
 pass=0; fail=0
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
@@ -62,9 +62,15 @@ else
 fi
 
 step "Weights: symlinked (README steps 1-3 not exercised)"
-for d in local_ltx25_fp8 local_ltx25_model local_ltx25_enhancer; do
+# Only the fp8 tree is required to generate. local_ltx25_model carries the
+# latent upsampler for the 2-stage path, and the enhancer is optional -- note
+# them as absent rather than failing the run, since a clone that can generate
+# is what this test is about.
+if [ -e "$SRC/local_ltx25_fp8" ]; then ln -sfn "$SRC/local_ltx25_fp8" local_ltx25_fp8; ok "linked local_ltx25_fp8"
+else bad "$SRC/local_ltx25_fp8 not present to link"; fi
+for d in local_ltx25_model local_ltx25_enhancer local_ltx25_bf16; do
     if [ -e "$SRC/$d" ]; then ln -sfn "$SRC/$d" "$d"; ok "linked $d"
-    else bad "$SRC/$d not present to link"; fi
+    else printf '   \033[33mSKIP\033[0m %s not present (optional)\n' "$d"; fi
 done
 
 step "Imports resolve in the clean environment"

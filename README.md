@@ -17,7 +17,7 @@ Anyway, hope this is useful for at least one person. And any bugs are entirely C
 
 ## What is this?!
 
-A GUI control panel and a headless CLI for running the **LTX-2.5 video diffusion model** on a single AMD consumer GPU via ROCm — developed on an RX 9070 XT (16GB VRAM) with 128GB system RAM (originally 32GB, but kept running out by about 2GB!), but the RAM figure is not a requirement — more than 32GB is what matters, and 32GB itself works for smaller generations.
+A GUI control panel and a headless CLI for running the **LTX-2.5 video diffusion model** on AMD GPUs via ROCm — developed on an RX 9070 XT (16GB VRAM), and since on a pair of Radeon AI PRO R9700s (32GB each, optionally sharded), with 128GB system RAM (originally 32GB, but kept running out by about 2GB!), but the RAM figure is not a requirement — more than 32GB is what matters, and 32GB itself works for smaller generations.
 
 It keeps the FP8 model resident in memory between generations, runs the distilled guidance-free schedule correctly, tiles the VAE decode to avoid AMDGPU driver timeouts, and supports a working two-stage generate-then-upscale pipeline. Is FP8 the correct format? Yet to be seen, but it works for now, and at a decent speed, but I'm very open to constructive criticism!
 
@@ -100,7 +100,11 @@ output here is untested.
 
 Nothing here ships weights — you build the environment and the FP8 model once, locally. Budget ~50GB of disk and an hour, most of it downloading.
 
-0. **Environment.** Python 3.12, and a ROCm build of PyTorch. Install torch from AMD's index *first*, since the PyPI default is a CUDA build and will not work:
+> **Install with `requirements.txt` and a ROCm torch wheel, not with the root `pyproject.toml`.** That `pyproject.toml` (and everything under `packages/`) is the vendored Lightricks LTX-2 trainer this repo inherited from upstream and keeps as reference source — it is a CUDA-pinned uv workspace, and `uv sync` / `pip install .` will not give you a working app. There is nothing to `pip install` here: this is an application with a hardware-specific torch build and a local model-build step, so the four steps below *are* the install.
+
+0. **Environment.** Python 3.12, a ROCm build of PyTorch, and **git-lfs** — the example videos, screenshots and the app icons are LFS objects, so a clone without it gets pointer files instead (`sudo apt install git-lfs && git lfs install`, then `git lfs pull` if you already cloned).
+
+   Install torch from AMD's index *first*, since the PyPI default is a CUDA build and will not work:
    ```bash
    python3 -m venv venv && source venv/bin/activate
    pip install --pre torch torchvision torchaudio \
@@ -126,7 +130,9 @@ Nothing here ships weights — you build the environment and the FP8 model once,
    ```bash
    python quant_transformer_fp8.py
    ```
-   This casts every `nn.Linear` in the transformer to `float8_e4m3fn` and writes `./local_ltx25_fp8` (~18GB). Keep `./local_ltx25_model` afterwards — the 2-stage upscale path still reads its `latent_upsampler` config.
+   This casts every `nn.Linear` in the transformer to `float8_e4m3fn` and writes `./local_ltx25_fp8` (~18GB). Keep `./local_ltx25_model` afterwards — the 2-stage upscale path loads its `latent_upsampler/` (config *and* weights, both of which come with step 1; `save_pretrained` does not copy the weights into the FP8 tree). If you only have a `latent_upscale_models/*spatial*.safetensors` checkpoint, the engine falls back to that plus whichever `latent_upsampler/config.json` it can find, so either layout works.
+
+   To check a fresh clone actually installs and runs, `tests/test_cleanroom.sh` clones the repo into a temp dir, builds a new venv, follows these steps verbatim and symlinks the weights rather than re-downloading them. Set `ROCM_INDEX=` to test against a different ROCm build.
 
 4. *(Optional)* the prompt enhancer — see [Requirements](#requirements).
 
@@ -293,7 +299,7 @@ Peak RAM usage is roughly 45GB — the resident 18GB transformer plus a transien
 
 ## Requirements
 
-* **AMD GPU with ROCm support, bfloat16, and enough VRAM.** Developed and tested on exactly one card — an RX 9070 XT (gfx1201). Nothing here is architecture-specific, so other ROCm-capable AMD GPUs *should* work, but that is untested and not a promise. Two things decide it:
+* **AMD GPU with ROCm support, bfloat16, and enough VRAM.** Developed and tested on two card models — an RX 9070 XT (16GB) and, since, a pair of Radeon AI PRO R9700s (32GB each). Both are gfx1201, so **every measurement here still comes from one GPU architecture**: nothing is architecture-specific and other ROCm-capable AMD GPUs *should* work, but that remains untested and is not a promise. Two things decide it:
 
   * **bfloat16 is a hard requirement** — the FP8 weights are upcast to bf16 in the patched linear layers, and the rest of the pipeline runs in bf16 throughout. Well supported on RDNA3/4 and CDNA; weak or emulated on older architectures.
   * **VRAM is the binding constraint.** The fixed footprint is ~8GB before any activations, and the rest scales with `latent_frames × (H/32) × (W/32)`:
